@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.6.2'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '1.6.3'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -91,7 +91,20 @@ MODE_HELP = {
 PRESETS = {'fast': (120, 50), 'stable': (300, 300)}
 INTERVALS = [30, 60, 120, 300, 600, 1800]
 TOLERANCES = [30, 50, 100, 200, 300, 500, 1000]
-CFG_FORMAT = 4            # 4: замеры пинга и скорости всегда через выбранный сервер
+CFG_FORMAT = 5            # 4: замеры пинга и скорости всегда через выбранный сервер; 5: MAX и проверки IP — напрямую
+# Российские приложения (MAX и т.п.) узнают внешний IP через несколько сервисов и сравнивают ответы.
+# Если часть проверок уходит через VPN, адреса расходятся, и приложение жалуется на VPN.
+# Поэтому сами приложения и эти сервисы всегда идут напрямую, в любом режиме маршрутизации.
+RU_APPS_DIRECT = ['DOMAIN-SUFFIX,max.ru', 'DOMAIN-SUFFIX,oneme.ru', 'DOMAIN-SUFFIX,okcdn.ru',
+                  'DOMAIN-SUFFIX,gosuslugi.ru', 'DOMAIN-SUFFIX,trace-flow.ru',
+                  'DOMAIN-SUFFIX,ifconfig.me', 'DOMAIN,api.ipify.org', 'DOMAIN,checkip.amazonaws.com',
+                  'DOMAIN,ipv4-internet.yandex.net', 'DOMAIN,ipv6-internet.yandex.net', 'DOMAIN,ip.mail.ru',
+                  'IP-CIDR,155.212.204.0/24']
+# свой адрес выхода бот узнаёт через сервис, которого нет в списке выше
+EXIT_IP_URLS = ('https://ipv4.icanhazip.com', 'https://ipinfo.io/ip')
+WG_IOS = 'https://apps.apple.com/app/wireguard/id1441195209'
+WG_ANDROID = 'https://play.google.com/store/apps/details?id=com.wireguard.android'
+AMNEZIA_NOTE = 'Если у вас уже стоит AmneziaWG (или AmneziaVPN), можно сканировать QR-код ею — WireGuard ставить не нужно.'
 NOTIFY_KINDS = [
     ('switch', '🔁 Смена сервера'),
     ('dead', '🔴 Недоступность VPN'),
@@ -767,7 +780,8 @@ ROUTING = {
     'blocked': ('🎯 Только заблокированное', 'Через VPN идут только заблокированные в РФ ресурсы и зарубежные '
                                             'ИИ-сервисы, всё остальное — напрямую. Экономит трафик VPN, но '
                                             'сайты, которые сами не пускают из России, придётся добавлять в исключения.'),
-    'all': ('🌐 Всё через VPN', 'Весь трафик идёт через VPN-сервер (кроме ваших исключений «напрямую»).'),
+    'all': ('🌐 Всё через VPN', 'Весь трафик идёт через VPN-сервер (кроме ваших исключений «напрямую»). '
+                              'MAX и сервисы, по которым приложения проверяют IP, в любом режиме идут напрямую.'),
 }
 
 
@@ -914,8 +928,10 @@ def build_managed(v):
              'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve', 'IP-CIDR,100.64.0.0/10,DIRECT,no-resolve',
              # замеры пинга и скорости в боте всегда идут через выбранный сервер
              f'DOMAIN,{PING_HOST},{SELECT_GROUP}', f'DOMAIN,{urllib.parse.urlsplit(SPEED_URL).hostname},{SELECT_GROUP}']
+    rules += [f'DOMAIN,{urllib.parse.urlsplit(u).hostname},{SELECT_GROUP}' for u in EXIT_IP_URLS]
     rules += [target_rule(t, SELECT_GROUP) for t in v.get('rules_proxy', [])]
     rules += [target_rule(t, 'DIRECT') for t in v.get('rules_direct', [])]
+    rules += [x + ',DIRECT' + (',no-resolve' if x.startswith('IP-') else '') for x in RU_APPS_DIRECT]
     for key, pid in svc.items():
         rules += [f'{x.split(",")[0]},{x.split(",")[1]},VIA-{pid}' + (',no-resolve' if x.endswith('no-resolve') else '')
                   for x in SERVICES[key][1]]
@@ -1052,11 +1068,42 @@ def current_speed():
 
 
 def exit_ip():
+    for url in EXIT_IP_URLS:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'curl/8.5'})
+            ip = proxy_opener.open(req, timeout=8).read().decode().strip()
+            if IP_RE.match(ip):
+                return ip
+        except Exception:
+            pass
+    return 'не удалось определить'
+
+
+def fmt_autoapply():
+    """После обновления бота: если отличается только формат конфига, применить его самому."""
+    v = state.get('vpn')
+    a = dict((v or {}).get('applied') or {})
+    if not v or a.get('fmt') == CFG_FORMAT:
+        return
+    cur = dict(snapshot(v))
+    cur.pop('fmt'); a.pop('fmt', None); a.pop('mode', None)
+    if cur != a:
+        return                      # есть неприменённые правки пользователя — пусть применит сам
+    for _ in range(30):
+        try:
+            api('/version')
+            break
+        except Exception:
+            time.sleep(10)
     try:
-        req = urllib.request.Request('https://ifconfig.me/ip', headers={'User-Agent': 'curl/8.5'})
-        return proxy_opener.open(req, timeout=8).read().decode().strip()
-    except Exception:
-        return 'не удалось определить'
+        apply_vpn_config(v)
+        time.sleep(5)
+        if v['mode'] == 'priority' and not v['manual']:
+            prio_tick(force=True)
+        add_event('Конфиг VPN обновлён до нового формата: MAX и сервисы проверки IP идут напрямую')
+        log('конфиг mihomo переведён на формат', CFG_FORMAT)
+    except Exception as e:
+        log('не удалось обновить формат конфига mihomo:', e)
 
 
 def run(cmd, timeout=30, inp=None):
@@ -1386,7 +1433,10 @@ def wg_mail(pub, to, via=None):
         text = '\n'.join([
             'Здравствуйте!', '', f'Это доступ к VPN «{GW_NAME}» для «{name}».', '',
             'Телефон или планшет:',
-            '  1. Установите приложение WireGuard (App Store или Google Play).',
+            '  1. Установите приложение WireGuard:',
+            f'     iPhone/iPad: {WG_IOS}',
+            f'     Android: {WG_ANDROID}',
+            f'     {AMNEZIA_NOTE}',
             '  2. Нажмите «+» → «Сканировать QR-код» и наведите камеру на QR-код из этого письма '
             '(откройте письмо на другом экране).',
             '     Или откройте вложенный файл .conf прямо на телефоне и выберите WireGuard.',
@@ -1400,7 +1450,9 @@ def wg_mail(pub, to, via=None):
             '<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#222">'
             f'<p>Здравствуйте!</p><p>Это доступ к VPN <b>{e(GW_NAME)}</b> для <b>«{e(name)}»</b>.</p>'
             '<h3 style="margin:18px 0 6px">📱 Телефон или планшет</h3><ol style="margin-top:0">'
-            '<li>Установите приложение <b>WireGuard</b> (App Store или Google Play).</li>'
+            f'<li>Установите приложение <b>WireGuard</b>: <a href="{WG_IOS}">App Store</a> (iPhone, iPad) или '
+            f'<a href="{WG_ANDROID}">Google Play</a> (Android).<br>'
+            f'<span style="color:#555">{html.escape(AMNEZIA_NOTE)}</span></li>'
             '<li>Нажмите <b>«+»</b> → <b>«Сканировать QR-код»</b> и наведите камеру на код ниже '
             '(откройте письмо на другом экране).<br>Или откройте вложенный файл <b>.conf</b> прямо на телефоне.</li>'
             '<li>Включите туннель.</li></ol>'
@@ -1432,15 +1484,17 @@ def wg_send_conf(chat, pub, only=None, via=None):
         if png:
             tg_file('sendPhoto', chat, 'photo', 'qr.png', png,
                     f'🔳 <b>{h(p["name"])}</b>: QR-код для приложения WireGuard\n\n'
-                    '1. Установите WireGuard (App Store / Google Play)\n'
+                    f'1. Установите WireGuard: <a href="{WG_IOS}">App Store</a> · <a href="{WG_ANDROID}">Google Play</a>\n'
                     '2. «+» → «Сканировать QR-код»\n3. Включите туннель\n\n'
+                    f'💡 {AMNEZIA_NOTE}\n\n'
                     '⚠️ QR — это ключ доступа, не показывайте его посторонним.')
         else:
             raw_send(chat, 'ℹ️ QR-код не создан: на сервере нет программы qrencode '
                            '(<code>sudo apt install -y qrencode</code>).', ttl_kind='files')
     if want_file:
-        how = ('Импорт: WireGuard → «+» → «Импорт из файла».' if phone else
-               'Windows/macOS: установите WireGuard с wireguard.com → «Импорт туннелей из файла» → «Подключить».\n'
+        how = (f'Импорт: WireGuard (<a href="{WG_IOS}">App Store</a> · <a href="{WG_ANDROID}">Google Play</a>) → '
+               '«+» → «Импорт из файла». Подойдёт и AmneziaWG.' if phone else
+               'Windows/macOS: установите WireGuard с <a href="https://www.wireguard.com/install/">wireguard.com</a> → «Импорт туннелей из файла» → «Подключить».\n'
                'Linux: <code>sudo cp файл.conf /etc/wireguard/ &amp;&amp; sudo wg-quick up имя</code>.')
         tg_file('sendDocument', chat, 'document', f'{safe}.conf', conf.encode(),
                 f'{KIND_ICON.get(p["kind"], "📱")} Конфиг «{h(p["name"])}»\n\n{how}\n\n'
@@ -7106,6 +7160,7 @@ def main():
         {'command': 'site', 'description': 'Куда идёт сайт: /site youtube.com'},
     ])
     threading.Thread(target=watcher, daemon=True).start()
+    threading.Thread(target=fmt_autoapply, daemon=True).start()
     if os.path.exists(RESTORED_FILE):
         report_restored()
     elif os.path.exists(UPDATE_RESULT):

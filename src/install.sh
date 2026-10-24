@@ -451,7 +451,7 @@ EOF
     local ip="" i
     for i in $(seq 1 12); do
         sleep 5
-        ip=$(curl -4 -s -m 8 -x http://127.0.0.1:7890 https://ifconfig.me/ip 2>/dev/null) && [ -n "$ip" ] && break
+        ip=$(curl -4 -s -m 8 -x http://127.0.0.1:7890 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]') && [ -n "$ip" ] && break
     done
     [ -n "$ip" ] || die "VPN не заработал: через mihomo нет выхода в интернет. Проверьте подписку."
     VPN_IP=$ip

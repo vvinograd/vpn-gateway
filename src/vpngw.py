@@ -312,7 +312,8 @@ def cmd_status():
     for unit in ('mihomo', 'wg-quick@wg0', 'vpnbot'):
         r = sh(['systemctl', 'is-active', unit]).stdout.strip() or 'нет'
         print(f'{unit:<14} {r}')
-    ip = sh(['curl', '-s', '-m', '10', '-x', 'http://127.0.0.1:7890', 'https://ifconfig.me/ip']).stdout.strip()
+    # ifconfig.me в конфиге идёт напрямую (из-за проверок MAX), поэтому адрес выхода — через icanhazip
+    ip = sh(['curl', '-4', '-s', '-m', '10', '-x', 'http://127.0.0.1:7890', 'https://ipv4.icanhazip.com']).stdout.strip()
     print(f'{"IP через VPN":<14} {ip or "нет ответа"}')
 
 
