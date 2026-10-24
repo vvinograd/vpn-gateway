@@ -311,14 +311,15 @@ step_servers() {
 step_mode() {
     local cm cr
     cm=$(jq -r '.mode // "stable"' <<<"${CUR_VPN:-{\}}" 2>/dev/null); [[ "$cm" =~ ^(fast|stable|priority)$ ]] || cm=stable
-    cr=$(jq -r '.routing // "smart"' <<<"${CUR_VPN:-{\}}" 2>/dev/null); [[ "$cr" =~ ^(smart|blocked|all)$ ]] || cr=smart
+    cr=$(jq -r '.routing // "smart"' <<<"${CUR_VPN:-{\}}" 2>/dev/null); [[ "$cr" =~ ^(smart|list|blocked|all)$ ]] || cr=smart
     MODE=$(need radio "Переключение серверов" "Как выбирать VPN-сервер?" 16 \
         stable "Стабильный — меняет сервер, только если он упал (рекомендуется)" "$(onoff "$cm" stable)" \
         fast "Быстрый — всегда самый быстрый, переключается часто" "$(onoff "$cm" fast)" \
         priority "По приоритету — по порядку списка, порядок меняется в боте" "$(onoff "$cm" priority)")
     case $MODE in fast) INTERVAL=120; TOL=50 ;; *) INTERVAL=300; TOL=300 ;; esac
-    ROUTING=$(need radio "Маршрутизация" "Какой трафик отправлять через VPN?\n(Можно поменять позже в боте: Настройки → Маршрутизация.)" 17 \
+    ROUTING=$(need radio "Маршрутизация" "Какой трафик отправлять через VPN?\n(Можно поменять позже в боте: Настройки → Маршрутизация.)" 18 \
         smart "Умная: заблокированное и зарубежное — VPN, российское — напрямую" "$(onoff "$cr" smart)" \
+        list "Только выбранные сервисы (YouTube, Telegram, ИИ…), как на MikroTik" "$(onoff "$cr" list)" \
         blocked "Только заблокированное в РФ через VPN, остальное напрямую" "$(onoff "$cr" blocked)" \
         all "Весь трафик через VPN" "$(onoff "$cr" all)")
     save_conf MODE "$MODE"; save_conf ROUTING "$ROUTING"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.6.3'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '1.7'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -62,6 +62,48 @@ SERVICES = {
     'netflix': ('Netflix', ['GEOSITE,netflix', 'GEOIP,netflix,no-resolve']),
     'spotify': ('Spotify', ['GEOSITE,spotify']),
 }
+# Режим «Только выбранные сервисы» (как маршруты на MikroTik): через VPN — только отмеченное, остальное напрямую.
+# Домены сервисов шлюз видит сам (DNS клиентов идёт через него), а для приложений, которые ходят прямо на IP
+# (Telegram, Meta, X, Netflix), добавлены их подсети.
+LIST_CATALOG = {
+    'youtube': ('YouTube', ['GEOSITE,youtube'], True),
+    'telegram': ('Telegram', ['GEOSITE,telegram', 'GEOIP,telegram,no-resolve'], True),
+    'whatsapp': ('WhatsApp', ['GEOSITE,whatsapp'], True),
+    'meta': ('Instagram, Facebook, Threads', ['GEOSITE,instagram', 'GEOSITE,facebook', 'GEOSITE,meta',
+                                              'GEOIP,facebook,no-resolve'], True),
+    'twitter': ('X (Twitter)', ['GEOSITE,twitter', 'GEOSITE,x', 'GEOIP,twitter,no-resolve'], True),
+    'discord': ('Discord', ['GEOSITE,discord'], True),
+    'ai': ('ChatGPT, Claude, Grok, Perplexity и другие ИИ', ['GEOSITE,openai', 'GEOSITE,anthropic', 'GEOSITE,xai',
+                                                            'GEOSITE,perplexity', 'GEOSITE,category-ai-!cn'], True),
+    'gemini': ('Gemini и Google AI Studio', ['GEOSITE,google-gemini', 'GEOSITE,google-deepmind'], True),
+    'dev': ('Cursor, GitHub, Docker, JetBrains', ['GEOSITE,cursor', 'GEOSITE,github', 'GEOSITE,docker',
+                                                  'GEOSITE,jetbrains'], True),
+    'work': ('Notion, Figma, Canva, Slack, Zoom', ['GEOSITE,notion', 'GEOSITE,figma', 'GEOSITE,canva',
+                                                   'GEOSITE,slack', 'GEOSITE,zoom'], True),
+    'linkedin': ('LinkedIn', ['GEOSITE,linkedin'], True),
+    'media': ('Reddit, Medium, Pinterest, Quora, Patreon, SoundCloud, Tumblr',
+              ['GEOSITE,reddit', 'GEOSITE,medium', 'GEOSITE,pinterest', 'GEOSITE,quora', 'GEOSITE,patreon',
+               'GEOSITE,soundcloud', 'GEOSITE,tumblr'], True),
+    'tiktok': ('TikTok', ['GEOSITE,tiktok'], True),
+    'signal': ('Signal, Viber', ['GEOSITE,signal', 'GEOSITE,viber'], True),
+    'netflix': ('Netflix', ['GEOSITE,netflix', 'GEOIP,netflix,no-resolve'], True),
+    'spotify': ('Spotify', ['GEOSITE,spotify'], True),
+    'twitch': ('Twitch', ['GEOSITE,twitch'], False),
+    'google': ('Google целиком (поиск, Gmail, Диск)', ['GEOSITE,google', 'GEOIP,google,no-resolve'], False),
+    'microsoft': ('Microsoft (Copilot, OneDrive, обновления — много трафика)', ['GEOSITE,microsoft'], False),
+    'hw': ('Драйверы Intel и NVIDIA', ['GEOSITE,intel', 'GEOSITE,nvidia'], False),
+    'blocked': ('Всё остальное заблокированное в РФ (список РКН)', ['GEOSITE,ru-blocked',
+                                                                   'GEOIP,ru-blocked,no-resolve'], False),
+}
+LIST_DEFAULT = [k for k, x in LIST_CATALOG.items() if x[2]]
+
+
+def via_rule(x, target):
+    """'GEOIP,telegram,no-resolve' → 'GEOIP,telegram,PROXY,no-resolve'"""
+    a = x.split(',')
+    return f'{a[0]},{a[1]},{target}' + (',no-resolve' if x.endswith('no-resolve') else '')
+
+
 API = 'http://127.0.0.1:9090'
 PROXY_URL = 'http://127.0.0.1:7890'
 PROVIDER = 'sub'
@@ -244,6 +286,10 @@ def add_event(text):
 
 # ---------------- Telegram ----------------
 def tg(method, _timeout=20, **params):
+    if LINK_MODE:                         # подчинённый шлюз: в Telegram ходит главный бот
+        if method in ('getUpdates', 'setMyCommands', 'getMe'):
+            return None
+        return link_call({'t': 'call', 'm': method, 'p': params}, _timeout + 15)
     data = json.dumps(params).encode()
     url = f'https://api.telegram.org/bot{TOKEN}/{method}'
     last = None
@@ -266,6 +312,12 @@ def tg(method, _timeout=20, **params):
 
 
 def tg_file(method, chat, field, filename, content, caption=None, kb=None, ttl_kind='files'):
+    if LINK_MODE:
+        res = link_call({'t': 'file', 'm': method, 'chat': chat, 'field': field, 'filename': filename,
+                         'b64': base64.b64encode(content).decode(), 'caption': caption, 'kb': kb}, 150)
+        if res and ttl_kind:
+            track(chat, res['message_id'], clean_ttl(chat, ttl_kind))
+        return res
     boundary = uuid.uuid4().hex
     parts = []
 
@@ -438,9 +490,11 @@ def notify(kind, text, exclude=None, keep=None):
     """keep=True — важное: висит, пока не нажмут «✔️ Понятно». Иначе удаляется по таймеру админа."""
     if keep is None:
         keep = kind in IMPORTANT and not text.startswith('🟢')
+    text = gw_prefix(text)
     with lock:
         targets = [int(uid) for uid, a in state['admins'].items()
-                   if a['notify'].get(kind, True) and int(uid) != exclude]
+                   if a['notify'].get(kind, True) and int(uid) != exclude
+                   and (LINK_MODE or 'm' in gw_allowed(int(uid)))]
     for uid in targets:
         raw_send(uid, text, [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]],
                  ttl_kind='keep' if keep else 'notif')
@@ -770,13 +824,16 @@ def snapshot(v):
     return {'interval': v['interval'], 'tolerance': v['tolerance'], 'excluded': sorted(v['excluded']),
             'routing': v.get('routing', 'all'), 'rules_direct': list(v.get('rules_direct', [])),
             'rules_proxy': list(v.get('rules_proxy', [])), 'svc': dict(sorted((v.get('svc') or {}).items())),
-            'fmt': CFG_FORMAT}
+            'list_svc': sorted(v.get('list_svc', LIST_DEFAULT)), 'fmt': CFG_FORMAT}
 
 
 ROUTING = {
     'smart': ('🧠 Умная', 'Заблокированное в РФ и зарубежные ИИ-сервисы — через VPN. Российские сайты '
                          '(.ru, .рф, .su, сервисы РФ, российские IP, сайты «только для России») — напрямую. '
                          'Всё остальное — через VPN. Рекомендуется.'),
+    'list': ('📋 Только выбранные сервисы', 'Как маршруты на MikroTik: через VPN идут только сервисы из вашего '
+                                         'списка (YouTube, Telegram, Instagram, ИИ и др.) и исключения «через VPN». '
+                                         'Всё остальное, включая все российские сайты и приложения, — напрямую.'),
     'blocked': ('🎯 Только заблокированное', 'Через VPN идут только заблокированные в РФ ресурсы и зарубежные '
                                             'ИИ-сервисы, всё остальное — напрямую. Экономит трафик VPN, но '
                                             'сайты, которые сами не пускают из России, придётся добавлять в исключения.'),
@@ -834,6 +891,12 @@ def vpn_migrate(v):
             v['svc'] = {}
             if v.get('applied') is not None:
                 v['applied'].setdefault('svc', {})
+            save_state()
+    if 'list_svc' not in v:
+        with lock:
+            v['list_svc'] = list(LIST_DEFAULT)
+            if v.get('applied') is not None:
+                v['applied'].setdefault('list_svc', sorted(LIST_DEFAULT))
             save_state()
     if 'routing' not in v or 'rules_direct' not in v:
         try:
@@ -935,6 +998,13 @@ def build_managed(v):
     for key, pid in svc.items():
         rules += [f'{x.split(",")[0]},{x.split(",")[1]},VIA-{pid}' + (',no-resolve' if x.endswith('no-resolve') else '')
                   for x in SERVICES[key][1]]
+    if r == 'list':
+        for key in LIST_CATALOG:
+            if key in v.get('list_svc', LIST_DEFAULT):
+                rules += [via_rule(x, SELECT_GROUP) for x in LIST_CATALOG[key][1]]
+        rules.append('MATCH,DIRECT')
+        out += [f'  - {x}' for x in rules]
+        return '\n'.join(out) + '\n'
     if r != 'all':
         rules += [f'GEOSITE,ru-blocked,{SELECT_GROUP}', f'GEOIP,ru-blocked,{SELECT_GROUP},no-resolve',
                   'GEOSITE,category-ai-ru,DIRECT', f'GEOSITE,category-ai-!cn,{SELECT_GROUP}']
@@ -1618,6 +1688,9 @@ def scr_menu(uid):
     if is_owner(uid):
         last.append(btn('👥 Админы', 'admins'))
     kb.append(last)
+    row = gw_row(uid)
+    if row:
+        kb.insert(0, row)
     return text, kb
 
 
@@ -1774,7 +1847,13 @@ def scr_admins(uid, note=''):
             lines.append(f'👑 {h(a["name"])} — владелец')
         else:
             lines.append(f'👤 {h(a["name"])} · <code>{aid}</code>')
-            kb.append([btn(f'🗑 {a["name"]}'[:40], f'adm:del:{aid}')])
+            if gw_nodes() or LINK_MODE:
+                have = [gw_name(x) for x in a.get('gw', ['m']) if x == 'm' or x in gw_nodes()]
+                lines.append('      шлюзы: ' + (h(', '.join(have)) if have else 'нет'))
+                kb.append([btn(f'🏢 {a["name"]}'[:30] + ': шлюзы', f'adm:gws:{aid}'),
+                           btn('🗑', f'adm:del:{aid}')])
+            else:
+                kb.append([btn(f'🗑 {a["name"]}'[:40], f'adm:del:{aid}')])
     lines += ['', 'Чтобы добавить администратора, попросите его написать боту /start: '
                   'вам придёт запрос с кнопкой «Дать доступ». Или добавьте по Telegram ID.']
     if note:
@@ -1821,6 +1900,7 @@ def scr_settings(uid, note=''):
         kb.append([btn('📦 Подписки VPN', 'subs')])
         kb.append([btn('📧 Почтовые уведомления', 'em')])
         kb.append([btn('💾 Резервные копии', 'bk')])
+        kb.append([btn('🏢 Шлюзы: несколько серверов в одном боте', 'gw:set')])
     kb.append([btn('🧹 Чистый чат', 'cl')])
     kb.append([btn('🏠 Меню', 'menu')])
     return '\n'.join(lines), kb
@@ -1883,6 +1963,8 @@ def scr_sw_route(uid, note=''):
     if note:
         lines += ['', note]
     kb = [[btn(('✅ ' if k == cur else '') + label, f'swr:{k}')] for k, (label, _) in ROUTING.items()]
+    if cur == 'list':
+        kb.append([btn(f'📋 Сервисы через VPN ({len(v.get("list_svc", LIST_DEFAULT))})', 'swl')])
     kb.append([btn('✏️ Исключения', 'swe'), btn('🎯 Сервисы через подписку', 'svs')])
     kb.append([btn('🔎 Куда идёт сайт', 'site')])
     if vpn_dirty(v):
@@ -1909,6 +1991,28 @@ def scr_sw_exc(uid, note=''):
     kb.append([btn('➕ Напрямую', 'swea:d'), btn('➕ Через VPN', 'swea:p')])
     if vpn_dirty(v):
         kb.append([btn('✅ Применить', 'swapply:e'), btn('↩️ Отменить', 'swreset:e')])
+    kb.append([btn('⬅️ Маршрутизация', 'swr')])
+    return '\n'.join(lines), kb
+
+
+def scr_sw_list(uid, note=''):
+    v = vpn()
+    sel = v.get('list_svc', LIST_DEFAULT)
+    lines = ['📋 <b>Сервисы через VPN</b>', '',
+             'В режиме «Только выбранные сервисы» через VPN идёт только отмеченное здесь и ваши исключения '
+             '«через VPN». Остальное — напрямую. Сайт, которого нет в списке, добавьте в ✏️ Исключения.', '']
+    if v.get('routing') != 'list':
+        lines += ['ℹ️ Сейчас выбран другой режим — список начнёт работать, когда включите '
+                  '«📋 Только выбранные сервисы».', '']
+    if not sel:
+        lines += ['⚠️ Ничего не отмечено — весь трафик пойдёт напрямую.', '']
+    kb = [[btn((('✅ ' if k in sel else '▫️ ') + title)[:40], f'swl:{k}')] for k, (title, _, _) in LIST_CATALOG.items()]
+    if vpn_dirty(v):
+        lines += ['⚠️ <b>Есть неприменённые изменения.</b> При применении VPN прервётся на 5–10 секунд.']
+        kb.append([btn('✅ Применить', 'swapply:l'), btn('↩️ Отменить', 'swreset:l')])
+    if note:
+        lines += ['', note]
+    kb.append([btn('✔️ Все', 'swl:+all'), btn('▫️ Только основные', 'swl:+def')])
     kb.append([btn('⬅️ Маршрутизация', 'swr')])
     return '\n'.join(lines), kb
 
@@ -3609,6 +3713,9 @@ VS_HOST_RE = re.compile(r'^(?:([a-z_][a-z0-9_.-]{0,31})@)?([A-Za-z0-9][A-Za-z0-9
 
 
 def tg_download(file_id, limit=64 * 1024):
+    if LINK_MODE:
+        r = link_call({'t': 'dl', 'file_id': file_id, 'limit': limit}, 90)
+        return base64.b64decode(r) if r else None
     info = tg('getFile', file_id=file_id)
     if not info or not info.get('file_path') or (info.get('file_size') or 0) > limit:
         return None
@@ -3703,6 +3810,7 @@ BK_KEEP = 5
 BK_EVERY = [7, 14, 30]
 BK_PATHS = ['/etc/vpnbot.env', '/etc/vpnnotify.env', '/etc/vpngw', '/etc/wireguard', '/etc/mihomo/config.yaml',
             '/etc/mihomo/providers', STATE_FILE, '/var/lib/vpnbot/ssh', '/root/wg-clients']
+BK_PATHS.append('/var/lib/vpnbot/link')       # ключ связи подчинённого шлюза с главным ботом
 BK_FORMAT = 1
 BK_DEST = [('tg', '✈️ Telegram'), ('mail', '📧 Почта'), ('sftp', '📁 SFTP'), ('yd', '☁️ Яндекс.Диск')]
 BK_LOCK = threading.Lock()
@@ -5194,7 +5302,7 @@ def wg_mass(uid, chat, mid, via):
 SCREENS = {'menu': scr_menu, 'status': scr_status, 'servers': scr_servers, 'traffic': scr_traffic,
            'manage': scr_manage, 'notif': scr_notif, 'admins': scr_admins, 'log': scr_log,
            'set': scr_settings, 'em': scr_email, 'subs': scr_subs, 'srv': scr_srv,
-           'srvthr': scr_srv_thr, 'vs': scr_vs, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
+           'srvthr': scr_srv_thr, 'vs': scr_vs, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
            'swi': lambda uid: scr_sw_choice(uid, 'i'), 'swt': lambda uid: scr_sw_choice(uid, 't')}
 # клиентами WireGuard управляют все админы; общие настройки шлюза — только владелец
 OWNER_ONLY = ('vs', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
@@ -5813,6 +5921,19 @@ def handle_sw(uid, data, chat, mid):
             v[key] = [x for x in v.get(key, []) if tag(x) != t]
             save_state()
         return scr_sw_exc(uid, '🗑 Удалено')
+    if data.startswith('swl:'):
+        k = data[4:]
+        with lock:
+            cur = list(v.get('list_svc', LIST_DEFAULT))
+            if k == '+all':
+                cur = list(LIST_CATALOG)
+            elif k == '+def':
+                cur = list(LIST_DEFAULT)
+            elif k in LIST_CATALOG:
+                cur = [x for x in cur if x != k] if k in cur else cur + [k]
+            v['list_svc'] = [x for x in LIST_CATALOG if x in cur]
+            save_state()
+        return scr_sw_list(uid)
     if data.startswith('swr:'):
         with lock:
             v['routing'] = data[4:] if data[4:] in ROUTING else 'all'
@@ -5844,7 +5965,7 @@ def handle_sw(uid, data, chat, mid):
                 save_state()
             prio_tick()
         return scr_sw_prio(uid)
-    back = {'r': scr_sw_route, 'e': scr_sw_exc, 's': scr_svc}.get(data.rsplit(':', 1)[-1] if ':' in data else '', scr_sw)
+    back = {'r': scr_sw_route, 'e': scr_sw_exc, 's': scr_svc, 'l': scr_sw_list}.get(data.rsplit(':', 1)[-1] if ':' in data else '', scr_sw)
     if data.startswith('swapply'):
         edit(chat, mid, '⏳ Применяю настройки, VPN прервётся на 5–10 секунд…')
         try:
@@ -5868,6 +5989,7 @@ def handle_sw(uid, data, chat, mid):
             v['rules_direct'] = list(a.get('rules_direct', v.get('rules_direct', [])))
             v['rules_proxy'] = list(a.get('rules_proxy', v.get('rules_proxy', [])))
             v['svc'] = dict(a.get('svc', v.get('svc', {})))
+            v['list_svc'] = list(a.get('list_svc', v.get('list_svc', LIST_DEFAULT)))
             v['mode'] = a.get('mode') or detect_mode(v)
             v['mode'] = 'priority' if v['mode'] == 'priority' else detect_mode(dict(v, mode=''))
             save_state()
@@ -6092,6 +6214,7 @@ def handle_callback(cq):
         return
     touch_admin(cq['from'])
     CTX.chat = chat
+    CTX.frm = cq['from']
     if data == 'ok':                      # «✔️ Понятно» под уведомлением
         tg_del(chat, mid)
         return
@@ -6101,7 +6224,7 @@ def handle_callback(cq):
         return
     if mid and ui['menu'].get(str(chat)) != mid:
         set_menu(chat, mid)               # нажали кнопку в другом сообщении — теперь меню здесь
-    if data not in ('adm:add', 'em:add', 'em:name', 'wgepd', 'wgepi') and not data.startswith(
+    if data not in ('adm:add', 'em:add', 'em:name', 'wgepd', 'wgepi', 'gw:hostok') and not data.startswith(
             ('wgadd:', 'wgr:', 'swea:', 'wgxd:', 'wglc:', 'em:pv:', 'sub:', 'vsw:', 'mtw:')):
         awaiting.pop(uid, None)
     who = h(admin_name(uid))
@@ -6258,6 +6381,13 @@ def handle_callback(cq):
             text, kb = res
         elif data.startswith('sw'):
             text, kb = handle_sw(uid, data, chat, mid)
+        elif data == 'gws':
+            text, kb = scr_gws(uid)
+        elif data.startswith('gw:'):
+            res = handle_gw(uid, data, chat, mid)
+            if res is None:
+                return
+            text, kb = res
         elif data.startswith('em:'):
             text, kb = handle_em(uid, data, chat, mid)
         elif data.startswith('nt:'):
@@ -6274,6 +6404,19 @@ def handle_callback(cq):
                 text = ('➕ <b>Новый администратор</b>\n\nОтправьте сообщением его Telegram ID (число). '
                         'Узнать ID можно у @userinfobot.\n\nОтмена: /cancel')
                 kb = [[btn('✖️ Отмена', 'admins')]]
+            elif parts[1] == 'gws':
+                text, kb = scr_adm_gw(uid, parts[2])
+            elif parts[1] == 'gw':
+                a = state['admins'].get(parts[2])
+                if a and (parts[3] == 'm' or parts[3] in gw_nodes()):
+                    with lock:
+                        have = a.setdefault('gw', ['m'])
+                        if parts[3] in have:
+                            have.remove(parts[3])
+                        else:
+                            have.append(parts[3])
+                        save_state()
+                text, kb = scr_adm_gw(uid, parts[2])
             elif parts[1] == 'del':
                 text = f'🗑 Удалить администратора <b>{h(admin_name(parts[2]))}</b>?'
                 kb = [[btn('✅ Удалить', f'adm:rm:{parts[2]}'), btn('✖️ Отмена', 'admins')]]
@@ -6575,7 +6718,7 @@ def handle_message(m):
     touch_admin(u)
     CTX.chat = chat
     has_file = bool(m.get('document') or m.get('photo'))
-    if not has_file:
+    if not has_file and m.get('message_id'):
         tg('deleteMessage', chat_id=chat, message_id=m['message_id'])   # чистый чат: ввод не остаётся
     try:
         handle_admin_message(m, uid, chat, text)
@@ -6618,6 +6761,12 @@ def handle_admin_message(m, uid, chat, text):
         return
     elif kind in ('add_email', 'smtp_host', 'smtp_user', 'smtp_pass', 'mail_name') and not cmd and is_owner(uid):
         handle_email_input(uid, chat, m, kind, wdata, text)
+        return
+    elif kind and kind.startswith('gw_') and not cmd and is_owner(uid):
+        if kind == 'gw_code':
+            gw_join(uid, chat, text)
+        else:
+            handle_gw_input(uid, chat, kind, wdata, text)
         return
     elif kind == 'add_admin' and not cmd:
         if not text.isdigit():
@@ -7098,12 +7247,886 @@ def watcher():
 
 def dispatch(u):
     try:
+        if not LINK_MODE and gw_nodes() and gw_route(u):
+            return
         if 'callback_query' in u:
             handle_callback(u['callback_query'])
         elif 'message' in u:
             handle_message(u['message'])
     except Exception:
         log(traceback.format_exc())
+
+
+# ---------------- несколько шлюзов в одном боте ----------------
+# Главный шлюз держит бота Telegram. Подчинённый шлюз своего бота не опрашивает: он сам подключается к главному
+# по SSH (ключ с forced command — этим ключом можно только передавать сообщения бота) и получает нажатия
+# и сообщения тех, кто выбрал этот шлюз. Его ответы главный отправляет в Telegram своим токеном.
+# Подчинённому не нужен белый адрес: соединение исходящее. Главный должен быть доступен по SSH.
+LINK_DIR = '/var/lib/vpnbot/link'
+LINK_SOCK = '/run/vpngw/link.sock'
+LINK_USER = 'vpngw-link'
+LINK_HOME = '/var/lib/vpngw-link'
+LINK_PIPE = '/usr/local/lib/vpngw/link-pipe.py'
+LINK_PIPE_SRC = r'''#!/usr/bin/python3
+# Запускается sshd по ключу подчинённого шлюза: соединяет SSH-сессию с ботом главного шлюза.
+import json, os, select, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect('/run/vpngw/link.sock')
+s.sendall((json.dumps({'t': 'hello', 'nid': sys.argv[1]}) + '\n').encode())
+while True:
+    r, _, _ = select.select([0, s], [], [])
+    if 0 in r:
+        d = os.read(0, 65536)
+        if not d:
+            break
+        s.sendall(d)
+    if s in r:
+        d = s.recv(65536)
+        if not d:
+            break
+        os.write(1, d)
+'''
+LINK_CALLS = {'sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'deleteMessage', 'deleteMessages',
+              'answerCallbackQuery', 'sendChatAction', 'getFile', 'getChat'}
+LINK_MODE = False             # этот бот — подчинённый шлюз
+links = {}                    # на главном: nid → живое соединение
+links_lock = threading.Lock()
+link_cli = {'proc': None, 'up': False, 'n': 0, 'pending': {}, 'wlock': threading.Lock(), 'since': 0}
+
+
+# --- общее ---
+def gw_nodes():
+    return state.setdefault('nodes', {})
+
+
+def gw_allowed(uid):
+    """Какие шлюзы видит человек: 'm' — главный (этот), остальное — id подчинённых."""
+    ids = ['m'] + list(gw_nodes())
+    if is_owner(uid):
+        return ids
+    a = state['admins'].get(str(uid)) or {}
+    have = a.get('gw', ['m'])
+    return [x for x in ids if x in have]
+
+
+def gw_name(nid):
+    return GW_NAME if nid == 'm' else (gw_nodes().get(nid) or {}).get('name', nid)
+
+
+def gw_sel(uid):
+    sel = ui.setdefault('gw', {}).get(str(uid), 'm')
+    allowed = gw_allowed(uid)
+    if sel not in allowed:
+        sel = allowed[0] if allowed else 'm'
+    return sel
+
+
+def gw_set_sel(uid, nid):
+    with ui_lock:
+        ui.setdefault('gw', {})[str(uid)] = nid
+    ui_save()
+
+
+def gw_online(nid):
+    with links_lock:
+        return nid in links
+
+
+def gw_row(uid):
+    """Строка «шлюз» для главного меню: только если шлюзов больше одного."""
+    if LINK_MODE:
+        return [btn(f'🏢 Шлюз: {GW_NAME} ⇄'[:40], 'gws')]
+    if len(gw_allowed(uid)) > 1:
+        return [btn(f'🏢 Шлюз: {GW_NAME} ⇄'[:40], 'gws')]
+    return None
+
+
+def gw_prefix(text):
+    """Уведомления помечаются шлюзом, когда шлюзов несколько."""
+    if LINK_MODE or gw_nodes():
+        return f'🏢 <i>{h(GW_NAME)}</i>\n' + text
+    return text
+
+
+# --- главный: сервер связи ---
+class Link:
+    def __init__(self, nid, conn):
+        self.nid, self.conn, self.wlock = nid, conn, threading.Lock()
+        self.info, self.since, self.synced = {}, time.time(), None
+
+    def send(self, obj):
+        data = (json.dumps(obj, ensure_ascii=False) + '\n').encode()
+        with self.wlock:
+            self.conn.sendall(data)
+
+
+def ensure_link_user():
+    """Системный пользователь для входа подчинённых шлюзов и скрипт-переходник."""
+    os.makedirs(os.path.dirname(LINK_PIPE), exist_ok=True)
+    with open(LINK_PIPE, 'w') as f:
+        f.write(LINK_PIPE_SRC)
+    os.chmod(LINK_PIPE, 0o755)
+    if run(['id', LINK_USER], 5).returncode != 0:
+        r = run(['useradd', '-r', '-m', '-d', LINK_HOME, '-s', '/bin/sh', LINK_USER], 30)
+        if r.returncode != 0:
+            raise RuntimeError('не удалось создать пользователя: ' + r.stderr[-200:])
+    run(['usermod', '-p', '*', LINK_USER], 10)          # без пароля, но не заблокирован: вход только по ключу
+    os.makedirs(f'{LINK_HOME}/.ssh', exist_ok=True)
+    gw_write_keys()
+    try:
+        shutil.chown(LINK_SOCK, 'root', LINK_USER)
+        os.chmod(LINK_SOCK, 0o660)
+    except Exception:
+        pass
+
+
+def gw_write_keys():
+    lines = [f'restrict,command="/usr/bin/python3 {LINK_PIPE} {nid}" {n["pub"]}'
+             for nid, n in gw_nodes().items() if n.get('pub')]
+    path = f'{LINK_HOME}/.ssh/authorized_keys'
+    with open(path + '.tmp', 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(path + '.tmp', path)
+    for p, mode in ((f'{LINK_HOME}/.ssh', 0o700), (path, 0o600)):
+        shutil.chown(p, LINK_USER, LINK_USER)
+        os.chmod(p, mode)
+
+
+def gw_link_server():
+    try:
+        os.makedirs(os.path.dirname(LINK_SOCK), exist_ok=True)
+        os.chmod(os.path.dirname(LINK_SOCK), 0o755)
+        if os.path.exists(LINK_SOCK):
+            os.remove(LINK_SOCK)
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(LINK_SOCK)
+        os.chmod(LINK_SOCK, 0o600)
+        srv.listen(16)
+    except Exception as e:
+        log('связь шлюзов: сокет не открыт:', e)
+        return
+    if gw_nodes():
+        try:
+            ensure_link_user()
+        except Exception as e:
+            log('связь шлюзов:', e)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=link_session, args=(conn,), daemon=True).start()
+
+
+def link_session(conn):
+    f = conn.makefile('rb')
+    lk = None
+    try:
+        hello = json.loads(f.readline() or b'{}')
+        nid = hello.get('nid')
+        if hello.get('t') != 'hello' or nid not in gw_nodes():
+            return
+        lk = Link(nid, conn)
+        with links_lock:
+            old = links.get(nid)
+            links[nid] = lk
+        if old:
+            try:
+                old.conn.close()
+            except Exception:
+                pass
+        n = gw_nodes()[nid]
+        lk.send({'t': 'welcome', 'name': n['name'], 'main': GW_NAME})
+        gw_sync(lk)
+        first = not n.get('paired')
+        with lock:
+            n['paired'] = True
+            n['seen'] = time.time()
+            save_state()
+        if first:
+            add_event(f'Подключён шлюз {n["name"]}')
+            notify('actions', f'🏢 Шлюз <b>{h(n["name"])}</b> подключён к этому боту.')
+        elif n.get('alerted'):
+            with lock:
+                n['alerted'] = False
+                save_state()
+            notify('server', f'🟢 Шлюз <b>{h(n["name"])}</b> снова на связи.')
+        for line in f:
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            t = msg.get('t')
+            if t == 'info':
+                lk.info = msg
+                with lock:
+                    n['seen'] = time.time()
+                    n['ver'] = msg.get('ver')
+            elif t in ('call', 'file', 'dl'):
+                threading.Thread(target=link_exec, args=(lk, msg), daemon=True).start()
+    except Exception as e:
+        log('связь шлюзов:', e)
+    finally:
+        if lk:
+            with links_lock:
+                if links.get(lk.nid) is lk:
+                    links.pop(lk.nid)
+            with lock:
+                if lk.nid in gw_nodes():
+                    gw_nodes()[lk.nid]['seen'] = time.time()
+                    save_state()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def gw_chats(nid):
+    return {int(a) for a in state['admins'] if nid in gw_allowed(int(a))}
+
+
+def link_exec(lk, msg):
+    """Вызов Telegram от подчинённого шлюза — только разрешённые методы и только в чаты его админов."""
+    res = None
+    try:
+        chats = gw_chats(lk.nid)
+        t = msg['t']
+        if t == 'call':
+            m, p = msg.get('m'), msg.get('p') or {}
+            if m in LINK_CALLS and ('chat_id' not in p or int(p['chat_id']) in chats):
+                res = tg(m, **p)
+        elif t == 'file':
+            if msg.get('m') in ('sendDocument', 'sendPhoto') and int(msg['chat']) in chats:
+                res = tg_file(msg['m'], msg['chat'], msg['field'], msg['filename'],
+                              base64.b64decode(msg['b64']), msg.get('caption'), msg.get('kb'), ttl_kind=None)
+        elif t == 'dl':
+            data = tg_download(msg['file_id'], int(msg.get('limit') or 65536))
+            res = base64.b64encode(data).decode() if data is not None else None
+    except Exception as e:
+        log('связь шлюзов: вызов', msg.get('m') or msg.get('t'), e)
+    try:
+        lk.send({'t': 'r', 'id': msg.get('id'), 'r': res})
+    except Exception:
+        pass
+
+
+def gw_sync(lk):
+    nid = lk.nid
+    payload = {'t': 'sync', 'owner': OWNER, 'name': gw_name(nid), 'main': GW_NAME,
+               'admins': {a: x['name'] for a, x in state['admins'].items() if nid in gw_allowed(int(a))}}
+    if payload != lk.synced:
+        lk.send(payload)
+        lk.synced = payload
+
+
+def gw_tick():
+    """Главный: синхронизация админов и тревога, если подчинённый шлюз пропал."""
+    while True:
+        time.sleep(20)
+        try:
+            with links_lock:
+                cur = list(links.values())
+            for lk in cur:
+                try:
+                    gw_sync(lk)
+                except Exception:
+                    pass
+            for nid, n in list(gw_nodes().items()):
+                if not n.get('paired') or gw_online(nid) or n.get('alerted'):
+                    continue
+                if time.time() - (n.get('seen') or 0) > 180:
+                    with lock:
+                        n['alerted'] = True
+                        save_state()
+                    notify('server', f'🔴 Шлюз <b>{h(n["name"])}</b> не на связи больше 3 минут.\n'
+                                     'VPN на нём может работать, но управлять им сейчас нельзя. Проверьте, '
+                                     'включён ли сервер и есть ли у него интернет.')
+        except Exception as e:
+            log('связь шлюзов:', e)
+
+
+def gw_route(u):
+    """Главный: передать нажатие или сообщение выбранному подчинённому шлюзу. True — передано."""
+    cq = u.get('callback_query')
+    m = u.get('message')
+    src = (cq or m or {}).get('from') or {}
+    uid = src.get('id')
+    if not uid or not is_admin(uid):
+        return False
+    if cq:
+        data = cq.get('data', '')
+        if data in ('gws', 'ok', 'noop') or data.startswith(('gw:', 'acc:', 'rej:', 'adm:')) or data == 'admins':
+            return False
+    else:
+        if (m.get('chat') or {}).get('type') != 'private' or uid in awaiting:
+            return False
+    sel = gw_sel(uid)
+    if sel == 'm':
+        return False
+    with links_lock:
+        lk = links.get(sel)
+    if cq:
+        awaiting.pop(uid, None)
+    if not lk:
+        n = gw_nodes().get(sel) or {}
+        text = (f'🔴 <b>Шлюз «{h(n.get("name", sel))}» не на связи</b>\n\n'
+                + (f'Последняя связь: {fmt_ago(n["seen"])}.\n' if n.get('seen') else 'Он ещё ни разу не подключался.\n')
+                + 'Выберите другой шлюз или подождите — он подключится сам, когда появится интернет.')
+        kb = [[btn('🏢 Шлюзы', 'gws')]]
+        if cq:
+            tg('answerCallbackQuery', callback_query_id=cq['id'])
+            msg = cq.get('message') or {}
+            CTX.chat = msg.get('chat', {}).get('id')
+            edit(CTX.chat, msg.get('message_id'), text, kb)
+        else:
+            CTX.chat = m['chat']['id']
+            tg('deleteMessage', chat_id=m['chat']['id'], message_id=m['message_id'])
+            send(m['chat']['id'], text, kb)
+        return True
+    try:
+        lk.send({'t': 'upd', 'u': u})
+    except Exception as e:
+        log('связь шлюзов: не передано', e)
+        return False
+    return True
+
+
+def scr_gws(uid, note=''):
+    sel = gw_sel(uid)
+    lines = ['🏢 <b>Шлюзы</b>', '', 'Какой шлюз открыть:', '']
+    kb = []
+    for nid in gw_allowed(uid):
+        on = nid == 'm' or gw_online(nid)
+        mark = '✅ ' if nid == sel else ''
+        lines.append(f'{"🟢" if on else "🔴"} {mark}<b>{h(gw_name(nid))}</b>' + (' — главный' if nid == 'm' else ''))
+        kb.append([btn(f'{mark}{"🟢" if on else "🔴"} {gw_name(nid)}'[:40], f'gw:s:{nid}')])
+    if note:
+        lines += ['', note]
+    if is_owner(uid):
+        kb.append([btn('⚙️ Управление шлюзами', 'gw:adm')])
+    kb.append([btn('🏠 Меню', 'menu')])
+    return '\n'.join(lines), kb
+
+
+def scr_gw_adm(uid, note=''):
+    lines = ['🏢 <b>Управление шлюзами</b>', '',
+             'Один бот может управлять несколькими шлюзами. Этот шлюз — главный: у него бот Telegram. '
+             'Подчинённые шлюзы сами подключаются к нему по SSH, своих ботов у них нет.', '',
+             f'👑 <b>{h(GW_NAME)}</b> — главный, {h(platform.node())}']
+    kb = []
+    for nid, n in gw_nodes().items():
+        on = gw_online(nid)
+        st = ('🟢 на связи' if on else ('🔴 не на связи' if n.get('paired') else '⏳ ждёт подключения'))
+        lines.append(f'{"🟢" if on else "🔴"} <b>{h(n["name"])}</b> — {st}')
+        kb.append([btn(f'{"🟢" if on else "🔴"} {n["name"]}'[:40], f'gw:n:{nid}')])
+    lines += ['', 'Доступ админов к шлюзам: 👥 Админы → шлюзы у каждого админа.']
+    if note:
+        lines += ['', note]
+    kb.append([btn('➕ Подключить шлюз', 'gw:new')])
+    kb.append([btn('⬅️ Шлюзы', 'gws'), btn('🏠 Меню', 'menu')])
+    return '\n'.join(lines), kb
+
+
+def scr_gw_node(uid, nid, note=''):
+    n = gw_nodes().get(nid)
+    if not n:
+        return scr_gw_adm(uid, '⚠️ Шлюз не найден')
+    with links_lock:
+        lk = links.get(nid)
+    info = lk.info if lk else {}
+    lines = [f'🏢 <b>{h(n["name"])}</b>', '']
+    if lk:
+        lines.append(f'🟢 На связи {fmt_dur(time.time() - lk.since)}')
+        if info:
+            lines.append(f'Сервер: {h(info.get("host", "?"))}, версия {h(info.get("ver", "?"))}')
+            lines.append(f'Клиентов WireGuard: {info.get("peers", "?")} · mihomo: '
+                         + ('🟢' if info.get('mihomo') else '🔴'))
+    elif n.get('paired'):
+        lines.append(f'🔴 Не на связи, последняя связь {fmt_ago(n.get("seen"))}')
+    else:
+        lines.append('⏳ Ещё не подключался. Вставьте код подключения в бота этого шлюза.')
+    lines.append(f'Адрес главного для него: <code>{h(n.get("host", "?"))}:{n.get("port", 22)}</code>')
+    admins = [x['name'] for a, x in state['admins'].items() if int(a) != OWNER and nid in gw_allowed(int(a))]
+    lines.append('Админы: ' + (h(', '.join(admins)) if admins else 'только владелец'))
+    if note:
+        lines += ['', note]
+    kb = [[btn('✏️ Переименовать', f'gw:ren:{nid}'), btn('🔑 Новый код', f'gw:code:{nid}')],
+          [btn('🔌 Отключить шлюз', f'gw:del:{nid}')],
+          [btn('⬅️ Шлюзы', 'gw:adm'), btn('🏠 Меню', 'menu')]]
+    return '\n'.join(lines), kb
+
+
+def ssh_port():
+    try:
+        r = run(['sshd', '-T'], 10)
+        m = re.search(r'^port (\d+)', r.stdout, re.M)
+        return int(m.group(1)) if m else 22
+    except Exception:
+        return 22
+
+
+def gw_default_host():
+    e = wg_eps()
+    return e.get('domain') or public_ip() or lan_ip()
+
+
+def gw_make_code(nid):
+    """Новый ключ для подчинённого шлюза и код подключения с ним."""
+    n = gw_nodes()[nid]
+    ensure_link_user()
+    tmp = tempfile.mkdtemp()
+    try:
+        r = run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', f'vpngw-node-{nid}', '-f', f'{tmp}/k'], 30)
+        if r.returncode != 0:
+            raise RuntimeError('ssh-keygen: ' + r.stderr[-200:])
+        priv = open(f'{tmp}/k').read()
+        pub = open(f'{tmp}/k.pub').read().strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    hk = ''
+    for kt in ('ed25519', 'ecdsa', 'rsa'):
+        try:
+            hk = ' '.join(open(f'/etc/ssh/ssh_host_{kt}_key.pub').read().split()[:2])
+            break
+        except Exception:
+            continue
+    with lock:
+        n['pub'] = pub
+        save_state()
+    gw_write_keys()
+    me = tg('getMe') or {}
+    payload = {'v': 1, 'h': n['host'], 'p': n['port'], 'hk': hk, 'id': nid, 'name': n['name'], 'k': priv,
+               'o': OWNER, 'bot': me.get('username', '')}
+    return 'VPNGW1-' + base64.urlsafe_b64encode(zlib.compress(json.dumps(payload).encode(), 9)).decode()
+
+
+def gw_code_text(nid, code):
+    n = gw_nodes()[nid]
+    lines = [f'🔑 <b>Код подключения шлюза «{h(n["name"])}»</b>', '',
+             '1. Откройте бота <b>того</b> шлюза, который подключаете.',
+             '2. ⚙️ Настройки → 🏢 Шлюзы → 🔗 Подключить к главному боту.',
+             '3. Отправьте ему этот код целиком (нажмите на код — он скопируется):', '',
+             f'<code>{code}</code>', '',
+             'После этого бот того шлюза замолчит, а сам шлюз появится здесь: 🏢 Шлюз ⇄.', '',
+             f'Тот шлюз будет подключаться сюда по SSH: <code>{h(n["host"])}:{n["port"]}</code>.']
+    lan = lan_ip()
+    if lan and ipaddress.ip_address(lan).is_private and n['host'] != lan:
+        lines += ['', f'⚠️ Этот сервер за роутером ({h(lan)}). Если тот шлюз в другой сети, пробросьте на роутере '
+                      f'TCP {n["port"]} → {h(lan)}:{ssh_port()}. Для MikroTik:',
+                  f'<code>/ip firewall nat add chain=dstnat protocol=tcp dst-port={n["port"]} in-interface-list=WAN '
+                  f'action=dst-nat to-addresses={h(lan)} to-ports={ssh_port()} comment="vpn-gateway: связь шлюзов"</code>']
+    lines += ['', '⚠️ Код — это ключ доступа. Не пересылайте его посторонним. Сообщение удалится через час.']
+    return '\n'.join(lines)
+
+
+def handle_gw(uid, data, chat, mid):
+    parts = data.split(':')
+    act = parts[1] if len(parts) > 1 else ''
+    nid = parts[2] if len(parts) > 2 else ''
+    if act == 's':
+        if nid not in gw_allowed(uid):
+            return scr_gws(uid, '⚠️ Нет доступа к этому шлюзу')
+        gw_set_sel(uid, nid)
+        if nid == 'm':
+            return scr_menu(uid)
+        if not gw_online(nid):
+            return scr_gws(uid, f'🔴 Шлюз «{h(gw_name(nid))}» сейчас не на связи.')
+        with ui_lock:
+            if ui['menu'].get(str(chat)) == mid:
+                ui['menu'].pop(str(chat), None)
+        tg_del(chat, mid)
+        gw_route({'message': {'chat': {'id': chat, 'type': 'private'}, 'from': getattr(CTX, 'frm', None) or {'id': uid},
+                              'text': '/start', 'message_id': 0, 'date': int(time.time())}})
+        return None
+    if not is_owner(uid):
+        return scr_gws(uid)
+    if act == 'set':
+        return scr_gw_adm(uid) if gw_nodes() else scr_gw_solo(uid)
+    if act == 'solo':
+        return scr_gw_solo(uid)
+    if act == 'join':
+        awaiting[uid] = ('gw_code', None)
+        return ('🔗 <b>Подключение к главному боту</b>\n\nОтправьте код подключения из главного бота '
+                '(🏢 Шлюзы → ⚙️ Управление шлюзами → ➕ Подключить шлюз). Сообщение с кодом я сразу удалю.'
+                '\n\nОтмена: /cancel', [[btn('✖️ Отмена', 'gw:solo')]])
+    if act == 'hostok':
+        kind, w = awaiting.get(uid, (None, None))
+        if kind != 'gw_host_new':
+            return scr_gw_adm(uid)
+        gw_host_done(uid, chat, kind, w, gw_default_host(), ssh_port())
+        return None
+    if act == 'adm':
+        return scr_gw_adm(uid)
+    if act == 'new':
+        awaiting[uid] = ('gw_name', None)
+        return ('➕ <b>Новый шлюз</b>\n\nКак его назвать? Например <code>Офис</code> или <code>Москва-2</code>.'
+                '\n\nОтмена: /cancel', [[btn('✖️ Отмена', 'gw:adm')]])
+    if act == 'n':
+        return scr_gw_node(uid, nid)
+    if nid not in gw_nodes():
+        return scr_gw_adm(uid, '⚠️ Шлюз не найден')
+    n = gw_nodes()[nid]
+    if act == 'ren':
+        awaiting[uid] = ('gw_rename', nid)
+        return (f'✏️ Новое имя для «{h(n["name"])}»?\n\nОтмена: /cancel', [[btn('✖️ Отмена', f'gw:n:{nid}')]])
+    if act == 'code':
+        awaiting[uid] = ('gw_host', nid)
+        return (f'🔑 <b>Код для «{h(n["name"])}»</b>\n\nПо какому адресу тот шлюз будет подключаться сюда по SSH? '
+                f'Сейчас: <code>{h(n.get("host", ""))}:{n.get("port", 22)}</code>.\n\nОтправьте адрес '
+                '(<code>адрес</code> или <code>адрес:порт</code>) или нажмите «Оставить».\n'
+                'Старый код перестанет работать.',
+                [[btn('✅ Оставить', f'gw:keep:{nid}')], [btn('✖️ Отмена', f'gw:n:{nid}')]])
+    if act == 'keep':
+        awaiting.pop(uid, None)
+        gw_send_code(uid, chat, nid)
+        return scr_gw_node(uid, nid, '🔑 Код отправлен отдельным сообщением.')
+    if act == 'del':
+        return (f'🔌 <b>Отключить шлюз «{h(n["name"])}»?</b>\n\nНа нём ничего не сломается: VPN продолжит работать, '
+                'а его собственный бот снова заработает сам (если шлюз сейчас на связи). Если он не на связи, '
+                'выполните на нём: <code>sudo python3 /usr/local/bin/vpnbot.py --unlink</code>',
+                [[btn('🔌 Да, отключить', f'gw:dd:{nid}'), btn('✖️ Отмена', f'gw:n:{nid}')]])
+    if act == 'dd':
+        with links_lock:
+            lk = links.get(nid)
+        if lk:
+            try:
+                lk.send({'t': 'unlink'})
+            except Exception:
+                pass
+        with lock:
+            gw_nodes().pop(nid, None)
+            for a in state['admins'].values():
+                if nid in a.get('gw', []):
+                    a['gw'].remove(nid)
+            save_state()
+        try:
+            gw_write_keys()
+        except Exception as e:
+            log('связь шлюзов:', e)
+        with ui_lock:
+            for k, x in list(ui.get('gw', {}).items()):
+                if x == nid:
+                    ui['gw'][k] = 'm'
+        ui_save()
+        add_event(f'Шлюз {n["name"]} отключён от бота')
+        return scr_gw_adm(uid, f'🔌 Шлюз «{h(n["name"])}» отключён.')
+    return scr_gw_adm(uid)
+
+
+def gw_send_code(uid, chat, nid):
+    try:
+        code = gw_make_code(nid)
+    except Exception as e:
+        raw_send(chat, f'🔴 Не удалось создать код: <code>{h(str(e))[:300]}</code>', ttl_kind='notif')
+        return
+    r = raw_send(chat, gw_code_text(nid, code))
+    if r:
+        track(chat, r['message_id'], 3600)         # код живёт в чате не дольше часа
+
+
+def handle_gw_input(uid, chat, kind, wdata, text):
+    if kind == 'gw_name':
+        name = text.strip()[:30]
+        if not name:
+            send(chat, 'Имя не может быть пустым. Или /cancel.')
+            return
+        awaiting[uid] = ('gw_host_new', name)
+        host = gw_default_host()
+        send(chat, f'🌐 По какому адресу шлюз «{h(name)}» будет подключаться к этому серверу по SSH?\n\n'
+                   f'Предлагаю: <code>{h(host)}:{ssh_port()}</code> — нажмите «Подходит» '
+                   'или отправьте свой (<code>адрес</code> или <code>адрес:порт</code>).\n\n'
+                   'Если этот сервер за роутером, а шлюз в другой сети, нужен внешний адрес '
+                   'и проброс порта (подскажу после).',
+             [[btn('✅ Подходит', 'gw:hostok')], [btn('✖️ Отмена', 'gw:adm')]])
+        return
+    if kind in ('gw_host', 'gw_host_new'):
+        mt = re.match(r'^\s*([A-Za-z0-9.-]+)(?::(\d{1,5}))?\s*$', text)
+        if not mt:
+            send(chat, 'Нужен адрес вида <code>vpn.example.com</code> или <code>203.0.113.10:22</code>. Или /cancel.')
+            return
+        gw_host_done(uid, chat, kind, wdata, mt.group(1), int(mt.group(2) or ssh_port()))
+        return
+    if kind == 'gw_rename':
+        name = text.strip()[:30]
+        awaiting.pop(uid, None)
+        if name and wdata in gw_nodes():
+            with lock:
+                gw_nodes()[wdata]['name'] = name
+                save_state()
+        t, kb = scr_gw_node(uid, wdata, '✅ Переименовано')
+        send(chat, t, kb)
+
+
+def gw_host_done(uid, chat, kind, wdata, host, port):
+    awaiting.pop(uid, None)
+    if kind == 'gw_host_new':
+        nid = uuid.uuid4().hex[:8]
+        with lock:
+            gw_nodes()[nid] = {'name': wdata, 'created': time.time(), 'host': host, 'port': port, 'paired': False}
+            save_state()
+        add_event(f'{admin_name(uid)} создал код подключения шлюза {wdata}')
+    else:
+        nid = wdata
+        with lock:
+            gw_nodes()[nid].update(host=host, port=port)
+            save_state()
+    t, kb = scr_gw_node(uid, nid, '🔑 Код подключения — в следующем сообщении.')
+    send(chat, t, kb)
+    gw_send_code(uid, chat, nid)
+
+
+def scr_adm_gw(uid, aid, note=''):
+    a = state['admins'].get(aid)
+    if not a:
+        return scr_admins(uid, '⚠️ Админ не найден')
+    have = a.get('gw', ['m'])
+    lines = [f'🏢 <b>Шлюзы для {h(a["name"])}</b>', '', 'Отметьте, какими шлюзами этот админ может управлять:']
+    if note:
+        lines += ['', note]
+    kb = [[btn((('✅ ' if nid in have else '▫️ ') + gw_name(nid))[:40], f'adm:gw:{aid}:{nid}')]
+          for nid in ['m'] + list(gw_nodes())]
+    kb.append([btn('⬅️ Админы', 'admins')])
+    return '\n'.join(lines), kb
+
+
+# --- подчинённый: клиент связи ---
+def link_cfg():
+    return state.get('link')
+
+
+def link_write(obj):
+    p = link_cli['proc']
+    if not p or not link_cli['up']:
+        raise RuntimeError('нет связи с главным ботом')
+    data = (json.dumps(obj, ensure_ascii=False) + '\n').encode()
+    with link_cli['wlock']:
+        p.stdin.write(data)
+        p.stdin.flush()
+
+
+def link_call(obj, timeout=60):
+    with link_cli['wlock']:
+        link_cli['n'] += 1
+        i = link_cli['n']
+    ev = threading.Event()
+    link_cli['pending'][i] = [ev, None]
+    obj['id'] = i
+    try:
+        link_write(obj)
+        ev.wait(timeout)
+        return link_cli['pending'][i][1]
+    except Exception as e:
+        log('связь с главным:', e)
+        return None
+    finally:
+        link_cli['pending'].pop(i, None)
+
+
+def link_argv(cfg):
+    return ['ssh', '-T', '-i', f'{LINK_DIR}/key', '-p', str(cfg['port']), '-o', 'BatchMode=yes',
+            '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+            '-o', f'UserKnownHostsFile={LINK_DIR}/known_hosts', '-o', 'ConnectTimeout=15',
+            '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', f'{LINK_USER}@{cfg["host"]}']
+
+
+def link_info():
+    try:
+        ok = bool(api('/version'))
+    except Exception:
+        ok = False
+    try:
+        peers = len(wg_state()['peers'])
+    except Exception:
+        peers = '?'
+    return {'t': 'info', 'ver': BOT_VERSION, 'host': platform.node(), 'peers': peers, 'mihomo': ok}
+
+
+def link_apply_sync(msg):
+    global OWNER, GW_NAME
+    if not state.get('link'):
+        return
+    with lock:
+        cfg = state['link']
+        cfg['owner'] = OWNER = int(msg.get('owner') or OWNER)
+        cfg['name'] = GW_NAME = msg.get('name') or GW_NAME
+        want = {str(a): n for a, n in (msg.get('admins') or {}).items()}
+        want.setdefault(str(OWNER), str(OWNER))
+        adm = state['admins']
+        for a in list(adm):
+            if a not in want:
+                adm.pop(a)
+        for a, name in want.items():
+            adm.setdefault(a, {'name': name, 'notify': default_notify()})['name'] = name
+        save_state()
+
+
+def link_reader(p):
+    for line in p.stdout:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        t = msg.get('t')
+        if t == 'r':
+            slot = link_cli['pending'].get(msg.get('id'))
+            if slot:
+                slot[1] = msg.get('r')
+                slot[0].set()
+        elif t == 'welcome':
+            touch_alive()
+            link_cli['up'] = True
+            link_cli['since'] = time.time()
+            link_cli['welcome'].set()
+        elif t == 'sync':
+            link_apply_sync(msg)
+        elif t == 'upd':
+            threading.Thread(target=dispatch, args=(msg['u'],), daemon=True).start()
+        elif t == 'unlink':
+            link_off('главный бот отключил этот шлюз')
+
+
+def link_once(cfg, wait_welcome=False):
+    """Одно соединение с главным. Возвращает, когда оно оборвалось (или сразу, если не поздоровались)."""
+    link_cli['welcome'] = threading.Event()
+    p = subprocess.Popen(link_argv(cfg), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    link_cli['proc'] = p
+    t = threading.Thread(target=link_reader, args=(p,), daemon=True)
+    t.start()
+    if not link_cli['welcome'].wait(25):
+        p.kill()
+        err = p.stderr.read().decode(errors='ignore')[-300:] if p.stderr else ''
+        return err.strip() or 'главный бот не ответил'
+    if wait_welcome:
+        return p
+    link_write(link_info())
+    t.join()
+    return None
+
+
+def link_client():
+    delay = 5
+    while LINK_MODE:
+        cfg = link_cfg()
+        err = None
+        try:
+            err = link_once(cfg)
+        except Exception as e:
+            err = str(e)
+        link_cli['up'] = False
+        for slot in list(link_cli['pending'].values()):
+            slot[0].set()
+        if err:
+            log('связь с главным ботом:', err)
+            delay = min(delay * 2, 60)
+        else:
+            delay = 5
+        time.sleep(delay)
+
+
+def touch_alive():
+    try:
+        os.makedirs(os.path.dirname(ALIVE_FILE), exist_ok=True)
+        with open(ALIVE_FILE, 'w') as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def link_heartbeat():
+    while LINK_MODE:
+        time.sleep(60)
+        touch_alive()
+        if link_cli['up']:
+            try:
+                link_write(link_info())
+            except Exception:
+                pass
+
+
+def link_off(why):
+    """Стать снова самостоятельным: вернуть своих админов и перезапуститься со своим ботом."""
+    with lock:
+        cfg = state.pop('link', None) or {}
+        if cfg.get('admins_local'):
+            state['admins'] = cfg['admins_local']
+        save_state()
+    shutil.rmtree(LINK_DIR, ignore_errors=True)
+    log('этот шлюз больше не подчинённый:', why)
+    add_event(f'Шлюз отключён от главного бота: {why}')
+    subprocess.Popen(['systemctl', 'restart', 'vpnbot'])
+
+
+def gw_parse_code(text):
+    t = re.sub(r'\s+', '', text)
+    if not t.startswith('VPNGW1-'):
+        return None
+    try:
+        return json.loads(zlib.decompress(base64.urlsafe_b64decode(t[7:] + '=' * (-len(t[7:]) % 4))))
+    except Exception:
+        return None
+
+
+def scr_gw_solo(uid, note=''):
+    lines = ['🏢 <b>Шлюзы</b>', '',
+             'Один бот может управлять несколькими шлюзами. Есть два способа:', '',
+             '➕ <b>Сделать этот бот главным</b> и подключить к нему другие шлюзы: их боты замолчат, '
+             'а управлять ими можно будет отсюда.', '',
+             '🔗 <b>Подключить этот шлюз к другому боту</b>: нужен код из главного бота '
+             '(🏢 Шлюзы → ⚙️ Управление шлюзами → ➕ Подключить шлюз). Этот бот после этого замолчит.']
+    if note:
+        lines += ['', note]
+    kb = [[btn('➕ Подключить другой шлюз сюда', 'gw:new')],
+          [btn('🔗 Подключить этот шлюз к главному боту', 'gw:join')],
+          [btn('⬅️ Настройки', 'set'), btn('🏠 Меню', 'menu')]]
+    return '\n'.join(lines), kb
+
+
+def gw_join(uid, chat, text):
+    awaiting.pop(uid, None)
+    c = gw_parse_code(text)
+    if not c or not all(k in c for k in ('h', 'p', 'hk', 'id', 'k')):
+        t, kb = scr_gw_solo(uid, '⚠️ Это не код подключения. Скопируйте его из главного бота целиком.')
+        send(chat, t, kb)
+        return
+    if gw_nodes():
+        t, kb = scr_gw_solo(uid, '⚠️ К этому боту уже подключены другие шлюзы — он главный. '
+                                 'Сначала отключите их в «Управление шлюзами».')
+        send(chat, t, kb)
+        return
+    r = send(chat, f'⏳ Подключаюсь к главному боту ({h(c["h"])}:{c["p"]})…')
+    os.makedirs(LINK_DIR, mode=0o700, exist_ok=True)
+    with open(f'{LINK_DIR}/key', 'w') as f:
+        f.write(c['k'])
+    os.chmod(f'{LINK_DIR}/key', 0o600)
+    hostpart = c['h'] if int(c['p']) == 22 else f'[{c["h"]}]:{c["p"]}'
+    with open(f'{LINK_DIR}/known_hosts', 'w') as f:
+        f.write(f'{hostpart} {c["hk"]}\n')
+    cfg = {'host': c['h'], 'port': int(c['p']), 'nid': c['id'], 'name': c.get('name') or GW_NAME,
+           'owner': c.get('o'), 'bot': c.get('bot', '')}
+    res = link_once(cfg, wait_welcome=True)
+    if isinstance(res, str):
+        shutil.rmtree(LINK_DIR, ignore_errors=True)
+        hint = ''
+        if re.search(r'timed out|No route|refused|Could not resolve', res):
+            hint = ('\n\nГлавный сервер недоступен по SSH с этого сервера. Проверьте адрес и порт, '
+                    'а если главный за роутером — проброс порта.')
+        elif 'Host key verification' in res:
+            hint = '\n\nКлюч сервера не совпал: возможно, указан адрес другого сервера.'
+        elif 'Permission denied' in res:
+            hint = '\n\nГлавный бот не принял ключ: код устарел. Создайте новый код в главном боте.'
+        edit(chat, r['message_id'] if r else None,
+             f'🔴 Не удалось подключиться: <code>{h(res)[:300]}</code>{hint}', [[btn('⬅️ Шлюзы', 'gw:solo')]])
+        return
+    res.kill()
+    with lock:
+        cfg['admins_local'] = json.loads(json.dumps(state['admins']))
+        state['link'] = cfg
+        save_state()
+    add_event(f'Шлюз подключён к главному боту @{cfg["bot"]}' if cfg['bot'] else 'Шлюз подключён к главному боту')
+    edit(chat, r['message_id'] if r else None,
+         f'✅ <b>Готово: шлюз подключён к главному боту</b>'
+         + (f' @{h(cfg["bot"])}' if cfg['bot'] else '') + '.\n\n'
+         'Этот бот сейчас замолчит. Управляйте шлюзом из главного бота: 🏢 Шлюз ⇄ → '
+         f'«{h(cfg["name"])}».\n\nВернуть всё как было: в главном боте «🔌 Отключить шлюз», '
+         'а если главный недоступен — на этом сервере <code>sudo python3 /usr/local/bin/vpnbot.py --unlink</code>.')
+    subprocess.Popen(['systemctl', 'restart', 'vpnbot'])
 
 
 RESTORED_FILE = '/var/lib/vpngw/restored.json'
@@ -7137,8 +8160,36 @@ def report_restored():
     add_event('Шлюз восстановлен из резервной копии')
 
 
+def startup_reports():
+    if LINK_MODE:                         # сначала дождаться связи с главным ботом
+        for _ in range(120):
+            if link_cli['up']:
+                break
+            time.sleep(1)
+    if os.path.exists(RESTORED_FILE):
+        report_restored()
+    elif os.path.exists(UPDATE_RESULT):
+        report_update_result()
+    elif not state.get('upd_pending'):
+        notify('actions', f'✅ <b>Бот запущен</b> · версия {h(BOT_VERSION)}\nVPN-шлюз на связи.')
+
+
 def main():
+    global LINK_MODE, OWNER, GW_NAME
     load_state()
+    cfg = state.get('link')
+    if cfg and not os.path.exists(f'{LINK_DIR}/key'):
+        log('нет ключа связи с главным ботом — работаю сам')
+        with lock:
+            state.pop('link', None)
+            if cfg.get('admins_local'):
+                state['admins'] = cfg['admins_local']
+            save_state()
+        cfg = None
+    if cfg:
+        LINK_MODE = True
+        OWNER = int(cfg.get('owner') or OWNER)
+        GW_NAME = cfg.get('name') or GW_NAME
     ui_load()
     email_cfg()
     try:
@@ -7149,6 +8200,9 @@ def main():
         vpn()
     except Exception as e:
         log('настройки VPN будут прочитаны позже:', e)
+    if not LINK_MODE:
+        threading.Thread(target=gw_link_server, daemon=True).start()
+        threading.Thread(target=gw_tick, daemon=True).start()
     tg('setMyCommands', commands=[
         {'command': 'start', 'description': 'Главное меню'},
         {'command': 'status', 'description': 'Статус шлюза'},
@@ -7161,12 +8215,16 @@ def main():
     ])
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=fmt_autoapply, daemon=True).start()
-    if os.path.exists(RESTORED_FILE):
-        report_restored()
-    elif os.path.exists(UPDATE_RESULT):
-        report_update_result()
-    elif not state.get('upd_pending'):
-        notify('actions', f'✅ <b>Бот запущен</b> · версия {h(BOT_VERSION)}\nVPN-шлюз на связи.')
+    if LINK_MODE:
+        touch_alive()
+        threading.Thread(target=link_client, daemon=True).start()
+        threading.Thread(target=link_heartbeat, daemon=True).start()
+        threading.Thread(target=startup_reports, daemon=True).start()
+        add_event('Бот запущен (подчинённый шлюз)')
+        log('бот запущен как подчинённый шлюз, главный', cfg['host'], cfg['port'])
+        while True:
+            time.sleep(3600)
+    startup_reports()
     add_event('Бот запущен')
     log('бот запущен, владелец', OWNER)
     offset = None
@@ -7200,7 +8258,10 @@ def cli():
         old = state.get('vpn') or {}
         v['rules_direct'] = P.get('rules_direct', old.get('rules_direct', []))
         v['rules_proxy'] = P.get('rules_proxy', old.get('rules_proxy', []))
+        v['list_svc'] = old.get('list_svc', list(LIST_DEFAULT))
         state['subs'] = P['subs']
+        ids = {x['id'] for x in P['subs']}
+        v['svc'] = {k: x for k, x in (old.get('svc') or {}).items() if x in ids and k in SERVICES}
         out = render_config(open(a[1], encoding='utf-8').read(), v)
         with open(a[3], 'w', encoding='utf-8') as f:
             f.write(out)
@@ -7211,8 +8272,11 @@ def cli():
         old = state.get('vpn') or {}
         v = {'mode': P['mode'], 'interval': P['interval'], 'tolerance': P['tolerance'], 'excluded': P['excluded'],
              'priority': old.get('priority', []), 'manual': False, 'routing': P['routing'],
-             'rules_direct': old.get('rules_direct', []), 'rules_proxy': old.get('rules_proxy', [])}
+             'rules_direct': old.get('rules_direct', []), 'rules_proxy': old.get('rules_proxy', []),
+             'list_svc': old.get('list_svc', list(LIST_DEFAULT))}
         state['subs'] = P['subs']
+        ids = {x['id'] for x in P['subs']}
+        v['svc'] = {k: x for k, x in (old.get('svc') or {}).items() if x in ids and k in SERVICES}
         v['applied'] = dict(snapshot(v), mode=v['mode'])
         state['vpn'] = v
         save_state()
@@ -7222,6 +8286,13 @@ def cli():
     elif a[0] == '--vpn':                         # текущие настройки переключения (для установщика)
         load_state()
         print(json.dumps(state.get('vpn') or {}, ensure_ascii=False))
+    elif a[0] == '--unlink':                     # подчинённый шлюз снова работает со своим ботом
+        load_state()
+        if not state.get('link'):
+            print('Этот шлюз и так работает со своим ботом.')
+        else:
+            link_off('отключён командой --unlink')
+            print('Готово: шлюз отключён от главного бота, его собственный бот перезапускается.')
     elif a[0] == '--mark-applied':               # после восстановления: конфиг mihomo собран из текущих настроек
         load_state()
         v = state.get('vpn')
