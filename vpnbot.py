@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.7.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '1.7.3'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -293,22 +293,30 @@ def tg(method, _timeout=20, **params):
     data = json.dumps(params).encode()
     url = f'https://api.telegram.org/bot{TOKEN}/{method}'
     last = None
-    # сначала через VPN, если mihomo лежит — напрямую
-    for opener in (proxy_opener, direct_opener):
-        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-        try:
-            with opener.open(req, timeout=_timeout) as r:
-                return json.load(r).get('result')
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors='ignore')
-            if not re.search(r'message is not modified|message to (delete|edit) not found|'
-                             r"message can't be (deleted|edited)", body):
-                log('Telegram', method, e.code, body[:200])
-            return None
-        except Exception as e:
-            last = e
+    # Отправку сообщений повторяем: пока mihomo перезапускается (применение настроек, обновление),
+    # Telegram недоступен несколько секунд, а напрямую из России может не открываться совсем.
+    for pause in ((3, 7, 15) if method in TG_RETRY else ()) + (None,):
+        # сначала через VPN, если mihomo лежит — напрямую
+        for opener in (proxy_opener, direct_opener):
+            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+            try:
+                with opener.open(req, timeout=_timeout) as r:
+                    return json.load(r).get('result')
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors='ignore')
+                if not re.search(r'message is not modified|message to (delete|edit) not found|'
+                                 r"message can't be (deleted|edited)", body):
+                    log('Telegram', method, e.code, body[:200])
+                return None
+            except Exception as e:
+                last = e
+        if pause:
+            time.sleep(pause)
     log('Telegram недоступен:', method, last)
     return None
+
+
+TG_RETRY = {'sendMessage', 'sendDocument', 'sendPhoto'}
 
 
 def tg_file(method, chat, field, filename, content, caption=None, kb=None, ttl_kind='files'):
@@ -334,20 +342,23 @@ def tg_file(method, chat, field, filename, content, caption=None, kb=None, ttl_k
     parts.append(f'--{boundary}--\r\n'.encode())
     data = b''.join(parts)
     url = f'https://api.telegram.org/bot{TOKEN}/{method}'
-    for opener in (proxy_opener, direct_opener):
-        req = urllib.request.Request(url, data=data, headers={
-            'Content-Type': f'multipart/form-data; boundary={boundary}'})
-        try:
-            with opener.open(req, timeout=120) as r:
-                res = json.load(r).get('result')
-            if res and ttl_kind:
-                track(chat, res['message_id'], clean_ttl(chat, ttl_kind))
-            return res
-        except urllib.error.HTTPError as e:
-            log('Telegram', method, e.code, e.read().decode(errors='ignore')[:200])
-            return None
-        except Exception as e:
-            log('Telegram недоступен:', method, e)
+    for pause in (5, 15, None):
+        for opener in (proxy_opener, direct_opener):
+            req = urllib.request.Request(url, data=data, headers={
+                'Content-Type': f'multipart/form-data; boundary={boundary}'})
+            try:
+                with opener.open(req, timeout=120) as r:
+                    res = json.load(r).get('result')
+                if res and ttl_kind:
+                    track(chat, res['message_id'], clean_ttl(chat, ttl_kind))
+                return res
+            except urllib.error.HTTPError as e:
+                log('Telegram', method, e.code, e.read().decode(errors='ignore')[:200])
+                return None
+            except Exception as e:
+                log('Telegram недоступен:', method, e)
+        if pause:
+            time.sleep(pause)
     return None
 
 
@@ -495,10 +506,13 @@ def notify(kind, text, exclude=None, keep=None):
         targets = [int(uid) for uid, a in state['admins'].items()
                    if a['notify'].get(kind, True) and int(uid) != exclude
                    and (LINK_MODE or 'm' in gw_allowed(int(uid)))]
+    sent = 0
     for uid in targets:
-        raw_send(uid, text, [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]],
-                 ttl_kind='keep' if keep else 'notif')
+        if raw_send(uid, text, [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]],
+                    ttl_kind='keep' if keep else 'notif'):
+            sent += 1
     mail_async(kind, text)
+    return sent
 
 
 def clean_chat(chat):
@@ -795,11 +809,151 @@ def probe(name, tries=3):
     return 0
 
 
+# ---------------- проверка сервисов через текущий сервер ----------------
+# Сервер может отвечать на проверку Google, но не пускать в Telegram или YouTube (блок у поставщика, перегрузка,
+# выход заблокирован). Раз в несколько минут проверяем их через текущий сервер; если не открываются, а через другой
+# открываются — переключаемся на него (закрепляем) и сообщаем. Когда автовыбор снова предлагает рабочий сервер,
+# возвращаемся на автовыбор.
+SVC_CHECKS = [('Telegram', 'https://api.telegram.org/'), ('YouTube', 'https://www.youtube.com/generate_204')]
+SVC_EVERY = 300
+SVC_BAD_TTL = 1800                # сколько помнить, что сервер не пускает в сервис
+svc_bad = {}                      # сервер → {'svc': [...], 'ts': время}
+svc_state = {'busy': False, 'alert_none': 0, 'hint': {}}
+
+
+def svc_probe(name, url, tries=2):
+    if name not in SRV_PROV:
+        try:
+            servers()
+        except Exception:
+            pass
+    prov = SRV_PROV.get(name)
+    path = (f'/providers/proxies/{prov}/{q(name)}/healthcheck' if prov else f'/proxies/{q(name)}/delay')
+    for i in range(tries):
+        try:
+            if (api(f'{path}?url={q(url)}&timeout=6000', timeout=10) or {}).get('delay'):
+                return True
+        except Exception:
+            pass
+        if i < tries - 1:
+            time.sleep(3)
+    return False
+
+
+def svc_fails(name, tries=2):
+    return [svc for svc, url in SVC_CHECKS if not svc_probe(name, url, tries)]
+
+
+def svc_is_bad(name):
+    b = svc_bad.get(name)
+    return bool(b and time.time() - b['ts'] < SVC_BAD_TTL)
+
+
+def svc_candidates(v, cur):
+    lst = [p for p in servers() if p['name'] != cur and p.get('alive', True) and delay_of(p)
+           and p['name'] not in v['excluded'] and not svc_is_bad(p['name'])]
+    lst.sort(key=delay_of)
+    return [p['name'] for p in lst[:6]]
+
+
+def svc_preferred(v):
+    """Какой сервер выбрал бы автовыбор (или приоритет), если бы мы ничего не закрепляли."""
+    if v['mode'] == 'priority':
+        lst = servers()
+        ok = {p['name'] for p in lst if p.get('alive', True) and p.get('history') and delay_of(p)}
+        return next((n for n in prio_order(v, lst) if n in ok), None)
+    try:
+        return api(f'/proxies/{AUTO_GROUP}')['now']
+    except Exception:
+        return None
+
+
+def svc_unpin(v, why):
+    with lock:
+        v['manual'] = False
+        v.pop('svc_pin', None)
+        save_state()
+    last_manual[0] = time.time()
+    if v['mode'] == 'priority':
+        prio_tick(force=True)
+    else:
+        api(f'/proxies/{SELECT_GROUP}', 'PUT', {'name': AUTO_GROUP})
+    add_event(why)
+
+
+def svc_tick_safe():
+    try:
+        svc_tick()
+    except Exception:
+        log('svc_tick:', traceback.format_exc())
+
+
+def svc_tick():
+    v = state.get('vpn')
+    if not v or not v.get('svc_check', True) or svc_state['busy']:
+        return
+    svc_state['busy'] = True
+    try:
+        mode, cur = mode_and_current()
+        pin = v.get('svc_pin')
+        if pin and (pin != cur or mode != 'manual'):
+            with lock:                       # закрепление сняли (вручную или шлюз сам вернул автовыбор)
+                v.pop('svc_pin', None)
+                save_state()
+            pin = None
+        fails = svc_fails(cur)
+        if not fails:
+            svc_bad.pop(cur, None)
+            if pin:
+                pref = svc_preferred(v)
+                if pref and pref != cur and not svc_fails(pref, 1):
+                    svc_unpin(v, f'Сервер {pref} снова пускает во все сервисы — вернулся автовыбор')
+                    notify('switch', f'🟢 <b>Вернулся автовыбор</b>\n\nСервер <b>{h(pref)}</b> снова открывает '
+                                     f'{", ".join(s for s, _ in SVC_CHECKS)}.')
+            return
+        svc_bad[cur] = {'svc': fails, 'ts': time.time()}
+        what = ', '.join(fails)
+        target = None
+        for name in svc_candidates(v, cur):
+            if not svc_fails(name, 1):
+                target = name
+                break
+        if not target:
+            if time.time() - svc_state['alert_none'] > 3600:
+                svc_state['alert_none'] = time.time()
+                add_event(f'{what} не открывается через {cur}, и другого рабочего сервера нет')
+                notify('dead', f'⚠️ <b>{h(what)} не открывается</b>\n\nЧерез текущий сервер {h(cur)} не открывается, '
+                               'и ни один другой сервер из проверенных не помог. Возможно, сбой у самого сервиса '
+                               'или у поставщика VPN.')
+            return
+        if mode == 'manual' and not pin:
+            # сервер выбрали вручную — не спорим, только подсказываем (раз в час на сервер)
+            if time.time() - svc_state['hint'].get(cur, 0) > 3600:
+                svc_state['hint'][cur] = time.time()
+                add_event(f'Сервер {cur} (выбран вручную) не пускает в {what}')
+                notify('switch', f'⚠️ <b>Сервер {h(cur)} не пускает в {h(what)}</b>\n\nОн выбран вручную, поэтому '
+                                 f'я его не меняю. Через <b>{h(target)}</b> всё открывается — выберите его '
+                                 'в «🌍 Серверы» или включите «Авто».')
+            return
+        last_manual[0] = time.time()          # чтобы наблюдатель не прислал второе «сервер сменился»
+        api(f'/proxies/{SELECT_GROUP}', 'PUT', {'name': target})
+        with lock:
+            v['manual'] = True
+            v['svc_pin'] = target
+            save_state()
+        add_event(f'Сервер {cur} не пускает в {what} — переключился на {target}')
+        notify('switch', f'⚠️ <b>Сервер {h(cur)} не пускает в {h(what)}</b>\n\nПереключился на <b>{h(target)}</b> — '
+                         'через него всё открывается. Когда автовыбор снова найдёт рабочий сервер, вернусь на него сам.')
+    finally:
+        svc_state['busy'] = False
+
+
 def fallback_to_auto(dead):
     """Выбранный вручную сервер не отвечает — возвращаемся на автовыбор (и остаёмся на нём)."""
     v = vpn()
     with lock:
         v['manual'] = False
+        v.pop('svc_pin', None)
         save_state()
     last_manual[0] = time.time()
     if v['mode'] == 'priority':
@@ -1159,6 +1313,7 @@ def fmt_autoapply():
     cur.pop('fmt'); a.pop('fmt', None); a.pop('mode', None)
     if cur != a:
         return                      # есть неприменённые правки пользователя — пусть применит сам
+    time.sleep(90)                  # сначала пусть уйдут сообщения о запуске и обновлении: mihomo перезапустится
     for _ in range(30):
         try:
             api('/version')
@@ -1766,6 +1921,8 @@ def scr_servers(uid, note=''):
         else:
             icon = '🔴'
         extra = '' if name in members else ' · вне авто'
+        if svc_is_bad(name):
+            extra += f' · ⚠️ нет {", ".join(svc_bad[name]["svc"])}'
         lines.append(f'{icon} {h(name)} — {fmt_delay(p)}{extra}')
         label = ('📍 ' if name == cur and mode == 'manual' else '') + name
         row.append(btn(label[:40], f'srv:{i}:{tag(name)}'))
@@ -1919,7 +2076,12 @@ def scr_sw(uid, note=''):
         lines.append(f'🌍 В автовыборе: {n_in} из {len(lst)} серверов')
     except Exception:
         pass
-    if v['manual']:
+    sc = v.get('svc_check', True)
+    lines.append(f'🩺 Проверка Telegram и YouTube: {"✅ каждые 5 мин" if sc else "⛔ выключена"}')
+    if v.get('svc_pin') and v['manual']:
+        lines += ['', f'📌 Сейчас закреплён {h(v["svc_pin"])}: прежний сервер не пускал в Telegram или YouTube. '
+                      'Автовыбор вернётся сам, когда он снова предложит рабочий сервер.']
+    elif v['manual']:
         lines += ['', '✋ Сейчас сервер выбран вручную. Если он перестанет отвечать, шлюз сам включит '
                       'автовыбор. Вернуть вручную: «🌍 Серверы → Авто».']
     dirty = vpn_dirty(v)
@@ -1939,6 +2101,7 @@ def scr_sw(uid, note=''):
     if v['mode'] == 'priority':
         row.append(btn('🔢 Порядок', 'swp'))
     kb.append(row)
+    kb.append([btn(('✅ ' if sc else '⛔ ') + '🩺 Проверка Telegram и YouTube', 'swsc')])
     if dirty:
         kb.append([btn('✅ Применить', 'swapply'), btn('↩️ Отменить', 'swreset')])
     kb.append([btn('⬅️ Настройки', 'set'), btn('🏠 Меню', 'menu')])
@@ -5921,6 +6084,14 @@ def handle_sw(uid, data, chat, mid):
             v[key] = [x for x in v.get(key, []) if tag(x) != t]
             save_state()
         return scr_sw_exc(uid, '🗑 Удалено')
+    if data == 'swsc':
+        with lock:
+            v['svc_check'] = not v.get('svc_check', True)
+            if not v['svc_check'] and v.get('svc_pin'):
+                v.pop('svc_pin', None)
+            save_state()
+        add_event(f'{who} {"включил" if v["svc_check"] else "выключил"} проверку Telegram и YouTube')
+        return scr_sw(uid)
     if data.startswith('swl:'):
         k = data[4:]
         with lock:
@@ -6245,6 +6416,7 @@ def handle_callback(cq):
             if state.get('vpn'):
                 with lock:
                     state['vpn']['manual'] = True
+                    state['vpn'].pop('svc_pin', None)
                     save_state()
             api(f'/proxies/{SELECT_GROUP}', 'PUT', {'name': name})
             add_event(f'{admin_name(uid)} выбрал сервер {name}')
@@ -6255,6 +6427,7 @@ def handle_callback(cq):
             v = vpn()
             with lock:
                 v['manual'] = False
+                v.pop('svc_pin', None)
                 save_state()
             if v['mode'] == 'priority':
                 prio_tick(force=True)
@@ -6928,8 +7101,20 @@ def report_update_result():
     else:
         text = (f'⚠️ <b>Обновление не удалось</b>, возвращена прежняя версия {h(BOT_VERSION)}.\n'
                 f'<code>{h(rest[:400])}</code>')
+    with lock:
+        want = any(a['notify'].get('actions', True) for a in state['admins'].values())
+    if not notify('actions', text) and want and upd_retry[0] < 20:
+        upd_retry[0] += 1                 # Telegram был недоступен — сообщим позже, а не потеряем
+        with open(UPDATE_RESULT, 'w', encoding='utf-8') as f:
+            f.write(res)
+        with lock:
+            state['upd_pending'] = pend or {'to': BOT_VERSION}
+            save_state()
+        return
     add_event(plain(text).split('\n')[0])
-    notify('actions', text)
+
+
+upd_retry = [0]
 
 
 def scr_upd(uid, note=''):
@@ -7138,6 +7323,7 @@ def watcher():
     last_tr = 0
     last_sub = 0
     last_srv = 0
+    last_svc = 0
     started = time.time()
     while True:
         try:
@@ -7214,6 +7400,9 @@ def watcher():
                 sub_tick()
             except Exception:
                 log('sub_tick:', traceback.format_exc())
+        if time.time() - started > 120 and time.time() - last_svc >= SVC_EVERY:
+            last_svc = time.time()
+            threading.Thread(target=svc_tick_safe, daemon=True).start()
         if os.path.exists(UPDATE_RESULT):
             report_update_result()
         if state.get('upd_pending') and time.time() - started > 300 and not os.path.exists(UPDATE_RESULT):
