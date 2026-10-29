@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.8'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '1.7.4'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -247,47 +247,16 @@ def load_state():
     save_state()
 
 
-# Ведомый шлюз работает через два канала: свой бот ('own') и главный бот по SSH ('main').
-# У каждого канала свои админы и свой владелец: в своём боте — админы и владелец этого шлюза
-# (state['admins'], ADMIN_ID), через главного — те, кому главный выдал этот шлюз (state['link']['admins']).
-def cur_via():
-    return getattr(CTX, 'via', None) or 'own'
-
-
-def via_main():
-    return LINK_MODE and cur_via() == 'main'
-
-
-def link_admins():
-    return (state.get('link') or {}).setdefault('admins', {}) if state.get('link') else {}
-
-
-def adm_tab(via=None):
-    """Админы канала, через который сейчас обрабатывается нажатие или сообщение."""
-    if LINK_MODE and (via or cur_via()) == 'main':
-        return link_admins()
-    return state['admins']
-
-
-def adm_entry(uid):
-    """Запись админа в любом канале (сначала свой бот)."""
-    return state['admins'].get(str(uid)) or (link_admins().get(str(uid)) if LINK_MODE else None)
-
-
-def link_owner():
-    return int((state.get('link') or {}).get('owner') or 0)
-
-
 def is_admin(uid):
-    return str(uid) in adm_tab()
+    return str(uid) in state['admins']
 
 
 def is_owner(uid):
-    return uid == (link_owner() if via_main() else OWNER)
+    return uid == OWNER
 
 
 def admin_name(uid):
-    a = adm_tab().get(str(uid)) or adm_entry(uid)
+    a = state['admins'].get(str(uid))
     return a['name'] if a else str(uid)
 
 
@@ -299,7 +268,7 @@ def user_label(u):
 
 
 def touch_admin(u):
-    a = adm_tab().get(str(u['id']))
+    a = state['admins'].get(str(u['id']))
     if a is not None:
         name = user_label(u)
         if a.get('name') != name:
@@ -316,18 +285,11 @@ def add_event(text):
 
 
 # ---------------- Telegram ----------------
-def tg(method, _timeout=20, _via=None, **params):
-    if LINK_MODE:                         # ведомый шлюз: свой бот или главный — смотря чей это чат
-        via = _via
-        if via is None:
-            if method in ('getUpdates', 'setMyCommands', 'getMe', 'getFile'):
-                via = 'own'
-            elif 'chat_id' in params:
-                via = chat_via(params['chat_id'])
-            else:
-                via = cur_via()           # answerCallbackQuery — в тот бот, где нажали
-        if via == 'main':
-            return link_call({'t': 'call', 'm': method, 'p': params}, _timeout + 15)
+def tg(method, _timeout=20, **params):
+    if LINK_MODE:                         # ведомый шлюз: в Telegram ходит главный бот
+        if method in ('getUpdates', 'setMyCommands', 'getMe'):
+            return None
+        return link_call({'t': 'call', 'm': method, 'p': params}, _timeout + 15)
     data = json.dumps(params).encode()
     url = f'https://api.telegram.org/bot{TOKEN}/{method}'
     last = None
@@ -358,11 +320,11 @@ TG_RETRY = {'sendMessage', 'sendDocument', 'sendPhoto'}
 
 
 def tg_file(method, chat, field, filename, content, caption=None, kb=None, ttl_kind='files'):
-    if LINK_MODE and chat_via(chat) == 'main':
+    if LINK_MODE:
         res = link_call({'t': 'file', 'm': method, 'chat': chat, 'field': field, 'filename': filename,
                          'b64': base64.b64encode(content).decode(), 'caption': caption, 'kb': kb}, 150)
         if res and ttl_kind:
-            track(chat, res['message_id'], clean_ttl(chat, ttl_kind), 'main')
+            track(chat, res['message_id'], clean_ttl(chat, ttl_kind))
         return res
     boundary = uuid.uuid4().hex
     parts = []
@@ -388,7 +350,7 @@ def tg_file(method, chat, field, filename, content, caption=None, kb=None, ttl_k
                 with opener.open(req, timeout=120) as r:
                     res = json.load(r).get('result')
                 if res and ttl_kind:
-                    track(chat, res['message_id'], clean_ttl(chat, ttl_kind), 'own')
+                    track(chat, res['message_id'], clean_ttl(chat, ttl_kind))
                 return res
             except urllib.error.HTTPError as e:
                 log('Telegram', method, e.code, e.read().decode(errors='ignore')[:200])
@@ -408,10 +370,7 @@ def btn(text, data):
 # В чате всегда одно «живое» меню. Ответы на ввод и новые экраны заменяют его (старое удаляется),
 # сообщения админа удаляются после обработки, файлы и уведомления — по таймеру.
 CTX = threading.local()          # чат, для которого сейчас обрабатывается нажатие или сообщение
-# На ведомом у одного человека два чата: со своим ботом и с главным. Номера сообщений в них свои,
-# поэтому сообщения, пришедшие через главного, хранятся под ключом 'm<chat>', через свой бот — '<chat>'.
-# ui['via'] — через какой бот человек писал последним (туда же идут ответы из фоновых задач).
-ui = {'menu': {}, 'msgs': {}, 'del': [], 'via': {}, 'v': 0}
+ui = {'menu': {}, 'msgs': {}, 'del': []}
 ui_lock = threading.Lock()
 
 
@@ -426,36 +385,6 @@ def ui_load():
         pass
     except Exception as e:
         log('ошибка чтения ui.json:', e)
-    if ui.get('v', 0) < 2:                # до 1.8 ведомый жил только через главного: все его сообщения — оттуда
-        with ui_lock:
-            if LINK_MODE:
-                ui['menu'] = {'m' + k: v for k, v in ui['menu'].items() if not k.startswith('m')}
-                ui['msgs'] = {'m' + k: v for k, v in ui['msgs'].items() if not k.startswith('m')}
-                ui['del'] = [d[:3] + ['main'] for d in ui['del']]
-            ui['v'] = 2
-        ui_save()
-
-
-def chat_via(chat):
-    """Через какой бот писать в этот чат: 'own' или 'main' (только на ведомом)."""
-    if not LINK_MODE:
-        return 'own'
-    if getattr(CTX, 'chat', None) == chat and getattr(CTX, 'via', None):
-        return CTX.via
-    v = ui.get('via', {}).get(str(chat))
-    return v if v in ('own', 'main') else notify_via(chat)
-
-
-def notify_via(uid):
-    """Уведомления: админам своего бота — через свой бот, остальным — через главного."""
-    if not LINK_MODE or str(uid) in state['admins']:
-        return 'own'
-    return 'main'
-
-
-def uk(chat, via=None):
-    """Ключ чата в ui с учётом бота."""
-    return f'm{chat}' if LINK_MODE and (via or chat_via(chat)) == 'main' else str(chat)
 
 
 def ui_save():
@@ -471,7 +400,7 @@ def ui_save():
 
 
 def clean_cfg(uid):
-    a = adm_entry(uid)
+    a = state['admins'].get(str(uid))
     if a is None:
         return dict(CLEAN_DEFAULTS)
     c = a.setdefault('clean', {})
@@ -489,28 +418,26 @@ def clean_ttl(chat, kind):
         return None
 
 
-def track(chat, mid, ttl=None, via=None):
+def track(chat, mid, ttl=None):
     """Запомнить сообщение бота (для «Очистить чат») и, если нужно, когда его удалить."""
     now = time.time()
-    v = via or chat_via(chat)
     with ui_lock:
-        msgs = ui['msgs'].setdefault(uk(chat, v), {})
+        msgs = ui['msgs'].setdefault(str(chat), {})
         msgs[str(mid)] = now
         for k in [k for k, t in msgs.items() if now - t > 48 * 3600]:
             msgs.pop(k, None)
         if ttl:
-            ui['del'].append([now + min(ttl, TG_DEL_MAX), chat, mid, v])
+            ui['del'].append([now + min(ttl, TG_DEL_MAX), chat, mid])
     ui_save()
 
 
-def tg_del(chat, mid, via=None):
+def tg_del(chat, mid):
     """Удалить сообщение; если Telegram не даёт (старше 48 часов) — хотя бы убрать кнопки."""
-    v = via or chat_via(chat)
     with ui_lock:
-        ui['msgs'].get(uk(chat, v), {}).pop(str(mid), None)
-    if tg('deleteMessage', _via=v, chat_id=chat, message_id=mid):
+        ui['msgs'].get(str(chat), {}).pop(str(mid), None)
+    if tg('deleteMessage', chat_id=chat, message_id=mid):
         return True
-    tg('editMessageReplyMarkup', _via=v, chat_id=chat, message_id=mid, reply_markup={'inline_keyboard': []})
+    tg('editMessageReplyMarkup', chat_id=chat, message_id=mid, reply_markup={'inline_keyboard': []})
     return False
 
 
@@ -519,39 +446,31 @@ def del_tick():
     with ui_lock:
         due = [d for d in ui['del'] if d[0] <= now]
         ui['del'] = [d for d in ui['del'] if d[0] > now]
-    for d in due:
-        chat, mid = d[1], d[2]
-        v = d[3] if len(d) > 3 else 'own'
-        if v == 'main' and not LINK_MODE:  # шлюз отключён от главного: чужие сообщения не трогаем
-            continue
-        if ui['menu'].get(uk(chat, v)) != mid:
-            tg_del(chat, mid, v)
+    for _, chat, mid in due:
+        if ui['menu'].get(str(chat)) != mid:
+            tg_del(chat, mid)
     if due:
         ui_save()
 
 
 def set_menu(chat, mid):
     """Сделать сообщение живым меню чата; прежнее меню удаляется."""
-    v = chat_via(chat)
-    k = uk(chat, v)
     with ui_lock:
-        old = ui['menu'].get(k)
-        ui['menu'][k] = mid
-        ui['del'] = [d for d in ui['del']
-                     if not (d[1] == chat and d[2] == mid and (d[3] if len(d) > 3 else 'own') == v)]
+        old = ui['menu'].get(str(chat))
+        ui['menu'][str(chat)] = mid
+        ui['del'] = [d for d in ui['del'] if not (d[1] == chat and d[2] == mid)]
     if old and old != mid:
-        tg_del(chat, old, v)
+        tg_del(chat, old)
     ui_save()
 
 
-def raw_send(chat, text, kb=None, ttl_kind=None, via=None):
-    v = via or chat_via(chat)
+def raw_send(chat, text, kb=None, ttl_kind=None):
     p = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
     if kb:
         p['reply_markup'] = {'inline_keyboard': kb}
-    r = tg('sendMessage', _via=v, **p)
+    r = tg('sendMessage', **p)
     if r:
-        track(chat, r['message_id'], clean_ttl(chat, ttl_kind), v)
+        track(chat, r['message_id'], clean_ttl(chat, ttl_kind))
     return r
 
 
@@ -578,36 +497,19 @@ def edit(chat, mid, text, kb=None):
 IMPORTANT = ('dead', 'tunnel', 'server', 'billing')
 
 
-def notify_targets(kind, exclude=None):
-    """Кому слать уведомление и через какой бот: [(uid, via)]. Каждому — один раз.
-    На ведомом админы своего бота получают его через свой бот, остальные — через главного."""
-    with lock:
-        tabs = [('own', state['admins'])]
-        if LINK_MODE:
-            tabs.append(('main', link_admins()))
-        seen, out = set(), []
-        for via, tab in tabs:
-            for uid, a in tab.items():
-                if uid in seen:
-                    continue
-                seen.add(uid)
-                if int(uid) == exclude or not (a.get('notify') or {}).get(kind, True):
-                    continue
-                if not LINK_MODE and 'm' not in gw_allowed(int(uid)):
-                    continue
-                out.append((int(uid), via))
-    return out
-
-
 def notify(kind, text, exclude=None, keep=None):
     """keep=True — важное: висит, пока не нажмут «✔️ Понятно». Иначе удаляется по таймеру админа."""
     if keep is None:
         keep = kind in IMPORTANT and not text.startswith('🟢')
     text = gw_prefix(text)
+    with lock:
+        targets = [int(uid) for uid, a in state['admins'].items()
+                   if a['notify'].get(kind, True) and int(uid) != exclude
+                   and (LINK_MODE or 'm' in gw_allowed(int(uid)))]
     sent = 0
-    for uid, via in notify_targets(kind, exclude):
+    for uid in targets:
         if raw_send(uid, text, [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]],
-                    ttl_kind='keep' if keep else 'notif', via=via):
+                    ttl_kind='keep' if keep else 'notif'):
             sent += 1
     mail_async(kind, text)
     return sent
@@ -615,25 +517,23 @@ def notify(kind, text, exclude=None, keep=None):
 
 def clean_chat(chat):
     """Удалить всё, что можно, кроме живого меню: известные сообщения бота и последние 500 по номерам."""
-    v = chat_via(chat)
-    k = uk(chat, v)
-    live = ui['menu'].get(k)
+    live = ui['menu'].get(str(chat))
     with ui_lock:
-        known = [int(m) for m in ui['msgs'].get(k, {}) if int(m) != live]
+        known = [int(m) for m in ui['msgs'].get(str(chat), {}) if int(m) != live]
     n = 0
     for i in range(0, len(known), 100):
         part = known[i:i + 100]
-        if tg('deleteMessages', _via=v, chat_id=chat, message_ids=part):
+        if tg('deleteMessages', chat_id=chat, message_ids=part):
             n += len(part)
         else:
-            n += sum(1 for m in part if tg('deleteMessage', _via=v, chat_id=chat, message_id=m))
+            n += sum(1 for m in part if tg('deleteMessage', chat_id=chat, message_id=m))
     if live:
         rest = [m for m in range(max(live - 500, 1), live) if m not in known]
         for i in range(0, len(rest), 100):
-            tg('deleteMessages', _via=v, chat_id=chat, message_ids=rest[i:i + 100])
+            tg('deleteMessages', chat_id=chat, message_ids=rest[i:i + 100])
     with ui_lock:
-        ui['msgs'][k] = {str(live): time.time()} if live else {}
-        ui['del'] = [d for d in ui['del'] if not (d[1] == chat and (d[3] if len(d) > 3 else 'own') == v)]
+        ui['msgs'][str(chat)] = {str(live): time.time()} if live else {}
+        ui['del'] = [d for d in ui['del'] if d[1] != chat]
     ui_save()
     return n
 
@@ -1046,6 +946,72 @@ def svc_tick():
                          'через него всё открывается. Когда автовыбор снова найдёт рабочий сервер, вернусь на него сам.')
     finally:
         svc_state['busy'] = False
+
+
+# ---------------- сторож приёма соединений mihomo ----------------
+# Бывает, что mihomo перестаёт забирать новые TCP-соединения из туннеля: очередь его входа в TUN забита
+# (Recv-Q упирается в лимит), старые соединения живут, новые не открываются, ошибок в журнале нет.
+# Раз в минуту смотрим очередь; две проверки подряд «забито» — перезапускаем mihomo и сообщаем.
+tunq = {'bad': 0, 'last_restart': 0, 'restarts': []}
+
+
+def tun_queue():
+    """(занято, лимит) самой забитой очереди mihomo не на 127.0.0.1, или None."""
+    try:
+        out = run(['ss', '-ltnpH'], 10).stdout
+    except Exception:
+        return None
+    worst = None
+    for line in out.splitlines():
+        if '"mihomo"' not in line:
+            continue
+        f = line.split()
+        if len(f) < 4 or f[3].startswith(('127.', '[::1]')):
+            continue
+        try:
+            q, lim = int(f[1]), int(f[2])
+        except ValueError:
+            continue
+        if lim and (worst is None or q / lim > worst[0] / worst[1]):
+            worst = (q, lim)
+    return worst
+
+
+def tunq_tick():
+    w = tun_queue()
+    if not w:
+        tunq['bad'] = 0
+        return
+    q, lim = w
+    if q < lim * 0.9:
+        tunq['bad'] = 0
+        return
+    tunq['bad'] += 1
+    if tunq['bad'] < 2 or time.time() - tunq['last_restart'] < 600:
+        return
+    tunq['bad'] = 0
+    tunq['last_restart'] = time.time()
+    tunq['restarts'] = [t for t in tunq['restarts'] if time.time() - t < 86400] + [time.time()]
+    log(f'очередь новых соединений mihomo забита ({q}/{lim}) — перезапуск')
+    r = run(['systemctl', 'restart', 'mihomo'], 60)
+    ok = r.returncode == 0
+    add_event(f'mihomo перестал принимать соединения ({q}/{lim}) — ' + ('перезапущен' if ok else 'перезапуск не удался'))
+    n = len(tunq['restarts'])
+    notify('dead', ('⚠️ <b>mihomo перестал принимать новые соединения</b>\n\n'
+                    f'Очередь входа из туннеля забита ({q} из {lim}): открытые соединения работали, новые — нет. '
+                    + ('mihomo перезапущен, VPN снова работает.' if ok else
+                       f'Перезапустить не удалось: <code>{h(r.stderr[-200:])}</code>'))
+           + (f'\n\nЗа сутки это уже {n}-й раз — похоже на ошибку в текущей версии mihomo '
+              f'({h(mihomo_version())}). Проверьте обновление mihomo: 🔧 Управление → 🆕 Обновления → 🧱 mihomo.'
+              if n >= 3 else ''))
+
+
+def mihomo_version():
+    try:
+        m = re.search(r'v[\d.]+', run(['mihomo', '-v'], 10).stdout)
+        return m.group(0) if m else '?'
+    except Exception:
+        return '?'
 
 
 def fallback_to_auto(dead):
@@ -2088,7 +2054,7 @@ def scr_manage(uid, note=''):
 
 
 def scr_notif(uid):
-    n = adm_tab()[str(uid)].setdefault('notify', default_notify())
+    n = state['admins'][str(uid)]['notify']
     text = ('🔔 <b>Уведомления</b>\n\nЧто присылать вам в Telegram. '
             'Нажмите, чтобы включить или выключить:')
     kb = [[btn(('✅ ' if n.get(k, True) else '⬜ ') + label, f'nt:{k}')] for k, label in NOTIFY_KINDS]
@@ -2104,7 +2070,7 @@ def scr_admins(uid, note=''):
             lines.append(f'👑 {h(a["name"])} — владелец')
         else:
             lines.append(f'👤 {h(a["name"])} · <code>{aid}</code>')
-            if gw_nodes():
+            if gw_nodes() or LINK_MODE:
                 have = [gw_name(x) for x in a.get('gw', ['m']) if x == 'm' or x in gw_nodes()]
                 lines.append('      шлюзы: ' + (h(', '.join(have)) if have else 'нет'))
                 kb.append([btn(f'🏢 {a["name"]}'[:30] + ': шлюзы', f'adm:gws:{aid}'),
@@ -2113,11 +2079,6 @@ def scr_admins(uid, note=''):
                 kb.append([btn(f'🗑 {a["name"]}'[:40], f'adm:del:{aid}')])
     lines += ['', 'Чтобы добавить администратора, попросите его написать боту /start: '
                   'вам придёт запрос с кнопкой «Дать доступ». Или добавьте по Telegram ID.']
-    if LINK_MODE:
-        other = [x['name'] for a, x in link_admins().items() if a not in state['admins']]
-        lines += ['', '🏢 Этот шлюз подключён к главному боту. Там им управляют и те, кому его выдал владелец '
-                      'главного' + (': ' + h(', '.join(other)) if other else '') + '. '
-                      'Их список меняется в главном боте.']
     if note:
         lines += ['', note]
     kb.append([btn('➕ Добавить по ID', 'adm:add')])
@@ -3981,7 +3942,7 @@ VS_HOST_RE = re.compile(r'^(?:([a-z_][a-z0-9_.-]{0,31})@)?([A-Za-z0-9][A-Za-z0-9
 
 
 def tg_download(file_id, limit=64 * 1024):
-    if via_main():
+    if LINK_MODE:
         r = link_call({'t': 'dl', 'file_id': file_id, 'limit': limit}, 90)
         return base64.b64decode(r) if r else None
     info = tg('getFile', file_id=file_id)
@@ -6121,8 +6082,7 @@ def flow_speed(chat, mid):
 
 def grant_access(aid, name, by_uid):
     with lock:
-        state['admins'][str(aid)] = {'name': name, 'notify': default_notify(),
-                                     'gw': ['m'] + list(gw_nodes())}   # новому админу видны все шлюзы
+        state['admins'][str(aid)] = {'name': name, 'notify': default_notify()}
         state['pending'].pop(str(aid), None)
         save_state()
     add_event(f'{admin_name(by_uid)} добавил администратора {name}')
@@ -6499,7 +6459,7 @@ def handle_callback(cq):
         t, kb = scr_menu(uid)
         send(chat, t, kb)
         return
-    if mid and ui['menu'].get(uk(chat)) != mid:
+    if mid and ui['menu'].get(str(chat)) != mid:
         set_menu(chat, mid)               # нажали кнопку в другом сообщении — теперь меню здесь
     if data not in ('adm:add', 'em:add', 'em:name', 'wgepd', 'wgepi') and not data.startswith(
             ('wgadd:', 'wgr:', 'swea:', 'wgxd:', 'wglc:', 'em:pv:', 'sub:', 'vsw:', 'mtw:')):
@@ -6671,7 +6631,7 @@ def handle_callback(cq):
             text, kb = handle_em(uid, data, chat, mid)
         elif data.startswith('nt:'):
             with lock:
-                n = adm_tab()[str(uid)].setdefault('notify', default_notify())
+                n = state['admins'][str(uid)]['notify']
                 k = data[3:]
                 n[k] = not n.get(k, True)
                 save_state()
@@ -6992,8 +6952,8 @@ def handle_message(m):
                        + ('Запрос уже отправлен владельцу, ожидайте.' if already
                           else 'Запрос на доступ отправлен владельцу.'))
             if not already:
-                raw_send(OWNER, f'🙋 <b>Запрос доступа к боту</b>\n\n{h(user_label(u))}\nID: <code>{uid}</code>',
-                         [[btn('✅ Дать доступ', f'acc:{uid}'), btn('❌ Отклонить', f'rej:{uid}')]], via='own')
+                send(OWNER, f'🙋 <b>Запрос доступа к боту</b>\n\n{h(user_label(u))}\nID: <code>{uid}</code>',
+                     [[btn('✅ Дать доступ', f'acc:{uid}'), btn('❌ Отклонить', f'rej:{uid}')]])
         return
     touch_admin(u)
     CTX.chat = chat
@@ -7208,8 +7168,7 @@ def report_update_result():
         text = (f'⚠️ <b>Обновление не удалось</b>, возвращена прежняя версия {h(BOT_VERSION)}.\n'
                 f'<code>{h(rest[:400])}</code>')
     with lock:
-        want = any((a.get('notify') or {}).get('actions', True)
-                   for a in list(state['admins'].values()) + list(link_admins().values() if LINK_MODE else []))
+        want = any(a['notify'].get('actions', True) for a in state['admins'].values())
     if not notify('actions', text) and want and upd_retry[0] < 20:
         upd_retry[0] += 1                 # Telegram был недоступен — сообщим позже, а не потеряем
         with open(UPDATE_RESULT, 'w', encoding='utf-8') as f:
@@ -7412,14 +7371,10 @@ def update_tick():
         text = (f'🆕 <b>Доступна новая версия шлюза: {h(u["latest"])}</b> (у вас {h(BOT_VERSION)})')
         if u.get('changes'):
             text += '\n\n' + h(u['changes'][:1200])
-        kb = [[btn('⬇️ Обновить', 'upd:ask'), btn('Подробнее', 'upd')]]
         with lock:
-            owners = [(OWNER, 'own', state['admins'].get(str(OWNER), {}))]
-            if LINK_MODE and link_owner() and link_owner() != OWNER:
-                owners.append((link_owner(), 'main', link_admins().get(str(link_owner()), {})))
-        for who, via, a in owners:
-            if who and (a.get('notify') or {}).get('actions', True):
-                raw_send(who, gw_prefix(text), kb, via=via)
+            owner_on = state['admins'].get(str(OWNER), {}).get('notify', {}).get('actions', True)
+        if owner_on:
+            send(OWNER, text, [[btn('⬇️ Обновить', 'upd:ask'), btn('Подробнее', 'upd')]])
 
 
 # ---------------- фоновый наблюдатель ----------------
@@ -7502,6 +7457,10 @@ def watcher():
         if time.time() - last_srv >= 60:
             last_srv = time.time()
             try:
+                tunq_tick()
+            except Exception:
+                log('tunq_tick:', traceback.format_exc())
+            try:
                 srv_tick()
             except Exception:
                 log('srv_tick:', traceback.format_exc())
@@ -7546,16 +7505,8 @@ def watcher():
         time.sleep(WATCH_EVERY)
 
 
-def dispatch(u, via='own'):
-    """via: 'own' — пришло в свой бот, 'main' — главный передал нажатие или сообщение (на ведомом)."""
-    CTX.via = via
+def dispatch(u):
     try:
-        if LINK_MODE:                     # запомнить, через какой бот человек пишет: туда же пойдут ответы
-            src = ((u.get('callback_query') or u.get('message') or {}).get('from') or {})
-            if src.get('id') and ui['via'].get(str(src['id'])) != via:
-                with ui_lock:
-                    ui['via'][str(src['id'])] = via
-                ui_save()
         if not LINK_MODE and gw_nodes() and gw_route(u):
             return
         if 'callback_query' in u:
@@ -7648,11 +7599,8 @@ def gw_online(nid):
 
 
 def gw_row(uid):
-    """Строка «шлюз» в главном меню: у ведомого — в меню через главного, у главного — если человеку
-    доступно больше одного шлюза. В своём боте ведомого переключать нечего."""
-    if LINK_MODE:
-        return [btn(f'🏢 Шлюз: {GW_NAME} ⇄'[:40], 'gws')] if via_main() else None
-    if len(gw_allowed(uid)) > 1:
+    """Строка «шлюз» в главном меню: у ведомого всегда, у главного — если человеку доступно больше одного шлюза."""
+    if LINK_MODE or len(gw_allowed(uid)) > 1:
         return [btn(f'🏢 Шлюз: {GW_NAME} ⇄'[:40], 'gws')]
     return None
 
@@ -8143,15 +8091,7 @@ def handle_gw(uid, data, chat, mid):
         return scr_gws(uid)
     if act == 'set':
         if LINK_MODE:
-            return scr_gw_slave(uid)
-    if act == 'off' and LINK_MODE:
-        return ('🔌 <b>Отключить этот шлюз от главного бота?</b>\n\nИз главного бота им больше нельзя будет '
-                'управлять, этот бот продолжит работать. Подключить снова можно новым кодом из главного.',
-                [[btn('✅ Отключить', 'gw:offy'), btn('✖️ Отмена', 'gw:set')]])
-    if act == 'offy' and LINK_MODE:
-        threading.Thread(target=link_off, args=(f'отключил {admin_name(uid)}',), daemon=True).start()
-        return ('✅ Шлюз отключён от главного бота. Бот перезапустится на пару секунд.',
-                [[btn('🏠 Меню', 'menu')]])
+            return scr_menu(uid)
         return scr_gw_adm(uid) if gw_nodes() else scr_gw_solo(uid)
     if act == 'solo':
         return scr_gw_solo(uid)
@@ -8256,8 +8196,6 @@ def handle_gw_input(uid, chat, kind, wdata, text):
             with lock:
                 gw_nodes()[nid] = {'v': 2, 'name': wdata, 'created': time.time(), 'host': host, 'port': port,
                                    'paired': False, 'err': ''}
-                for a in state['admins'].values():   # новый шлюз сразу виден всем админам, лишним снимают галочку
-                    a.setdefault('gw', ['m']).append(nid)
                 save_state()
             add_event(f'{admin_name(uid)} добавил шлюз {wdata} ({host}:{port})')
             t, kb = scr_gw_node(uid, nid, '🔑 Код подключения — в следующем сообщении.')
@@ -8347,27 +8285,23 @@ def link_info():
 
 
 def link_apply_sync(msg):
-    """Главный прислал владельца, имя и тех, кому выдан этот шлюз. Свои админы и владелец не меняются."""
-    global GW_NAME
+    global OWNER, GW_NAME
     if not state.get('link'):
         return
     with lock:
         cfg = state['link']
         if msg.get('owner'):
-            cfg['owner'] = int(msg['owner'])
+            cfg['owner'] = OWNER = int(msg['owner'])
         if msg.get('name'):
             cfg['name'] = GW_NAME = msg['name']
         want = {str(a): n for a, n in (msg.get('admins') or {}).items()}
-        if cfg.get('owner'):
-            want.setdefault(str(cfg['owner']), str(cfg['owner']))
-        adm = cfg.setdefault('admins', {})
+        want.setdefault(str(OWNER), str(OWNER))
+        adm = state['admins']
         for a in list(adm):
             if a not in want:
                 adm.pop(a)
         for a, name in want.items():
-            x = adm.setdefault(a, {'name': name, 'notify': default_notify()})
-            x['name'] = name
-            x.setdefault('notify', default_notify())
+            adm.setdefault(a, {'name': name, 'notify': default_notify()})['name'] = name
         save_state()
 
 
@@ -8470,7 +8404,7 @@ def link_conn(conn):
             elif t == 'sync':
                 link_apply_sync(msg)
             elif t == 'upd':
-                threading.Thread(target=dispatch, args=(msg['u'], 'main'), daemon=True).start()
+                threading.Thread(target=dispatch, args=(msg['u'],), daemon=True).start()
             elif t == 'unlink':
                 link_off('главный бот отключил этот шлюз')
                 return
@@ -8500,27 +8434,12 @@ def link_heartbeat():
 
 
 def link_off(why):
-    """Стать снова самостоятельным. Свой бот и так работает — перезапуск только выходит из режима ведомого."""
+    """Стать снова самостоятельным: вернуть своих админов и перезапуститься со своим ботом."""
     with lock:
-        state.pop('link', None)
+        cfg = state.pop('link', None) or {}
+        if cfg.get('admins_local'):
+            state['admins'] = cfg['admins_local']
         save_state()
-    if CLI_MODE:                          # --unlink: работающий бот держит ui.json, прочитать его
-        try:
-            with open(UI_FILE, encoding='utf-8') as f:
-                d = json.load(f)
-            for k in ui:
-                if isinstance(d.get(k), type(ui[k])):
-                    ui[k] = d[k]
-        except Exception:
-            pass
-        if ui.get('v', 0) < 2:            # сообщения ещё в формате 1.7 (все от главного) — просто забыть
-            ui.update({'menu': {}, 'msgs': {}, 'del': [], 'v': 2})
-    with ui_lock:                         # сообщения главного бота этот шлюз больше не трогает
-        ui['menu'] = {k: v for k, v in ui['menu'].items() if not k.startswith('m')}
-        ui['msgs'] = {k: v for k, v in ui['msgs'].items() if not k.startswith('m')}
-        ui['del'] = [d for d in ui['del'] if (d[3] if len(d) > 3 else 'own') != 'main']
-        ui['via'] = {}
-    ui_save()
     try:
         ensure_link_user('')                  # ключ главного больше не действует
     except Exception as e:
@@ -8530,30 +8449,14 @@ def link_off(why):
     subprocess.Popen(['systemctl', 'restart', 'vpnbot'])
 
 
-def scr_gw_slave(uid, note=''):
-    cfg = state.get('link') or {}
-    up = link_cli['up']
-    lines = ['🏢 <b>Шлюзы</b>', '',
-             'Этот шлюз подключён к главному боту' + (f' @{h(cfg["bot"])}' if cfg.get('bot') else '')
-             + (f' («{h(cfg["main"])}»)' if cfg.get('main') else '') + '.',
-             ('🟢 Главный на связи.' if up else '🔴 Главный сейчас не на связи.'), '',
-             'Этот бот работает как обычно для своих админов. Из главного шлюзом управляют те, '
-             'кому его выдал владелец главного.']
-    if note:
-        lines += ['', note]
-    kb = [[btn('🔌 Отключиться от главного', 'gw:off')],
-          [btn('⬅️ Настройки', 'set'), btn('🏠 Меню', 'menu')]]
-    return '\n'.join(lines), kb
-
-
 def scr_gw_solo(uid, note=''):
     lines = ['🏢 <b>Шлюзы</b>', '',
-             'Один бот может управлять несколькими шлюзами. Главный шлюз сам подключается к ведомым по SSH. '
-             'Бот ведомого при этом продолжает работать для своих админов.', '',
+             'Один бот может управлять несколькими шлюзами. Главный шлюз сам подключается к ведомым по SSH, '
+             'боты ведомых молчат.', '',
              '➕ <b>Подключить другой шлюз сюда</b> — этот бот станет главным. Понадобится адрес того сервера, '
              'по которому до него можно достучаться по SSH отсюда.', '',
              '🔗 <b>Подключить этот шлюз к главному боту</b> — нужен код из главного бота. '
-             'Этот бот продолжит работать, а шлюзом можно будет управлять и из главного.']
+             'Этот бот после этого замолчит.']
     if note:
         lines += ['', note]
     kb = [[btn('➕ Подключить другой шлюз сюда', 'gw:new')],
@@ -8590,18 +8493,19 @@ def gw_join(uid, chat, text):
     cfg = {'nid': c['id'], 'name': c['name'], 'owner': int(c.get('o') or OWNER), 'bot': c.get('bot', ''),
            'main': c.get('main', ''), 'main_pub': c['pub']}
     with lock:
+        cfg['admins_local'] = json.loads(json.dumps(state['admins']))
         state['link'] = cfg
         save_state()
     add_event('Шлюз подключён к главному боту' + (f' @{cfg["bot"]}' if cfg['bot'] else ''))
     lan, pub = lan_ip(), public_ip()
     send(chat, '✅ <b>Готово: этот шлюз ждёт главного бота</b>' + (f' @{h(cfg["bot"])}' if cfg['bot'] else '') + '.\n\n'
          'В течение минуты главный подключится сюда по SSH, и шлюз появится в главном боте: 🏢 Шлюз ⇄ → '
-         f'«{h(cfg["name"])}». Этот бот продолжит работать для своих админов (перезапустится на пару секунд).\n\n'
+         f'«{h(cfg["name"])}». Этот бот сейчас замолчит.\n\n'
          f'Адреса этого сервера: локальный <code>{h(lan or "?")}</code>, внешний <code>{h(pub or "?")}</code>, '
          f'SSH-порт {ssh_port()}. В главном боте должен быть указан адрес, по которому этот сервер доступен '
          'с главного (при необходимости — с пробросом порта на роутере).\n\n'
-         'Если шлюз так и не появился: в главном боте откройте его — там будет причина. Отключиться от главного: '
-         '⚙️ Настройки → 🏢 Шлюзы в этом боте.')
+         'Если шлюз так и не появился: в главном боте откройте его — там будет причина. Вернуть этот бот: '
+         '<code>sudo python3 /usr/local/bin/vpnbot.py --unlink</code>')
     time.sleep(1)
     subprocess.Popen(['systemctl', 'restart', 'vpnbot'])
 
@@ -8640,15 +8544,6 @@ def report_restored():
 def gw_startup_migrate():
     """Сброс связей в формате первой сборки 1.7 (там ведомый сам подключался к главному)."""
     cfg = state.get('link')
-    if cfg and 'admins_local' in cfg:             # до 1.8: свои админы спрятаны, в state['admins'] — список главного
-        with lock:
-            local = cfg.pop('admins_local') or {}
-            cfg['admins'] = dict(state['admins'])   # главный пришлёт точный список при первой же связи
-            state['admins'] = local
-            if OWNER and str(OWNER) not in local:
-                local[str(OWNER)] = {'name': str(OWNER), 'notify': default_notify()}
-            save_state()
-        log('ведомый шлюз: свой бот снова работает для своих админов')
     if cfg and not cfg.get('main_pub'):           # схема первой сборки 1.7: ведомый сам ходил к главному
         log('связь с главным в старом формате — шлюз снова работает со своим ботом, подключите его заново')
         with lock:
@@ -8684,11 +8579,12 @@ def startup_reports():
 
 
 def main():
-    global LINK_MODE, GW_NAME
+    global LINK_MODE, OWNER, GW_NAME
     load_state()
     cfg = gw_startup_migrate()
     if cfg:
         LINK_MODE = True
+        OWNER = int(cfg.get('owner') or OWNER)
         GW_NAME = cfg.get('name') or GW_NAME
     ui_load()
     email_cfg()
@@ -8731,9 +8627,10 @@ def main():
         threading.Thread(target=startup_reports, daemon=True).start()
         add_event('Бот запущен (ведомый шлюз)')
         log('бот запущен как ведомый шлюз, ждёт главного', cfg.get('bot', ''))
-    else:
-        startup_reports()
-        add_event('Бот запущен')
+        while True:
+            time.sleep(3600)
+    startup_reports()
+    add_event('Бот запущен')
     log('бот запущен, владелец', OWNER)
     offset = None
     while True:
