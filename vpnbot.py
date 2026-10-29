@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.7.4'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '1.8.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
