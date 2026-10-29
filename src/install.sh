@@ -1133,6 +1133,8 @@ uninstall() {
         /var/lib/vpnbot /usr/local/bin/vpnbot.py /usr/local/bin/vpngw /usr/local/bin/vpngw-setup \
         /usr/local/lib/vpngw /var/lib/vpngw "$CONF_DIR" /etc/sysctl.d/99-vpngw.conf /run/vpngw
     id vpngw-link >/dev/null 2>&1 && run userdel -r vpngw-link     # вход главного бота на ведомый шлюз
+    run systemctl disable --now vpngw-zapret; rm -f /etc/systemd/system/vpngw-zapret.service   # zapret
+    nft delete table inet vpngw_zapret >/dev/null 2>&1; id vpngw-zt >/dev/null 2>&1 && run userdel vpngw-zt
     run systemctl daemon-reload
     ask "Удаление" "Удалить и сам пакет mihomo с его папкой /etc/mihomo?" 8 && { run apt-get -o DPkg::Lock::Timeout=900 remove -y mihomo; rm -rf /etc/mihomo; }
     msg "Удалено" "VPN-шлюз удалён.\nРезервная копия: $bak" 9

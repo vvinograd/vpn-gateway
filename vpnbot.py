@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.9.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.0'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -155,6 +155,7 @@ NOTIFY_KINDS = [
     ('server', '🖥 Состояние сервера (диск, память, нагрузка)'),
     ('actions', '👤 Действия админов, запуск, обновления'),
     ('backup', '💾 Резервные копии'),
+    ('zapret', '🚀 zapret: сервисы напрямую и их переход на VPN'),
 ]
 UI_FILE = '/var/lib/vpnbot/ui.json'      # чистый чат: живое меню, отправленные сообщения, таймеры удаления
 CLEAN_DEFAULTS = {'files': 3600, 'backup': 86400, 'notif': 86400}
@@ -821,6 +822,614 @@ def probe(name, tries=3):
     return 0
 
 
+# ---------------- zapret: заблокированное напрямую, без VPN ----------------
+# Для выбранных сервисов (YouTube и др.) шлюз пробует обходить блокировку провайдера прямо у себя (zapret / nfqws),
+# без VPN-сервера: полная скорость и разгрузка VPN. Устроено так:
+#   • mihomo отправляет такие сервисы в группу ZT-<сервис> = [ZAPRET, VPN]. ZAPRET — прямое соединение с меткой
+#     ZT_MARK; nftables отдаёт первые пакеты помеченных соединений в nfqws, который маскирует их от DPI.
+#   • Способ маскировки (стратегия) подбирается сам: шлюз перебирает известные стратегии, проверяя сервис
+#     тестовыми запросами от отдельного пользователя ZT_USER (его пакеты идут в отдельную очередь).
+#   • Раз в 5 минут каждый сервис проверяется; перестал открываться — сразу переключается на VPN (без перезапуска
+#     mihomo: просто выбор в группе), в фоне ищется новая стратегия; нашлась — сервис возвращается на zapret.
+#     Не нашлась — остаётся на VPN, следующая попытка через 6–24 часа.
+#   • QUIC (UDP 443) для сервисов на zapret отключается — приложения сами переходят на обычный HTTPS.
+ZT_MARK = 0x5a00
+ZT_QNUM, ZT_TEST_QNUM = 200, 201
+ZT_DIR = '/var/lib/vpngw/zapret'
+ZT_BIN = '/usr/local/lib/vpngw/nfqws'
+ZT_ENV = '/etc/vpngw/zapret.env'
+ZT_NFT = '/etc/vpngw/zapret.nft'
+ZT_UNIT = 'vpngw-zapret'
+ZT_UNIT_FILE = f'/etc/systemd/system/{ZT_UNIT}.service'
+ZT_USER = 'vpngw-zt'
+ZT_REPO = 'https://github.com/bol-van/zapret'
+ZT_CHECK_EVERY = 300
+ZT_RETRY = [6 * 3600, 12 * 3600, 24 * 3600]
+# сервис: (название, домены (с поддоменами), проверки: (адрес, минимальная скорость байт/с или 0))
+ZT_SERVICES = {
+    'youtube': ('YouTube', ['youtube.com', 'googlevideo.com', 'ytimg.com', 'ggpht.com', 'youtu.be',
+                            'youtube-nocookie.com', 'youtubei.googleapis.com', 'yt.be'],
+                [('https://www.youtube.com/', 100_000), ('https://i.ytimg.com/vi/aqz-KE-bpKQ/hqdefault.jpg', 0),
+                 ('https://redirector.googlevideo.com/report_mapping', 0)]),
+    'discord': ('Discord (чат и картинки)', ['discord.com', 'discord.gg', 'discordapp.com', 'discordapp.net',
+                                             'discord.media', 'discordcdn.com'],
+                [('https://discord.com/', 0), ('https://cdn.discordapp.com/', 0)]),
+    'linkedin': ('LinkedIn', ['linkedin.com', 'licdn.com'], [('https://www.linkedin.com/', 0)]),
+    'trackers': ('Торрент-трекеры (rutracker, nnm-club, rutor)', ['rutracker.org', 'rutracker.cc', 'rutracker.net',
+                                                                  'nnmclub.to', 'nnm-club.me', 'rutor.info',
+                                                                  'rutor.is'],
+                 [('https://rutracker.org/forum/index.php', 0)]),
+    'x': ('X (Twitter)', ['x.com', 'twitter.com', 'twimg.com', 't.co'], [('https://x.com/', 0),
+                                                                        ('https://abs.twimg.com/favicon.ico', 0)]),
+    'meta': ('Instagram и Facebook', ['instagram.com', 'cdninstagram.com', 'facebook.com', 'fbcdn.net',
+                                      'fbsbx.com'],
+             [('https://www.instagram.com/', 0), ('https://www.facebook.com/', 0)]),
+}
+ZT_SVC_MAP = {'youtube': 'youtube', 'meta': 'meta'}     # какая «подписка для сервиса» служит запасным путём
+# стратегии от мягких к жёстким (синтаксис nfqws из zapret, как в blockcheck)
+ZT_STRATS = [
+    '--dpi-desync=multidisorder --dpi-desync-split-pos=midsld',
+    '--dpi-desync=multisplit --dpi-desync-split-pos=1',
+    '--dpi-desync=multisplit --dpi-desync-split-pos=midsld',
+    '--dpi-desync=multidisorder --dpi-desync-split-pos=1,midsld',
+    '--dpi-desync=multidisorder --dpi-desync-split-pos=sniext+1',
+    '--dpi-desync=multisplit --dpi-desync-split-pos=1,sniext+1,host+1,midsld-2,midsld,midsld+2,endhost-1',
+    '--dpi-desync=fake,multidisorder --dpi-desync-split-pos=midsld --dpi-desync-fooling=badseq',
+    '--dpi-desync=fake,multisplit --dpi-desync-split-pos=midsld --dpi-desync-fooling=badseq',
+    '--dpi-desync=fakedsplit --dpi-desync-split-pos=midsld --dpi-desync-fooling=badseq',
+    '--dpi-desync=fake --dpi-desync-fooling=badseq',
+    '--dpi-desync=fake --dpi-desync-fooling=md5sig',
+    '--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-repeats=6 '
+    '--dpi-desync-fooling=badseq,md5sig',
+    '--dpi-desync=fake --dpi-desync-ttl=4',
+    '--dpi-desync=fake,multisplit --dpi-desync-split-pos=1 --dpi-desync-ttl=5',
+]
+ZT_ICON = {'zapret': '🚀', 'direct': '🟢', 'vpn': '🔒', 'search': '🔎', 'new': '🔎', 'off': '⏸'}
+zt_lock = threading.Lock()            # одна проверка за раз (одна тестовая очередь)
+zt_q = []                             # очередь подбора стратегий
+zt_rt = {'worker': False, 'last_check': 0, 'busy': '', 'installing': False, 'msg': ''}
+
+
+def zt():
+    z = state.setdefault('zt', {})
+    z.setdefault('on', False)
+    s = z.setdefault('svc', {})
+    for k in ZT_SERVICES:
+        s.setdefault(k, {'en': True, 'st': 'new', 'strat': None, 'next': 0, 'bad': 0, 'n': 0})
+    return z
+
+
+def zt_installed():
+    return os.path.exists(ZT_BIN)
+
+
+def zt_keys():
+    """Сервисы, для которых в конфиге mihomo нужны правила zapret."""
+    z = state.get('zt') or {}
+    if not z.get('on'):
+        return []
+    return [k for k in ZT_SERVICES if (z.get('svc') or {}).get(k, {}).get('en', True)]
+
+
+def zt_fallback(k, v=None):
+    v = v or state.get('vpn') or {}
+    pid = (v.get('svc') or {}).get(ZT_SVC_MAP.get(k, ''))
+    return f'VIA-{pid}' if pid and sub_by_id(pid) else SELECT_GROUP
+
+
+def zt_render(v):
+    """(proxies, groups, rules) для конфига mihomo."""
+    keys = zt_keys()
+    if not keys:
+        return [], [], []
+    proxies = ['proxies:', f'  - {{name: ZAPRET, type: direct, routing-mark: {ZT_MARK}, udp: true}}']
+    groups, rules = [], []
+    for k in keys:
+        fb = zt_fallback(k, v)
+        groups += [f'  - name: ZT-{k}', '    type: select', f'    proxies: [ZAPRET, {fb}]',
+                   f'  - name: ZTQ-{k}', '    type: select', f'    proxies: [REJECT, {fb}]']
+        for d in ZT_SERVICES[k][1]:
+            rules.append(f'AND,((NETWORK,UDP),(DOMAIN-SUFFIX,{d})),ZTQ-{k}')
+        rules += [f'DOMAIN-SUFFIX,{d},ZT-{k}' for d in ZT_SERVICES[k][1]]
+    return proxies, groups, rules
+
+
+def zt_want(k):
+    st = zt()['svc'][k]['st']
+    return st in ('zapret', 'direct')
+
+
+def zt_select():
+    """Выставить выбор в группах ZT-*/ZTQ-* по текущим состояниям (без перезапуска mihomo)."""
+    for k in zt_keys():
+        on = zt_want(k)
+        fb = zt_fallback(k)
+        for grp, want in ((f'ZT-{k}', 'ZAPRET' if on else fb), (f'ZTQ-{k}', 'REJECT' if on else fb)):
+            try:
+                if (api(f'/proxies/{q(grp)}') or {}).get('now') != want:
+                    api(f'/proxies/{q(grp)}', 'PUT', {'name': want})
+            except Exception:
+                pass
+
+
+# --- установка ---
+ZT_NFT_TEXT = f'''table inet vpngw_zapret
+flush table inet vpngw_zapret
+table inet vpngw_zapret {{
+    chain out {{
+        type filter hook output priority mangle; policy accept;
+        meta mark & 0x40000000 != 0 return
+        tcp dport {{ 80, 443 }} meta mark {ZT_MARK:#x} ct original packets 1-6 queue num {ZT_QNUM} bypass
+        tcp dport {{ 80, 443 }} meta skuid "{ZT_USER}" ct original packets 1-6 queue num {ZT_TEST_QNUM} bypass
+    }}
+}}
+'''
+ZT_UNIT_TEXT = f'''[Unit]
+Description=vpn-gateway: zapret (nfqws) для выбранных сервисов
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile={ZT_ENV}
+ExecStartPre=/usr/sbin/nft -f {ZT_NFT}
+ExecStart={ZT_BIN} $ZT_ARGS
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+
+def zt_install(say=None):
+    say = say or (lambda t: None)
+    zt_rt['installing'] = True
+    try:
+        say('📦 Ставлю пакеты для сборки (1–2 минуты)…')
+        r = run(['apt-get', '-o', 'DPkg::Lock::Timeout=600', 'install', '-y', '-qq', 'git', 'make', 'gcc',
+                 'libnetfilter-queue-dev', 'libmnl-dev', 'libcap-dev', 'zlib1g-dev', 'nftables', 'curl'], 900)
+        if r.returncode != 0:
+            raise RuntimeError('apt: ' + (r.stderr or r.stdout)[-300:])
+        say('⬇️ Скачиваю zapret с GitHub…')
+        src = f'{ZT_DIR}/src'
+        shutil.rmtree(src, ignore_errors=True)
+        os.makedirs(ZT_DIR, exist_ok=True)
+        r = run(['git', 'clone', '--depth', '1', ZT_REPO, src], 300)
+        if r.returncode != 0:
+            shutil.rmtree(src, ignore_errors=True)
+            r = run(['git', '-c', f'http.proxy={PROXY_URL}', 'clone', '--depth', '1', ZT_REPO, src], 300)
+        if r.returncode != 0:
+            raise RuntimeError('git: ' + r.stderr[-300:])
+        say('🔨 Собираю nfqws…')
+        r = run(['make', '-C', f'{src}/nfq'], 600)
+        if r.returncode != 0 or not os.path.exists(f'{src}/nfq/nfqws'):
+            raise RuntimeError('сборка: ' + (r.stderr or r.stdout)[-300:])
+        os.makedirs(os.path.dirname(ZT_BIN), exist_ok=True)
+        shutil.copy2(f'{src}/nfq/nfqws', ZT_BIN + '.new')
+        os.chmod(ZT_BIN + '.new', 0o755)
+        os.replace(ZT_BIN + '.new', ZT_BIN)
+        ver = run(['git', '-C', src, 'log', '-1', '--format=%h %cs'], 10).stdout.strip()
+        with lock:
+            zt()['ver'] = ver
+            save_state()
+        zt_prepare()
+        return ver
+    finally:
+        zt_rt['installing'] = False
+
+
+def zt_prepare():
+    """Пользователь для проверок, правила nftables и служба (без запуска)."""
+    if run(['id', ZT_USER], 5).returncode != 0:
+        run(['useradd', '-r', '-M', '-s', '/usr/sbin/nologin', ZT_USER], 30)
+    run(['sysctl', '-w', 'net.netfilter.nf_conntrack_tcp_be_liberal=1'], 10)
+    os.makedirs(os.path.dirname(ZT_NFT), exist_ok=True)
+    with open(ZT_NFT, 'w') as f:
+        f.write(ZT_NFT_TEXT)
+    if not os.path.exists(ZT_ENV):
+        with open(ZT_ENV, 'w') as f:
+            f.write(f'ZT_ARGS=--qnum={ZT_QNUM}\n')
+    with open(ZT_UNIT_FILE, 'w') as f:
+        f.write(ZT_UNIT_TEXT)
+    run(['systemctl', 'daemon-reload'], 30)
+    r = run(['nft', '-f', ZT_NFT], 20)
+    if r.returncode != 0:
+        raise RuntimeError('nftables: ' + r.stderr[-300:])
+    run(['sysctl', '-w', 'net.netfilter.nf_conntrack_tcp_be_liberal=1'], 10)
+
+
+def zt_args():
+    """Аргументы рабочего nfqws: профиль на каждую стратегию со списком доменов её сервисов."""
+    by = {}
+    for k in zt_keys():
+        s = zt()['svc'][k]
+        if s['st'] == 'zapret' and s.get('strat'):
+            by.setdefault(s['strat'], []).extend(ZT_SERVICES[k][1])
+    if not by:
+        return None
+    os.makedirs(ZT_DIR, exist_ok=True)
+    parts = [f'--qnum={ZT_QNUM}']
+    for i, (strat, doms) in enumerate(sorted(by.items())):
+        path = f'{ZT_DIR}/hosts{i}.txt'
+        with open(path, 'w') as f:
+            f.write('\n'.join(sorted(set(doms))) + '\n')
+        if i:
+            parts.append('--new')
+        parts += ['--filter-tcp=80,443', f'--hostlist={path}', strat]
+    return ' '.join(parts)
+
+
+def zt_apply_nfqws():
+    args = zt_args()
+    if not args:
+        run(['systemctl', 'disable', '--now', ZT_UNIT], 30)
+        return
+    new = f'ZT_ARGS={args}\n'
+    try:
+        old = open(ZT_ENV).read()
+    except Exception:
+        old = ''
+    if old != new:
+        with open(ZT_ENV, 'w') as f:
+            f.write(new)
+        run(['systemctl', 'enable', ZT_UNIT], 30)
+        run(['systemctl', 'restart', ZT_UNIT], 30)
+    elif run(['systemctl', 'is-active', '--quiet', ZT_UNIT], 10).returncode != 0:
+        run(['systemctl', 'enable', '--now', ZT_UNIT], 30)
+
+
+# --- проверки ---
+def zt_curl(url, speed=0):
+    r = run(['runuser', '-u', ZT_USER, '--', 'curl', '-sS', '-o', '/dev/null', '--connect-timeout', '4',
+             '--max-time', '10', '-w', '%{speed_download}', url], 20)
+    if r.returncode != 0:
+        return False
+    try:
+        return not speed or float(r.stdout.strip() or 0) >= speed
+    except ValueError:
+        return False
+
+
+def zt_try(strat, tests, tries=1):
+    """Открываются ли адреса со стратегией strat ('' — без обхода)? None — стратегия не запустилась."""
+    with zt_lock:
+        proc = None
+        if strat:
+            proc = subprocess.Popen([ZT_BIN, f'--qnum={ZT_TEST_QNUM}'] + shlex.split(strat),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.7)
+            if proc.poll() is not None:
+                return None           # nfqws не принял параметры
+        try:
+            for url, speed in tests:
+                if not any(zt_curl(url, speed) for _ in range(tries)):
+                    return False
+            return True
+        finally:
+            if proc:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except Exception:
+                    proc.kill()
+
+
+def zt_search(k):
+    """Подобрать стратегию для сервиса: '' — обход не нужен, строка — стратегия, None — ничего не помогло."""
+    tests = ZT_SERVICES[k][2]
+    known = [s['strat'] for kk, s in zt()['svc'].items() if kk != k and s.get('strat')]
+    cur = zt()['svc'][k].get('strat')
+    order = []
+    for s in ([''] + ([cur] if cur else []) + known + ZT_STRATS):
+        if s not in order:
+            order.append(s)
+    for s in order:
+        zt_rt['busy'] = f'{ZT_SERVICES[k][0]}: {s or "без обхода"}'
+        if zt_try(s, tests):
+            return s
+    return None
+
+
+def zt_kick(keys):
+    for k in keys:
+        if k not in zt_q:
+            zt_q.append(k)
+    if not zt_rt['worker']:
+        zt_rt['worker'] = True
+        threading.Thread(target=zt_worker, daemon=True).start()
+
+
+def zt_worker():
+    results = []
+    try:
+        while zt_q:
+            k = zt_q.pop(0)
+            z = zt()
+            s = z['svc'][k]
+            if not z.get('on') or not s.get('en', True):
+                continue
+            prev = s['st']
+            with lock:
+                s['st'] = 'search'
+                save_state()
+            zt_select()
+            try:
+                found = zt_search(k)
+            except Exception as e:
+                log('zapret: подбор', k, e)
+                found = None
+            with lock:
+                if found is None:
+                    s['st'] = 'vpn'
+                    s['n'] = min(s.get('n', 0) + 1, len(ZT_RETRY))
+                    s['next'] = time.time() + ZT_RETRY[s['n'] - 1]
+                else:
+                    s['st'] = 'zapret' if found else 'direct'
+                    s['strat'] = found
+                    s['n'] = 0
+                    s['bad'] = 0
+                save_state()
+            zt_apply_nfqws()
+            zt_select()
+            results.append((k, prev, s['st'], s.get('strat')))
+            title = ZT_SERVICES[k][0]
+            add_event(f'zapret: {title} — ' + {'zapret': f'напрямую через zapret ({found})', 'direct':
+                                               'напрямую, обход не нужен', 'vpn': 'через VPN, обход не найден'}[s['st']])
+    finally:
+        zt_rt['worker'] = False
+        zt_rt['busy'] = ''
+    results = [x for x in results if not (x[1] == 'vpn' and x[2] == 'vpn')]   # повторная неудача — молча
+    if results:
+        zt_report(results)
+
+
+def zt_report(results):
+    lines = []
+    for k, prev, st, strat in results:
+        title = ZT_SERVICES[k][0]
+        if st == 'zapret':
+            lines.append(f'🚀 {h(title)} — напрямую через zapret' + (' (снова)' if prev in ('vpn', 'search') else ''))
+        elif st == 'direct':
+            lines.append(f'🟢 {h(title)} — напрямую, обход не нужен')
+        else:
+            nxt = zt()['svc'][k].get('next')
+            lines.append(f'🔒 {h(title)} — через VPN, обход не найден'
+                         + (f' (новая попытка {time.strftime("%d.%m %H:%M", time.localtime(nxt))})' if nxt else ''))
+    notify('zapret', '🚀 <b>zapret: результат подбора</b>\n\n' + '\n'.join(lines))
+
+
+def zt_tick():
+    z = state.get('zt') or {}
+    if not z.get('on') or not zt_installed() or zt_rt['installing']:
+        return
+    zt_select()
+    now = time.time()
+    if now - zt_rt['last_check'] < ZT_CHECK_EVERY or zt_rt['worker']:
+        return
+    zt_rt['last_check'] = now
+    if any(zt()['svc'][k]['st'] == 'zapret' for k in zt_keys()):
+        zt_apply_nfqws()                  # служба упала или параметры не совпадают — поднять
+    todo = []
+    for k in zt_keys():
+        s = zt()['svc'][k]
+        if s['st'] in ('new', 'search'):
+            todo.append(k)
+        elif s['st'] == 'vpn' and now >= s.get('next', 0):
+            todo.append(k)
+        elif s['st'] in ('zapret', 'direct'):
+            ok = zt_try(s.get('strat') or '', ZT_SERVICES[k][2][:1], tries=2)
+            if ok:
+                if s.get('bad'):
+                    with lock:
+                        s['bad'] = 0
+                        save_state()
+                continue
+            with lock:
+                s['bad'] = s.get('bad', 0) + 1
+                save_state()
+            if s['bad'] >= 2:
+                with lock:
+                    s['st'] = 'search'
+                    save_state()
+                zt_select()           # сразу на VPN
+                title = ZT_SERVICES[k][0]
+                add_event(f'zapret: {title} перестал открываться напрямую — временно через VPN, ищу новый способ')
+                notify('zapret', f'🔁 <b>{h(title)}: zapret перестал справляться</b>\n\nВременно идёт через VPN — '
+                                 'пользователи этого не заметят. Подбираю новый способ обхода, это несколько минут.')
+                todo.append(k)
+    if todo:
+        zt_kick(todo)
+
+
+def zt_startup():
+    """После запуска бота: доустановить, если включено (например, после переезда из копии), и привести в порядок."""
+    z = state.get('zt') or {}
+    if not z.get('on'):
+        return
+    time.sleep(30)
+    try:
+        if not zt_installed():
+            zt_install()
+        zt_prepare()
+        zt_apply_nfqws()
+        zt_select()
+    except Exception as e:
+        log('zapret: запуск', e)
+
+
+# --- экран ---
+def zt_status_line():
+    z = state.get('zt') or {}
+    if not z.get('on'):
+        return ''
+    parts = [f'{ZT_ICON.get(zt()["svc"][k]["st"], "▫️")} {ZT_SERVICES[k][0].split(" (")[0]}' for k in zt_keys()]
+    return '🚀 zapret: ' + ', '.join(parts)
+
+
+def scr_zt(uid, note=''):
+    z = zt()
+    lines = ['🚀 <b>zapret: заблокированное напрямую</b>', '',
+             'Шлюз сам обходит блокировку провайдера для выбранных сервисов — без VPN-сервера: полная скорость '
+             'и разгрузка VPN. Способ обхода подбирается сам и проверяется каждые 5 минут; перестал работать — '
+             'сервис сразу уходит на VPN, а шлюз ищет новый способ.', '']
+    if not z['on']:
+        lines.append('Сейчас: ⛔ выключен' + (f' (zapret установлен: {h(z.get("ver", ""))})' if zt_installed() else ''))
+    else:
+        lines.append(f'Сейчас: ✅ включён · zapret {h(z.get("ver", "?"))}')
+        if zt_rt['busy']:
+            lines.append(f'🔎 Проверяю: {h(zt_rt["busy"])}')
+        lines.append('')
+        for k, (title, _, _) in ZT_SERVICES.items():
+            s = z['svc'][k]
+            if not s.get('en', True):
+                lines.append(f'⏸ {h(title)} — не используется')
+                continue
+            st = s['st']
+            txt = {'zapret': 'напрямую через zapret', 'direct': 'напрямую, обход не нужен',
+                   'vpn': 'через VPN — обход не найден', 'search': 'подбираю способ…', 'new': 'ещё не проверен'}[st]
+            if st == 'vpn' and s.get('next'):
+                txt += f', новая попытка {time.strftime("%d.%m %H:%M", time.localtime(s["next"]))}'
+            lines.append(f'{ZT_ICON[st]} {h(title)} — {txt}')
+            if st == 'zapret' and s.get('strat'):
+                lines.append(f'      <code>{h(s["strat"])}</code>')
+        lines += ['', 'zapret помогает, когда сайт блокируют по имени. Где блокируют по IP или сервис сам не пускает '
+                      'из России, шлюз оставит сервис на VPN — ничего выбирать не нужно.']
+    if zt_rt['installing']:
+        lines += ['', '⏳ Идёт установка…']
+    if note:
+        lines += ['', note]
+    kb = []
+    if not z['on']:
+        kb.append([btn('✅ Включить zapret', 'zt:on')])
+    else:
+        for k, (title, _, _) in ZT_SERVICES.items():
+            en = z['svc'][k].get('en', True)
+            kb.append([btn((('✅ ' if en else '▫️ ') + title)[:40], f'zt:s:{k}')])
+        kb.append([btn('🔁 Подобрать заново', 'zt:re'), btn('🔄 Обновить', 'zt')])
+        kb.append([btn('⛔ Выключить zapret', 'zt:off')])
+    kb.append([btn('⬅️ Маршрутизация', 'swr')])
+    return '\n'.join(lines), kb
+
+
+def zt_direct_ok():
+    """Свой трафик шлюза должен уходить в интернет напрямую. Если роутер заворачивает его обратно в туннель
+    (маршруты на MikroTik), прямой выход совпадёт с выходом VPN — тогда zapret включать нельзя: будет петля."""
+    try:
+        with direct_opener.open(urllib.request.Request('https://www.cloudflare.com/cdn-cgi/trace',
+                                                       headers={'User-Agent': 'curl/8.5'}), timeout=10) as r:
+            m = re.search(r'^ip=(\S+)', r.read(4096).decode(), re.M)
+        direct = m.group(1) if m else ''
+    except Exception:
+        return True                   # не удалось проверить — не мешаем
+    return not direct or direct != exit_ip()
+
+
+ZT_LOOP_HINT = ('Свой трафик шлюза уходит в интернет через VPN, а не напрямую — так бывает, когда роутер (MikroTik) '
+                'заворачивает зарубежные адреса обратно в туннель к шлюзу. С zapret это была бы петля.\n\n'
+                'Нужно правило на MikroTik: трафик самого шлюза — напрямую в интернет. Пример (подставьте адрес шлюза '
+                'и шлюз провайдера):\n<code>/routing table add name=gw-direct fib\n'
+                '/ip route add dst-address=0.0.0.0/0 gateway=ШЛЮЗ_ПРОВАЙДЕРА routing-table=gw-direct check-gateway=ping\n'
+                '/routing rule add src-address=АДРЕС_ШЛЮЗА/32 dst-address=192.168.0.0/16 action=lookup table=main\n'
+                '/routing rule add src-address=АДРЕС_ШЛЮЗА/32 action=lookup-only-in-table table=gw-direct</code>')
+
+
+def zt_enable(uid, chat, mid):
+    def say(t):
+        edit(chat, mid, f'🚀 <b>Включаю zapret</b>\n\n{t}')
+    try:
+        say('🔎 Проверяю, что шлюз выходит в интернет напрямую…')
+        if not zt_direct_ok():
+            t, kb = scr_zt(uid, '⚠️ ' + ZT_LOOP_HINT)
+            edit(chat, mid, t, kb)
+            return
+        if not zt_installed():
+            ver = zt_install(say)
+        else:
+            zt_prepare()
+            ver = zt().get('ver', '')
+        say('⚙️ Добавляю правила в mihomo — VPN прервётся на 5–10 секунд…')
+        v = vpn()
+        with lock:
+            z = zt()
+            z['on'] = True
+            for s in z['svc'].values():
+                if s['st'] not in ('zapret', 'direct'):
+                    s['st'] = 'new'
+                s['bad'] = 0
+            save_state()
+        apply_vpn_config(v)
+        time.sleep(5)
+        zt_select()
+        add_event(f'{admin_name(uid)} включил zapret ({ver})')
+        zt_rt['last_check'] = time.time()
+        zt_kick(zt_keys())
+        t, kb = scr_zt(uid, '✅ zapret включён. Подбираю способы обхода для каждого сервиса — это несколько минут, '
+                            'результат пришлю отдельным сообщением.')
+    except Exception as e:
+        log('zapret: включение', traceback.format_exc())
+        with lock:
+            zt()['on'] = False
+            save_state()
+        t, kb = scr_zt(uid, f'🔴 Не удалось включить: <code>{h(str(e))[:400]}</code>')
+    edit(chat, mid, t, kb)
+
+
+def handle_zt(uid, data, chat, mid):
+    act = data.split(':')
+    z = zt()
+    if len(act) == 1:
+        return scr_zt(uid)
+    a = act[1]
+    if a == 'on':
+        if zt_rt['installing']:
+            return scr_zt(uid, '⏳ Установка уже идёт.')
+        edit(chat, mid, '🚀 <b>Включаю zapret</b>\n\n⏳ Начинаю…')
+        threading.Thread(target=zt_enable, args=(uid, chat, mid), daemon=True).start()
+        return None
+    if a == 'off':
+        edit(chat, mid, '⏳ Выключаю zapret, VPN прервётся на 5–10 секунд…')
+        with lock:
+            z['on'] = False
+            save_state()
+        zt_q.clear()
+        try:
+            apply_vpn_config(vpn())
+        except Exception as e:
+            return scr_zt(uid, f'🔴 Не удалось применить: <code>{h(str(e))[:300]}</code>')
+        run(['systemctl', 'disable', '--now', ZT_UNIT], 30)
+        add_event(f'{admin_name(uid)} выключил zapret')
+        return scr_zt(uid, '⛔ zapret выключен: все сервисы снова идут как раньше.')
+    if a == 're':
+        with lock:
+            for k in zt_keys():
+                z['svc'][k]['next'] = 0
+                if z['svc'][k]['st'] == 'vpn':
+                    z['svc'][k]['st'] = 'new'
+            save_state()
+        zt_kick(zt_keys())
+        return scr_zt(uid, '🔁 Подбираю заново — результат пришлю отдельным сообщением.')
+    if a == 's' and len(act) > 2 and act[2] in ZT_SERVICES:
+        k = act[2]
+        edit(chat, mid, '⏳ Применяю, VPN прервётся на 5–10 секунд…')
+        with lock:
+            s = z['svc'][k]
+            s['en'] = not s.get('en', True)
+            if s['en']:
+                s['st'] = 'new'
+            save_state()
+        try:
+            apply_vpn_config(vpn())
+        except Exception as e:
+            return scr_zt(uid, f'🔴 Не удалось применить: <code>{h(str(e))[:300]}</code>')
+        zt_apply_nfqws()
+        time.sleep(3)
+        zt_select()
+        if z['svc'][k]['en']:
+            zt_kick([k])
+        return scr_zt(uid)
+    return scr_zt(uid)
+
+
 # ---------------- самодиагностика и самовосстановление ----------------
 # Отдельный поток раз в 20 секунд:
 #   • очередь новых соединений mihomo (вход из туннеля): держится выше 64 и не убывает ~1 минуту — mihomo завис,
@@ -849,7 +1458,7 @@ PIN_MIN_AGE = 600
 MANUAL_TTLS = [3600, 7200, 28800, 86400, 0]
 MANUAL_TTL_DEFAULT = 7200
 TUNQ_STUCK = 64                   # у работающего mihomo очередь почти всегда 0
-TUNQ_TICKS = 3                    # столько проверок подряд (по 20 с) очередь держится и не убывает — завис
+TUNQ_TICKS = 2                    # столько проверок подряд (по 20 с) очередь держится и не убывает — завис
 QUEUE_SYSCTL = '/etc/sysctl.d/98-vpngw-queue.conf'
 QUEUE_SIZE = 65535
 svc_bad = {}                      # сервер → {'svc': [...], 'why': текст, 'ts': время, 'n': сколько раз}
@@ -1084,6 +1693,10 @@ def health_loop():
             tunq_tick()
         except Exception:
             log('tunq_tick:', traceback.format_exc())
+        try:
+            zt_tick()
+        except Exception:
+            log('zt_tick:', traceback.format_exc())
         if time.time() - started < 120:
             continue
         try:
@@ -1136,7 +1749,7 @@ def tunq_tick():
     n = len(tunq['restarts'])
     v = state.get('vpn') or {}
     stack = tun_stack()
-    to_gvisor = n >= 3 and stack == 'system' and v.get('tun_auto', True)
+    to_gvisor = n >= 2 and stack == 'system' and v.get('tun_auto', True)
     log(f'очередь новых соединений mihomo не разбирается ({qn}/{lim}) — ' + ('перевожу TUN на gvisor' if to_gvisor
                                                                              else 'перезапуск'))
     if to_gvisor:
@@ -1292,6 +1905,8 @@ def scr_diag(uid, note=''):
     n = len([t for t in tunq['restarts'] if time.time() - t < 86400])
     lines.append(f'Зависаний mihomo за сутки: {n}' + (f', последнее {fmt_ago(tunq["last_restart"])}' if n else ''))
     lines.append(f'Автопереход на gvisor при частых зависаниях: {"✅" if v.get("tun_auto", True) else "⛔"}')
+    if zt_status_line():
+        lines += ['', zt_status_line()]
     if note:
         lines += ['', note]
     kb = [[btn('🧪 Проверить все серверы', 'diag:test')],
@@ -1393,7 +2008,7 @@ def snapshot(v):
     return {'interval': v['interval'], 'tolerance': v['tolerance'], 'excluded': sorted(v['excluded']),
             'routing': v.get('routing', 'all'), 'rules_direct': list(v.get('rules_direct', [])),
             'rules_proxy': list(v.get('rules_proxy', [])), 'svc': dict(sorted((v.get('svc') or {}).items())),
-            'list_svc': sorted(v.get('list_svc', LIST_DEFAULT)), 'fmt': CFG_FORMAT}
+            'list_svc': sorted(v.get('list_svc', LIST_DEFAULT)), 'zt': zt_keys(), 'fmt': CFG_FORMAT}
 
 
 ROUTING = {
@@ -1460,6 +2075,10 @@ def vpn_migrate(v):
             v['svc'] = {}
             if v.get('applied') is not None:
                 v['applied'].setdefault('svc', {})
+            save_state()
+    if v.get('applied') is not None and 'zt' not in v['applied']:
+        with lock:
+            v['applied']['zt'] = zt_keys()
             save_state()
     if 'list_svc' not in v:
         with lock:
@@ -1541,6 +2160,9 @@ def build_managed(v):
     if v['excluded']:
         pat += '|^(?:' + '|'.join(rx_escape(n) for n in v['excluded']) + ')$'
     use = '[' + ', '.join(x['id'] for x in subs()) + ']'
+    zt_proxies, zt_groups, zt_rules = zt_render(v)
+    if zt_proxies:
+        out += zt_proxies + ['']
     out.append(build_providers().rstrip('\n'))
     out.append('')
     out += ['proxy-groups:', f'  - name: {AUTO_GROUP}', '    type: url-test', f'    use: {use}',
@@ -1555,6 +2177,7 @@ def build_managed(v):
                 f'    interval: {v["interval"]}', f'    tolerance: {v["tolerance"]}', '    lazy: false',
                 f'  - name: VIA-{pid}', '    type: fallback', f'    proxies: [SUB-{pid}, {SELECT_GROUP}]',
                 '    url: https://www.gstatic.com/generate_204', '    interval: 120', '    lazy: false']
+    out += zt_groups
     out += ['', 'rules:']
     rules = ['IP-CIDR,10.0.0.0/8,DIRECT,no-resolve', 'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
              'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve', 'IP-CIDR,100.64.0.0/10,DIRECT,no-resolve',
@@ -1564,6 +2187,7 @@ def build_managed(v):
     rules += [target_rule(t, SELECT_GROUP) for t in v.get('rules_proxy', [])]
     rules += [target_rule(t, 'DIRECT') for t in v.get('rules_direct', [])]
     rules += [x + ',DIRECT' + (',no-resolve' if x.startswith('IP-') else '') for x in RU_APPS_DIRECT]
+    rules += zt_rules
     for key, pid in svc.items():
         rules += [f'{x.split(",")[0]},{x.split(",")[1]},VIA-{pid}' + (',no-resolve' if x.endswith('no-resolve') else '')
                   for x in SERVICES[key][1]]
@@ -1590,7 +2214,7 @@ def build_managed(v):
 
 
 MANAGED_KEYS = {'geodata-mode', 'geodata-loader', 'geox-url', 'geo-auto-update', 'geo-update-interval',
-                'dns', 'sniffer', 'proxy-providers', 'proxy-groups', 'rules', 'rule-providers'}
+                'dns', 'sniffer', 'proxies', 'proxy-providers', 'proxy-groups', 'rules', 'rule-providers'}
 
 
 def render_config(txt, v):
@@ -2547,7 +3171,8 @@ def scr_sw_route(uid, note=''):
     if cur == 'list':
         kb.append([btn(f'📋 Сервисы через VPN ({len(v.get("list_svc", LIST_DEFAULT))})', 'swl')])
     kb.append([btn('✏️ Исключения', 'swe'), btn('🎯 Сервисы через подписку', 'svs')])
-    kb.append([btn('🔎 Куда идёт сайт', 'site')])
+    kb.append([btn('🔎 Куда идёт сайт', 'site'), btn('🚀 zapret' + (' ✅' if (state.get('zt') or {}).get('on') else ''),
+                                                    'zt')])
     if vpn_dirty(v):
         kb.append([btn('✅ Применить', 'swapply:r'), btn('↩️ Отменить', 'swreset:r')])
     kb.append([btn('⬅️ Настройки', 'set'), btn('🏠 Меню', 'menu')])
@@ -5886,7 +6511,7 @@ SCREENS = {'menu': scr_menu, 'status': scr_status, 'servers': scr_servers, 'traf
            'srvthr': scr_srv_thr, 'vs': scr_vs, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'diag': scr_diag, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
            'swi': lambda uid: scr_sw_choice(uid, 'i'), 'swt': lambda uid: scr_sw_choice(uid, 't')}
 # клиентами WireGuard управляют все админы; общие настройки шлюза — только владелец
-OWNER_ONLY = ('diag:set:', 'diag:auto', 'vs', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
+OWNER_ONLY = ('zt:', 'diag:set:', 'diag:auto', 'vs', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
               'upd:', 'subs', 'sub:', 'srvthr', 'srvt:', 'srvclean')
 
 CONFIRM = {
@@ -6983,6 +7608,11 @@ def handle_callback(cq):
             text, kb = res
         elif data.startswith('sw'):
             text, kb = handle_sw(uid, data, chat, mid)
+        elif data == 'zt' or data.startswith('zt:'):
+            res = handle_zt(uid, data, chat, mid)
+            if res is None:
+                return
+            text, kb = res
         elif data.startswith('diag:'):
             text, kb = handle_diag(uid, data, chat, mid)
         elif data == 'gws':
@@ -8975,6 +9605,7 @@ def main():
     threading.Thread(target=fmt_autoapply, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
     threading.Thread(target=queue_upgrade, daemon=True).start()
+    threading.Thread(target=zt_startup, daemon=True).start()
     if LINK_MODE:
         touch_alive()
         try:
