@@ -354,12 +354,16 @@ wait_apt() {
 install_mihomo() {
     wait_apt
     info "Скачиваю mihomo…"
-    local url
-    url=$(curl -s -m 20 https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
-          | grep -oE "https://[^\"]+mihomo-linux-${ARCH_ASSET}-v[0-9.]+\.deb" | head -1)
-    [ -n "$url" ] || url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_FALLBACK}/mihomo-linux-${ARCH_ASSET}-${MIHOMO_FALLBACK}.deb"
+    # ставим проверенную версию: в v1.19.33 mihomo со stack: system перестаёт принимать новые соединения
+    local url latest
+    url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_FALLBACK}/mihomo-linux-${ARCH_ASSET}-${MIHOMO_FALLBACK}.deb"
     log "mihomo: $url"
-    curl -fsSL -m 300 -o "$TMP/mihomo.deb" "$url" >>"$LOG" 2>&1 || { die "Не удалось скачать mihomo с GitHub."; return 1; }
+    if ! curl -fsSL -m 300 -o "$TMP/mihomo.deb" "$url" >>"$LOG" 2>&1; then
+        latest=$(curl -s -m 20 https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+                 | grep -oE "https://[^\"]+mihomo-linux-${ARCH_ASSET}-v[0-9.]+\.deb" | head -1)
+        [ -n "$latest" ] && log "mihomo: $latest" && curl -fsSL -m 300 -o "$TMP/mihomo.deb" "$latest" >>"$LOG" 2>&1 \
+            || { die "Не удалось скачать mihomo с GitHub."; return 1; }
+    fi
     run apt-get -o DPkg::Lock::Timeout=900 install -y -qq -o Dpkg::Options::=--force-confold "$TMP/mihomo.deb" || { die "Не удалось установить mihomo."; return 1; }
     command -v mihomo >/dev/null || { die "mihomo не найден после установки."; return 1; }
     return 0
@@ -443,7 +447,7 @@ EOF
 [Service]
 ExecStartPost=/bin/sh -c 'for i in $$(seq 1 30); do ip link show mihomo >/dev/null 2>&1 && break; sleep 0.5; done; ip route replace default dev mihomo table 100'
 EOF
-    printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=2\n' >/etc/sysctl.d/99-vpngw.conf
+    printf 'net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=2\nnet.core.somaxconn=65535\nnet.ipv4.tcp_max_syn_backlog=65535\n' >/etc/sysctl.d/99-vpngw.conf
     run sysctl --system
     run systemctl daemon-reload
     run systemctl enable mihomo

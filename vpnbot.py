@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '1.8.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '1.9.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -737,11 +737,23 @@ def provider(pid=None):
     return api(f'/providers/proxies/{pid or subs()[0]["id"]}')
 
 
+def by_test_url(p):
+    """Состояние сервера по проверке автовыбора. Верхние alive/history mihomo пишет после любой проверки
+    (в том числе наших проверок Telegram и YouTube), а по адресу автовыбора — только его собственные."""
+    e = (p.get('extra') or {}).get(TEST_URL)
+    if isinstance(e, dict):
+        p['alive'] = e.get('alive', p.get('alive', True))
+        if e.get('history'):
+            p['history'] = e['history']
+    return p
+
+
 def servers():
     res = []
     for sb in subs():
         try:
             for p in provider(sb['id']).get('proxies') or []:
+                by_test_url(p)
                 if not HIDE_RE.search(p['name']):
                     p['_prov'] = sb['id']
                     SRV_PROV[p['name']] = sb['id']
@@ -770,7 +782,7 @@ def server_info(name):
         except Exception:
             pass
     try:
-        return api(f'/providers/proxies/{SRV_PROV.get(name, subs()[0]["id"])}/{q(name)}') or {}
+        return by_test_url(api(f'/providers/proxies/{SRV_PROV.get(name, subs()[0]["id"])}/{q(name)}') or {})
     except Exception:
         return {}
 
@@ -809,16 +821,41 @@ def probe(name, tries=3):
     return 0
 
 
-# ---------------- проверка сервисов через текущий сервер ----------------
-# Сервер может отвечать на проверку Google, но не пускать в Telegram или YouTube (блок у поставщика, перегрузка,
-# выход заблокирован). Раз в несколько минут проверяем их через текущий сервер; если не открываются, а через другой
-# открываются — переключаемся на него (закрепляем) и сообщаем. Когда автовыбор снова предлагает рабочий сервер,
-# возвращаемся на автовыбор.
+# ---------------- самодиагностика и самовосстановление ----------------
+# Отдельный поток раз в 20 секунд:
+#   • очередь новых соединений mihomo (вход из туннеля): держится выше 64 и не убывает ~1 минуту — mihomo завис,
+#     перезапускаем; если за сутки это уже 3-й раз, переводим TUN на gvisor (другой механизм приёма соединений);
+#   • раз в минуту — устойчивость текущего сервера: 3 короткие проверки через него, окно 15 последних; потерь
+#     от трети и больше — сервер «плохой»;
+#   • раз в 5 минут — Telegram и YouTube через текущий сервер;
+#   • «плохой» сервер (потери или не пускает в сервисы) — ищем рабочий и закрепляем его; плохой помним
+#     30 минут, при повторах дольше (до 6 часов), чтобы не прыгать туда-обратно;
+#   • закреплённый сервер снимаем, когда автовыбор предлагает сервер, который сейчас не числится плохим
+#     и проходит все проверки (не раньше чем через 10 минут после закрепления);
+#   • ручной выбор держится заданное время (по умолчанию 2 часа) и только пока сервер исправен.
 SVC_CHECKS = [('Telegram', 'https://api.telegram.org/'), ('YouTube', 'https://www.youtube.com/generate_204')]
+# Проверки идут не по адресу автовыбора (gstatic): mihomo хранит результат отдельно для каждого адреса, и наши
+# частые проверки не помечают сервер «мёртвым» для автовыбора — иначе одна случайная неудача дёргала бы переключение.
+STAB_URL = 'https://www.google.com/generate_204'
+HEALTH_TICK = 20
+STAB_EVERY = 60
 SVC_EVERY = 300
-SVC_BAD_TTL = 1800                # сколько помнить, что сервер не пускает в сервис
-svc_bad = {}                      # сервер → {'svc': [...], 'ts': время}
-svc_state = {'busy': False, 'alert_none': 0, 'hint': {}}
+STAB_WINDOW = 15
+STAB_MIN = 6                      # меньше проверок — рано судить
+STAB_LOSS = 0.34                  # доля неудачных проверок, при которой сервер «плохой»
+SVC_BAD_TTL = 1800
+SVC_BAD_MAX = 6 * 3600
+PIN_MIN_AGE = 600
+MANUAL_TTLS = [3600, 7200, 28800, 86400, 0]
+MANUAL_TTL_DEFAULT = 7200
+TUNQ_STUCK = 64                   # у работающего mihomo очередь почти всегда 0
+TUNQ_TICKS = 3                    # столько проверок подряд (по 20 с) очередь держится и не убывает — завис
+QUEUE_SYSCTL = '/etc/sysctl.d/98-vpngw-queue.conf'
+QUEUE_SIZE = 65535
+svc_bad = {}                      # сервер → {'svc': [...], 'why': текст, 'ts': время, 'n': сколько раз}
+svc_state = {'busy': False, 'alert_none': 0, 'last_stab': 0, 'last_svc': 0, 'svc_res': {}, 'svc_ts': 0}
+stab_win = {}                     # сервер → список последних результатов (True/False)
+tunq = {'bad': 0, 'last_restart': 0, 'restarts': [], 'prev': 0, 'last': None}
 
 
 def svc_probe(name, url, tries=2):
@@ -844,9 +881,24 @@ def svc_fails(name, tries=2):
     return [svc for svc, url in SVC_CHECKS if not svc_probe(name, url, tries)]
 
 
+def all_ok(name, tries=1):
+    return svc_probe(name, STAB_URL, tries) and not svc_fails(name, tries)
+
+
 def svc_is_bad(name):
     b = svc_bad.get(name)
-    return bool(b and time.time() - b['ts'] < SVC_BAD_TTL)
+    return bool(b and time.time() - b['ts'] < min(SVC_BAD_TTL * 2 ** (b.get('n', 1) - 1), SVC_BAD_MAX))
+
+
+def mark_bad(name, why, svc=None):
+    old = svc_bad.get(name)
+    n = (old['n'] + 1) if old and time.time() - old['ts'] < SVC_BAD_MAX else 1
+    svc_bad[name] = {'svc': svc or [], 'why': why, 'ts': time.time(), 'n': n}
+
+
+def stab_loss(name):
+    w = stab_win.get(name) or []
+    return (sum(1 for x in w if not x) / len(w)) if w else 0.0
 
 
 def svc_candidates(v, cur):
@@ -868,10 +920,12 @@ def svc_preferred(v):
         return None
 
 
-def svc_unpin(v, why):
+def back_to_auto(v, why):
     with lock:
         v['manual'] = False
         v.pop('svc_pin', None)
+        v.pop('pin_since', None)
+        v.pop('manual_since', None)
         save_state()
     last_manual[0] = time.time()
     if v['mode'] == 'priority':
@@ -881,80 +935,164 @@ def svc_unpin(v, why):
     add_event(why)
 
 
-def svc_tick_safe():
-    try:
-        svc_tick()
-    except Exception:
-        log('svc_tick:', traceback.format_exc())
+svc_unpin = back_to_auto
 
 
-def svc_tick():
-    v = state.get('vpn')
-    if not v or not v.get('svc_check', True) or svc_state['busy']:
+def manual_ttl(v):
+    t = v.get('manual_ttl', MANUAL_TTL_DEFAULT)
+    return t if t in MANUAL_TTLS else MANUAL_TTL_DEFAULT
+
+
+def fmt_ttl(t):
+    return 'пока не сменю' if not t else (f'{t // 3600} ч' if t >= 3600 else f'{t // 60} мин')
+
+
+def degrade(v, mode, cur, why, svc=None):
+    """Текущий сервер плохой: ищем рабочий и закрепляем его."""
+    mark_bad(cur, why, svc)
+    target = next((n for n in svc_candidates(v, cur) if all_ok(n)), None)
+    if not target:
+        svc_bad.pop(cur, None)        # другие не лучше — значит, дело не в этом сервере
+        if time.time() - svc_state['alert_none'] > 3600:
+            svc_state['alert_none'] = time.time()
+            add_event(f'Сервер {cur} {why}, и другого рабочего сервера нет')
+            notify('dead', f'⚠️ <b>Сервер {h(cur)} {h(why)}</b>\n\nДругие серверы из проверенных тоже не помогли. '
+                           'Возможно, сбой у самого сервиса, у поставщика VPN или в интернете шлюза.')
+        return None
+    was_manual = mode == 'manual' and not v.get('svc_pin')
+    last_manual[0] = time.time()      # чтобы наблюдатель не прислал второе «сервер сменился»
+    api(f'/proxies/{SELECT_GROUP}', 'PUT', {'name': target})
+    with lock:
+        v['manual'] = True
+        v['svc_pin'] = target
+        v['pin_since'] = time.time()
+        v.pop('manual_since', None)
+        save_state()
+    stab_win.pop(target, None)
+    add_event(f'Сервер {cur} {why} — переключился на {target}')
+    notify('switch', f'⚠️ <b>Сервер {h(cur)} {h(why)}</b>\n\nПереключился на <b>{h(target)}</b> — через него всё '
+                     'работает.' + (' Ручной выбор снят, потому что сервер перестал нормально работать.'
+                                     if was_manual else '')
+                     + ' Когда автовыбор снова найдёт рабочий сервер, вернусь на него сам.')
+    return target
+
+
+def pin_tick(v, mode, cur):
+    """Снять закрепление, когда автовыбор снова предлагает исправный сервер."""
+    pin = v.get('svc_pin')
+    if not pin:
         return
+    if pin != cur or mode != 'manual':
+        with lock:                    # закрепление сняли вручную или шлюз сам вернул автовыбор
+            v.pop('svc_pin', None)
+            v.pop('pin_since', None)
+            save_state()
+        return
+    if time.time() - v.get('pin_since', 0) < PIN_MIN_AGE:
+        return
+    pref = svc_preferred(v)
+    if not pref or svc_is_bad(pref):
+        return
+    if pref == cur or all_ok(pref, 2):
+        back_to_auto(v, f'Автовыбор снова предлагает исправный сервер {pref} — закрепление снято')
+        if pref != cur:
+            notify('switch', f'🟢 <b>Вернулся автовыбор</b>\n\nСервер <b>{h(pref)}</b> снова проходит все проверки.')
+
+
+def manual_tick(v, mode, cur):
+    """Ручной выбор держится не дольше заданного времени."""
+    if mode != 'manual' or v.get('svc_pin'):
+        return
+    ttl = manual_ttl(v)
+    if not v.get('manual_since'):
+        with lock:
+            v['manual_since'] = time.time()
+            save_state()
+        return
+    if ttl and time.time() - v['manual_since'] > ttl:
+        back_to_auto(v, f'Ручной выбор {cur} действовал {fmt_ttl(ttl)} — вернулся автовыбор')
+        time.sleep(2)
+        try:
+            _, now = mode_and_current()
+        except Exception:
+            now = '?'
+        notify('switch', f'🔁 <b>Ручной выбор истёк</b>\n\n{h(cur)} был выбран вручную {fmt_ttl(ttl)} назад. '
+                         f'Вернулся автовыбор: <b>{h(now)}</b>.\nСрок ручного выбора меняется в '
+                         '⚙️ Настройки → 🔀 Переключение VPN.')
+
+
+def stab_tick(v, cur):
+    res = [svc_probe(cur, STAB_URL, 1) for _ in range(3)]
+    w = (stab_win.get(cur) or []) + res
+    stab_win[cur] = w[-STAB_WINDOW:]
+    for name in list(stab_win):
+        if name != cur:
+            stab_win.pop(name)
+    loss = stab_loss(cur)
+    if len(stab_win[cur]) >= STAB_MIN and loss >= STAB_LOSS:
+        stab_win.pop(cur, None)
+        return f'теряет {round(loss * 100)}% соединений'
+    return None
+
+
+def health_tick():
+    v = state.get('vpn')
+    if not v or svc_state['busy']:
+        return
+    try:
+        api('/version')
+    except Exception:
+        return                        # mihomo не отвечает — этим занимается наблюдатель
     svc_state['busy'] = True
     try:
         mode, cur = mode_and_current()
-        pin = v.get('svc_pin')
-        if pin and (pin != cur or mode != 'manual'):
-            with lock:                       # закрепление сняли (вручную или шлюз сам вернул автовыбор)
-                v.pop('svc_pin', None)
-                save_state()
-            pin = None
-        fails = svc_fails(cur)
-        if not fails:
-            svc_bad.pop(cur, None)
-            if pin:
-                pref = svc_preferred(v)
-                if pref and pref != cur and not svc_fails(pref, 1):
-                    svc_unpin(v, f'Сервер {pref} снова пускает во все сервисы — вернулся автовыбор')
-                    notify('switch', f'🟢 <b>Вернулся автовыбор</b>\n\nСервер <b>{h(pref)}</b> снова открывает '
-                                     f'{", ".join(s for s, _ in SVC_CHECKS)}.')
-            return
-        svc_bad[cur] = {'svc': fails, 'ts': time.time()}
-        what = ', '.join(fails)
-        target = None
-        for name in svc_candidates(v, cur):
-            if not svc_fails(name, 1):
-                target = name
-                break
-        if not target:
-            if time.time() - svc_state['alert_none'] > 3600:
-                svc_state['alert_none'] = time.time()
-                add_event(f'{what} не открывается через {cur}, и другого рабочего сервера нет')
-                notify('dead', f'⚠️ <b>{h(what)} не открывается</b>\n\nЧерез текущий сервер {h(cur)} не открывается, '
-                               'и ни один другой сервер из проверенных не помог. Возможно, сбой у самого сервиса '
-                               'или у поставщика VPN.')
-            return
-        if mode == 'manual' and not pin:
-            # сервер выбрали вручную — не спорим, только подсказываем (раз в час на сервер)
-            if time.time() - svc_state['hint'].get(cur, 0) > 3600:
-                svc_state['hint'][cur] = time.time()
-                add_event(f'Сервер {cur} (выбран вручную) не пускает в {what}')
-                notify('switch', f'⚠️ <b>Сервер {h(cur)} не пускает в {h(what)}</b>\n\nОн выбран вручную, поэтому '
-                                 f'я его не меняю. Через <b>{h(target)}</b> всё открывается — выберите его '
-                                 'в «🌍 Серверы» или включите «Авто».')
-            return
-        last_manual[0] = time.time()          # чтобы наблюдатель не прислал второе «сервер сменился»
-        api(f'/proxies/{SELECT_GROUP}', 'PUT', {'name': target})
-        with lock:
-            v['manual'] = True
-            v['svc_pin'] = target
-            save_state()
-        add_event(f'Сервер {cur} не пускает в {what} — переключился на {target}')
-        notify('switch', f'⚠️ <b>Сервер {h(cur)} не пускает в {h(what)}</b>\n\nПереключился на <b>{h(target)}</b> — '
-                         'через него всё открывается. Когда автовыбор снова найдёт рабочий сервер, вернусь на него сам.')
+        now = time.time()
+        if now - svc_state['last_stab'] >= STAB_EVERY:
+            svc_state['last_stab'] = now
+            pin_tick(v, mode, cur)
+            manual_tick(v, mode, cur)
+            mode, cur = mode_and_current()
+            if v.get('svc_check', True):
+                why = stab_tick(v, cur)
+                if why:
+                    degrade(v, mode, cur, why)
+                    return
+        if v.get('svc_check', True) and now - svc_state['last_svc'] >= SVC_EVERY:
+            svc_state['last_svc'] = now
+            fails = svc_fails(cur)
+            svc_state['svc_res'] = {s: s not in fails for s, _ in SVC_CHECKS}
+            svc_state['svc_ts'] = now
+            if fails:
+                degrade(v, mode, cur, 'не пускает в ' + ', '.join(fails), fails)
+            else:
+                svc_bad.pop(cur, None)
     finally:
         svc_state['busy'] = False
 
 
-# ---------------- сторож приёма соединений mihomo ----------------
-# Бывает, что mihomo перестаёт забирать новые TCP-соединения из туннеля: очередь его входа в TUN забита
-# (Recv-Q упирается в лимит), старые соединения живут, новые не открываются, ошибок в журнале нет.
-# Раз в минуту смотрим очередь; две проверки подряд «забито» — перезапускаем mihomo и сообщаем.
-tunq = {'bad': 0, 'last_restart': 0, 'restarts': []}
+def svc_tick():
+    """Совместимость: полная проверка сразу (используется в тестах и вручную)."""
+    svc_state['last_stab'] = svc_state['last_svc'] = 0
+    health_tick()
 
 
+def health_loop():
+    started = time.time()
+    while True:
+        time.sleep(HEALTH_TICK)
+        try:
+            tunq_tick()
+        except Exception:
+            log('tunq_tick:', traceback.format_exc())
+        if time.time() - started < 120:
+            continue
+        try:
+            health_tick()
+        except Exception:
+            log('health_tick:', traceback.format_exc())
+
+
+# --- очередь mihomo ---
 def tun_queue():
     """(занято, лимит) самой забитой очереди mihomo не на 127.0.0.1, или None."""
     try:
@@ -969,41 +1107,64 @@ def tun_queue():
         if len(f) < 4 or f[3].startswith(('127.', '[::1]')):
             continue
         try:
-            q, lim = int(f[1]), int(f[2])
+            qn, lim = int(f[1]), int(f[2])
         except ValueError:
             continue
-        if lim and (worst is None or q / lim > worst[0] / worst[1]):
-            worst = (q, lim)
+        if lim and (worst is None or qn / lim > worst[0] / worst[1]):
+            worst = (qn, lim)
     return worst
 
 
 def tunq_tick():
     w = tun_queue()
+    tunq['last'] = w
     if not w:
         tunq['bad'] = 0
         return
-    q, lim = w
-    if q < lim * 0.9:
+    qn, lim = w
+    prev, tunq['prev'] = tunq['prev'], qn
+    if qn < TUNQ_STUCK or qn < prev:
         tunq['bad'] = 0
         return
     tunq['bad'] += 1
-    if tunq['bad'] < 2 or time.time() - tunq['last_restart'] < 600:
+    if tunq['bad'] < TUNQ_TICKS or time.time() - tunq['last_restart'] < 300:
         return
     tunq['bad'] = 0
+    tunq['prev'] = 0
     tunq['last_restart'] = time.time()
     tunq['restarts'] = [t for t in tunq['restarts'] if time.time() - t < 86400] + [time.time()]
-    log(f'очередь новых соединений mihomo забита ({q}/{lim}) — перезапуск')
-    r = run(['systemctl', 'restart', 'mihomo'], 60)
-    ok = r.returncode == 0
-    add_event(f'mihomo перестал принимать соединения ({q}/{lim}) — ' + ('перезапущен' if ok else 'перезапуск не удался'))
     n = len(tunq['restarts'])
-    notify('dead', ('⚠️ <b>mihomo перестал принимать новые соединения</b>\n\n'
-                    f'Очередь входа из туннеля забита ({q} из {lim}): открытые соединения работали, новые — нет. '
-                    + ('mihomo перезапущен, VPN снова работает.' if ok else
-                       f'Перезапустить не удалось: <code>{h(r.stderr[-200:])}</code>'))
-           + (f'\n\nЗа сутки это уже {n}-й раз — похоже на ошибку в текущей версии mihomo '
-              f'({h(mihomo_version())}). Проверьте обновление mihomo: 🔧 Управление → 🆕 Обновления → 🧱 mihomo.'
-              if n >= 3 else ''))
+    v = state.get('vpn') or {}
+    stack = tun_stack()
+    to_gvisor = n >= 3 and stack == 'system' and v.get('tun_auto', True)
+    log(f'очередь новых соединений mihomo не разбирается ({qn}/{lim}) — ' + ('перевожу TUN на gvisor' if to_gvisor
+                                                                             else 'перезапуск'))
+    if to_gvisor:
+        try:
+            set_tun_stack('gvisor')
+            ok, err = True, ''
+        except Exception as e:
+            ok, err = False, str(e)
+            r = run(['systemctl', 'restart', 'mihomo'], 60)
+            ok = r.returncode == 0
+    else:
+        r = run(['systemctl', 'restart', 'mihomo'], 60)
+        ok, err = r.returncode == 0, r.stderr
+    add_event(f'mihomo перестал принимать соединения ({qn}/{lim}) — '
+              + ('TUN переведён на gvisor' if to_gvisor and not err else 'перезапущен' if ok else 'перезапуск не удался'))
+    text = ('⚠️ <b>mihomo перестал принимать новые соединения</b>\n\n'
+            f'В очереди висело {qn} новых соединений: открытые соединения работали, новые — нет. ')
+    if to_gvisor and not err:
+        text += (f'За сутки это уже {n}-й раз, поэтому я перевёл приём соединений (TUN) с system на <b>gvisor</b> — '
+                 'это другой механизм, который не зависает так же. VPN снова работает. Вернуть можно в '
+                 '🔧 Управление → 🩺 Самодиагностика.')
+    elif ok:
+        text += 'mihomo перезапущен, VPN снова работает.' + (
+            f'\n\nЗа сутки это уже {n}-й раз — похоже на ошибку в текущей версии mihomo ({h(mihomo_version())}).'
+            if n >= 3 else '')
+    else:
+        text += f'Перезапустить не удалось: <code>{h((err or "")[-200:])}</code>'
+    notify('dead', text)
 
 
 def mihomo_version():
@@ -1014,12 +1175,200 @@ def mihomo_version():
         return '?'
 
 
+TUN_STACKS = {'system': 'system — быстрый, через ядро Linux',
+              'gvisor': 'gvisor — свой сетевой стек mihomo, чуть больше нагрузка на процессор, но не зависает '
+                        'так, как system',
+              'mixed': 'mixed — TCP через ядро, UDP через gvisor'}
+
+
+def tun_stack():
+    try:
+        txt = open(MIHOMO_CFG, encoding='utf-8').read()
+    except Exception:
+        return '?'
+    m = re.search(r'^tun:\n((?:[ \t]+.*\n|\n)*)', txt, re.M)
+    s = re.search(r'^\s+stack:\s*(\w+)', m.group(1), re.M) if m else None
+    return s.group(1) if s else 'gvisor'
+
+
+def set_tun_stack(stack):
+    if stack not in TUN_STACKS:
+        raise ValueError('неизвестный режим')
+    txt = open(MIHOMO_CFG, encoding='utf-8').read()
+    m = re.search(r'^tun:\n((?:[ \t]+.*\n|\n)*)', txt, re.M)
+    if not m:
+        raise RuntimeError('в конфиге mihomo нет раздела tun')
+    block = m.group(1)
+    if re.search(r'^\s+stack:', block, re.M):
+        nb = re.sub(r'^(\s+stack:\s*)\w+', r'\g<1>' + stack, block, count=1, flags=re.M)
+    else:
+        nb = f'  stack: {stack}\n' + block
+    new = txt[:m.start(1)] + nb + txt[m.end(1):]
+    with open(MIHOMO_TEST_CFG, 'w', encoding='utf-8') as f:
+        f.write(new)
+    os.chmod(MIHOMO_TEST_CFG, 0o600)
+    binary = shutil.which('mihomo') or '/usr/bin/mihomo'
+    r = run([binary, '-d', GEO_DIR, '-f', MIHOMO_TEST_CFG, '-t'], 180)
+    if r.returncode != 0:
+        os.remove(MIHOMO_TEST_CFG)
+        raise RuntimeError('mihomo отклонил конфиг: ' + (r.stdout + r.stderr)[-300:])
+    shutil.copy2(MIHOMO_CFG, MIHOMO_BAK_CFG)
+    os.replace(MIHOMO_TEST_CFG, MIHOMO_CFG)
+    r = run(['systemctl', 'restart', 'mihomo'], 60)
+    if r.returncode != 0:
+        raise RuntimeError('mihomo не перезапустился: ' + r.stderr[-300:])
+    with lock:
+        if state.get('vpn') is not None:
+            state['vpn']['tun_stack'] = stack
+            save_state()
+
+
+def ensure_queue_size():
+    """Увеличить очередь новых соединений (net.core.somaxconn): mihomo берёт её размер при запуске."""
+    try:
+        cur = int(open('/proc/sys/net/core/somaxconn').read().strip())
+    except Exception:
+        return False
+    if cur >= QUEUE_SIZE:
+        return False
+    try:
+        with open(QUEUE_SYSCTL, 'w') as f:
+            f.write(f'# vpn-gateway: большая очередь новых соединений для mihomo\n'
+                    f'net.core.somaxconn={QUEUE_SIZE}\nnet.ipv4.tcp_max_syn_backlog={QUEUE_SIZE}\n')
+        run(['sysctl', '-p', QUEUE_SYSCTL], 10)
+        return True
+    except Exception as e:
+        log('очередь соединений:', e)
+        return False
+
+
+def queue_upgrade():
+    """После обновления бота: увеличить очередь и один раз перезапустить mihomo, чтобы он её подхватил."""
+    ensure_queue_size()
+    try:
+        if int(open('/proc/sys/net/core/somaxconn').read().strip()) < QUEUE_SIZE:
+            return                    # увеличить не удалось — перезапуск ничего не даст
+    except Exception:
+        return
+    w = tun_queue()
+    if not w or w[1] >= QUEUE_SIZE:
+        return
+    time.sleep(150)                   # после сообщений о запуске и перестройки конфига (fmt_autoapply)
+    w = tun_queue()
+    if w and w[1] < QUEUE_SIZE:
+        run(['systemctl', 'restart', 'mihomo'], 60)
+        add_event(f'Очередь новых соединений mihomo увеличена с {w[1]} до {QUEUE_SIZE}')
+
+
+# --- экран самодиагностики ---
+def scr_diag(uid, note=''):
+    v = vpn()
+    lines = ['🩺 <b>Самодиагностика</b>', '']
+    try:
+        mode, cur = mode_and_current()
+        lines.append(f'Сервер: <b>{h(cur)}</b> ({MODE_RU[mode]})')
+        w = stab_win.get(cur) or []
+        lines.append(f'Устойчивость: ' + (f'{len(w) - sum(1 for x in w if not x)} из {len(w)} проверок прошли'
+                                          if w else 'ещё не проверялась'))
+        if svc_state['svc_ts']:
+            lines.append('Сервисы ({}): '.format(fmt_ago(svc_state['svc_ts'])) + ', '.join(
+                f'{"✅" if ok else "❌"} {s}' for s, ok in svc_state['svc_res'].items()))
+        if v.get('svc_pin'):
+            lines.append(f'📌 Закреплён {h(v["svc_pin"])} (прежний сервер работал плохо)')
+        elif mode == 'manual':
+            ttl = manual_ttl(v)
+            left = (ttl - (time.time() - v.get('manual_since', time.time()))) if ttl else 0
+            lines.append('✋ Выбран вручную' + (f', автовыбор вернётся через {fmt_dur(max(left, 0))}' if ttl else ''))
+    except Exception:
+        lines.append('🔴 mihomo не отвечает')
+    bad = [(n, b) for n, b in svc_bad.items() if svc_is_bad(n)]
+    if bad:
+        lines += ['', '<b>Плохие серверы</b> (временно не выбираются):']
+        lines += [f'⚠️ {h(n)} — {h(b["why"])}, {fmt_ago(b["ts"])}' for n, b in bad]
+    w = tun_queue()
+    lines += ['', f'mihomo {h(mihomo_version())}, приём соединений (TUN): <b>{h(tun_stack())}</b>']
+    if w:
+        lines.append(f'Очередь новых соединений: {w[0]} из {w[1]} ' + ('🟢' if w[0] < TUNQ_STUCK else '⚠️'))
+    n = len([t for t in tunq['restarts'] if time.time() - t < 86400])
+    lines.append(f'Зависаний mihomo за сутки: {n}' + (f', последнее {fmt_ago(tunq["last_restart"])}' if n else ''))
+    lines.append(f'Автопереход на gvisor при частых зависаниях: {"✅" if v.get("tun_auto", True) else "⛔"}')
+    if note:
+        lines += ['', note]
+    kb = [[btn('🧪 Проверить все серверы', 'diag:test')],
+          [btn(f'⚙️ Режим TUN: {tun_stack()}', 'diag:stack'),
+           btn(('✅' if v.get('tun_auto', True) else '⛔') + ' Автопереход', 'diag:auto')]]
+    if bad:
+        kb.append([btn('🧹 Забыть плохие серверы', 'diag:forget')])
+    kb.append([btn('🔄 Обновить', 'diag'), btn('⬅️ Управление', 'manage')])
+    return '\n'.join(lines), kb
+
+
+def full_test():
+    import concurrent.futures as cf
+    lst = [p['name'] for p in servers()][:25]
+
+    def one(name):
+        t0 = time.time()
+        g = svc_probe(name, STAB_URL, 1)
+        ms = int((time.time() - t0) * 1000)
+        return name, g, {s: svc_probe(name, u, 1) for s, u in SVC_CHECKS}, ms
+    with cf.ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(one, lst))
+    return res
+
+
+def handle_diag(uid, data, chat, mid):
+    v = vpn()
+    act = data.split(':', 1)[1] if ':' in data else ''
+    if act == 'test':
+        edit(chat, mid, '🧪 Проверяю все серверы: Google, Telegram, YouTube… до 30 секунд.')
+        res = full_test()
+        lines = ['🧪 <b>Проверка серверов</b>', '', 'G — Google, T — Telegram, Y — YouTube', '']
+        for name, g, s, ms in sorted(res, key=lambda x: (not (x[1] and all(x[2].values())), x[3])):
+            okall = g and all(s.values())
+            lines.append(f'{"🟢" if okall else "🔴" if not g else "🟡"} {h(name)} — '
+                         f'G{"✅" if g else "❌"} ' + ' '.join(f'{k[0]}{"✅" if x else "❌"}' for k, x in s.items())
+                         + (f' · {ms} мс' if g else ''))
+        good = sum(1 for _, g, s, _ in res if g and all(s.values()))
+        lines += ['', f'Полностью рабочих: {good} из {len(res)}.']
+        return '\n'.join(lines), [[btn('🔁 Ещё раз', 'diag:test'), btn('⬅️ Самодиагностика', 'diag')]]
+    if act == 'stack':
+        cur = tun_stack()
+        lines = ['⚙️ <b>Приём соединений из туннеля (TUN)</b>', '']
+        lines += [f'{"✅" if k == cur else "▫️"} {h(t)}' for k, t in TUN_STACKS.items()]
+        lines += ['', 'При смене VPN прервётся на 5–10 секунд.']
+        kb = [[btn(('✅ ' if k == cur else '') + k, f'diag:set:{k}')] for k in TUN_STACKS]
+        kb.append([btn('⬅️ Самодиагностика', 'diag')])
+        return '\n'.join(lines), kb
+    if act.startswith('set:'):
+        st = act[4:]
+        if st == tun_stack():
+            return scr_diag(uid)
+        edit(chat, mid, f'⏳ Перевожу TUN на {h(st)}, VPN прервётся на 5–10 секунд…')
+        try:
+            set_tun_stack(st)
+            add_event(f'{admin_name(uid)} перевёл TUN mihomo на {st}')
+            return scr_diag(uid, f'✅ TUN теперь {h(st)}')
+        except Exception as e:
+            return scr_diag(uid, f'🔴 Не удалось: <code>{h(str(e))[:300]}</code>')
+    if act == 'auto':
+        with lock:
+            v['tun_auto'] = not v.get('tun_auto', True)
+            save_state()
+        return scr_diag(uid)
+    if act == 'forget':
+        svc_bad.clear()
+        return scr_diag(uid, '🧹 Список плохих серверов очищен')
+    return scr_diag(uid)
+
+
 def fallback_to_auto(dead):
     """Выбранный вручную сервер не отвечает — возвращаемся на автовыбор (и остаёмся на нём)."""
     v = vpn()
     with lock:
         v['manual'] = False
-        v.pop('svc_pin', None)
+        for k in ('svc_pin', 'pin_since', 'manual_since'):
+            v.pop(k, None)
         save_state()
     last_manual[0] = time.time()
     if v['mode'] == 'priority':
@@ -1988,7 +2337,7 @@ def scr_servers(uid, note=''):
             icon = '🔴'
         extra = '' if name in members else ' · вне авто'
         if svc_is_bad(name):
-            extra += f' · ⚠️ нет {", ".join(svc_bad[name]["svc"])}'
+            extra += f' · ⚠️ {svc_bad[name]["why"]}'
         lines.append(f'{icon} {h(name)} — {fmt_delay(p)}{extra}')
         label = ('📍 ' if name == cur and mode == 'manual' else '') + name
         row.append(btn(label[:40], f'srv:{i}:{tag(name)}'))
@@ -2044,7 +2393,8 @@ def scr_manage(uid, note=''):
     lines.append(f'🧩 Версия шлюза: {BOT_VERSION}' + (
         f' · доступна <b>{h(state["upd"]["latest"])}</b>' if update_available() else ''))
     kb = [[btn('🔄 Обновить подписки', 'do:update'), btn('📦 Подписки', 'subs')],
-          [btn('♻️ Перезапуск mihomo', 'ask:mihomo'), btn('🔌 Перезапуск WireGuard', 'ask:wg')]]
+          [btn('♻️ Перезапуск mihomo', 'ask:mihomo'), btn('🔌 Перезапуск WireGuard', 'ask:wg')],
+          [btn('🩺 Самодиагностика', 'diag')]]
     if is_owner(uid):
         kb.append([btn('🛰 Свои серверы', 'vs')])
         kb.append([btn('🆕 Обновления' + (' •' if update_available() else ''), 'upd')])
@@ -2143,7 +2493,8 @@ def scr_sw(uid, note=''):
     except Exception:
         pass
     sc = v.get('svc_check', True)
-    lines.append(f'🩺 Проверка Telegram и YouTube: {"✅ каждые 5 мин" if sc else "⛔ выключена"}')
+    lines.append(f'🩺 Проверка серверов (устойчивость, Telegram, YouTube): {"✅" if sc else "⛔ выключена"}')
+    lines.append(f'✋ Ручной выбор держится: {fmt_ttl(manual_ttl(v))}')
     if v.get('svc_pin') and v['manual']:
         lines += ['', f'📌 Сейчас закреплён {h(v["svc_pin"])}: прежний сервер не пускал в Telegram или YouTube. '
                       'Автовыбор вернётся сам, когда он снова предложит рабочий сервер.']
@@ -2167,7 +2518,8 @@ def scr_sw(uid, note=''):
     if v['mode'] == 'priority':
         row.append(btn('🔢 Порядок', 'swp'))
     kb.append(row)
-    kb.append([btn(('✅ ' if sc else '⛔ ') + '🩺 Проверка Telegram и YouTube', 'swsc')])
+    kb.append([btn(('✅ ' if sc else '⛔ ') + '🩺 Проверка серверов', 'swsc'),
+               btn(f'✋ Ручной: {fmt_ttl(manual_ttl(v))}', 'swmt')])
     if dirty:
         kb.append([btn('✅ Применить', 'swapply'), btn('↩️ Отменить', 'swreset')])
     kb.append([btn('⬅️ Настройки', 'set'), btn('🏠 Меню', 'menu')])
@@ -5531,10 +5883,10 @@ def wg_mass(uid, chat, mid, via):
 SCREENS = {'menu': scr_menu, 'status': scr_status, 'servers': scr_servers, 'traffic': scr_traffic,
            'manage': scr_manage, 'notif': scr_notif, 'admins': scr_admins, 'log': scr_log,
            'set': scr_settings, 'em': scr_email, 'subs': scr_subs, 'srv': scr_srv,
-           'srvthr': scr_srv_thr, 'vs': scr_vs, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
+           'srvthr': scr_srv_thr, 'vs': scr_vs, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'diag': scr_diag, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
            'swi': lambda uid: scr_sw_choice(uid, 'i'), 'swt': lambda uid: scr_sw_choice(uid, 't')}
 # клиентами WireGuard управляют все админы; общие настройки шлюза — только владелец
-OWNER_ONLY = ('vs', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
+OWNER_ONLY = ('diag:set:', 'diag:auto', 'vs', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
               'upd:', 'subs', 'sub:', 'srvthr', 'srvt:', 'srvclean')
 
 CONFIRM = {
@@ -6150,6 +6502,14 @@ def handle_sw(uid, data, chat, mid):
             v[key] = [x for x in v.get(key, []) if tag(x) != t]
             save_state()
         return scr_sw_exc(uid, '🗑 Удалено')
+    if data == 'swmt':
+        t = manual_ttl(v)
+        with lock:
+            v['manual_ttl'] = MANUAL_TTLS[(MANUAL_TTLS.index(t) + 1) % len(MANUAL_TTLS)]
+            if v.get('manual') and not v.get('svc_pin'):
+                v['manual_since'] = time.time()
+            save_state()
+        return scr_sw(uid)
     if data == 'swsc':
         with lock:
             v['svc_check'] = not v.get('svc_check', True)
@@ -6482,7 +6842,9 @@ def handle_callback(cq):
             if state.get('vpn'):
                 with lock:
                     state['vpn']['manual'] = True
+                    state['vpn']['manual_since'] = time.time()
                     state['vpn'].pop('svc_pin', None)
+                    state['vpn'].pop('pin_since', None)
                     save_state()
             api(f'/proxies/{SELECT_GROUP}', 'PUT', {'name': name})
             add_event(f'{admin_name(uid)} выбрал сервер {name}')
@@ -6493,7 +6855,8 @@ def handle_callback(cq):
             v = vpn()
             with lock:
                 v['manual'] = False
-                v.pop('svc_pin', None)
+                for k in ('svc_pin', 'pin_since', 'manual_since'):
+                    v.pop(k, None)
                 save_state()
             if v['mode'] == 'priority':
                 prio_tick(force=True)
@@ -6620,6 +6983,8 @@ def handle_callback(cq):
             text, kb = res
         elif data.startswith('sw'):
             text, kb = handle_sw(uid, data, chat, mid)
+        elif data.startswith('diag:'):
+            text, kb = handle_diag(uid, data, chat, mid)
         elif data == 'gws':
             text, kb = scr_gws(uid)
         elif data.startswith('gw:'):
@@ -7389,7 +7754,6 @@ def watcher():
     last_tr = 0
     last_sub = 0
     last_srv = 0
-    last_svc = 0
     started = time.time()
     while True:
         try:
@@ -7457,10 +7821,6 @@ def watcher():
         if time.time() - last_srv >= 60:
             last_srv = time.time()
             try:
-                tunq_tick()
-            except Exception:
-                log('tunq_tick:', traceback.format_exc())
-            try:
                 srv_tick()
             except Exception:
                 log('srv_tick:', traceback.format_exc())
@@ -7470,9 +7830,6 @@ def watcher():
                 sub_tick()
             except Exception:
                 log('sub_tick:', traceback.format_exc())
-        if time.time() - started > 120 and time.time() - last_svc >= SVC_EVERY:
-            last_svc = time.time()
-            threading.Thread(target=svc_tick_safe, daemon=True).start()
         if os.path.exists(UPDATE_RESULT):
             report_update_result()
         if state.get('upd_pending') and time.time() - started > 300 and not os.path.exists(UPDATE_RESULT):
@@ -8616,6 +8973,8 @@ def main():
     ])
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=fmt_autoapply, daemon=True).start()
+    threading.Thread(target=health_loop, daemon=True).start()
+    threading.Thread(target=queue_upgrade, daemon=True).start()
     if LINK_MODE:
         touch_alive()
         try:
