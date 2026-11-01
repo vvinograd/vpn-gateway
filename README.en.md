@@ -167,6 +167,10 @@ much less suspicious than a big brand on a small hoster), then a fallback list. 
 Russia and applied only after you confirm; without an answer the server returns the previous one in 10 minutes.
 "🔄 Check" compares the link on the server with the one in the gateway and offers to update it if they differ.
 
+**Repair.** If the server does not work from Russia, "🛠 Repair" tries, one at a time, the Xray version (the previous
+one and earlier stable releases), camouflage sites and free ports, checking each from Russia until one works. An
+Xray version that broke the server is remembered and never installed automatically again.
+
 ## Several gateways in one bot
 
 One bot can manage several gateways (office, a second server, a friend's server). The main gateway runs the

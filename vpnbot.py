@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.2'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.4'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -4584,6 +4584,19 @@ def free_port():
     return p
 
 
+def mihomo_log_reason(path):
+    """Последняя ошибка соединения из журнала временного mihomo: «dial tcp …: i/o timeout», «REALITY …» и т.п."""
+    try:
+        lines = open(path, encoding='utf-8', errors='ignore').read().splitlines()
+    except OSError:
+        return ''
+    for line in reversed(lines):
+        if re.search(r'level=(warning|error)|ERR|WRN', line) and re.search(r'dial|reality|connect|EOF|timeout|refused|reset|handshake', line, re.I):
+            m = re.search(r'msg="(.*?)"\s*$', line) or re.search(r'(?:ERR|WRN)\]?\s*(.*)$', line)
+            return (m.group(1) if m else line)[-220:]
+    return ''
+
+
 def vless_check(link, geo=True):
     """Проверяет ссылку vless через отдельный временный mihomo (основной VPN не трогается).
     → {'ok', 'ms', 'ip', 'gl', 'err'}. gl — страна, которую видит Google (по YouTube)."""
@@ -4632,6 +4645,9 @@ def vless_check(link, geo=True):
                 err = str(e)
         if best is None:
             res['err'] = err or 'нет ответа'
+            why = mihomo_log_reason(os.path.join(d, 'log.txt'))
+            if why:                        # настоящая причина — в журнале mihomo (EOF от urllib её прячет)
+                res['err'] = why
             return res
         res.update(ok=True, ms=best)
         if geo:
@@ -4996,7 +5012,10 @@ def scr_vs(uid, note=''):
     if lst:
         rel = c.get('rel') or {}
         old = xray_outdated(rel)
-        lines += ['', f'⬆️ Последний Xray: <b>{h(rel["tag"])}</b>' + (f', старее на {len(old)} из {len(lst)}' if old else ', у всех свежий')
+        bad = c.get('bad_ver') or {}
+        lines += ['', f'⬆️ Последний Xray: <b>{h(rel["tag"])}</b>' + (
+            ' — ⛔ не заработал с шлюзом, ставить не буду' if xray_bad(rel['tag']) else
+            f', старее на {len(old)} из {len(lst)}' if old else ', у всех свежий')
                   if rel.get('tag') else '⬆️ Последний Xray: ещё не проверялся',
                   '🌙 Ночью с 03:00, по одному: ' + ('Xray — ' + dict(XRAY_MODES)[c['xray']]) + '; перезагрузка, '
                   + ('когда её просит система' if c.get('os') else 'выключена')]
@@ -5060,8 +5079,10 @@ def scr_vs_one(uid, vid, note=''):
     if note:
         lines += ['', note]
     kb = [[btn('🔄 Проверить', f'vs:chk:{vid}')]]
+    if vl and (not last.get('ok') or last.get('stale') or not sb):
+        kb.insert(0, [btn('🛠 Починить', f'vs:fix:{vid}')])
     if vl:
-        kb[0].append(btn('🔑 Новые ключи', f'vs:rot:{vid}'))
+        kb[0 if len(kb) == 1 else 1].append(btn('🔑 Новые ключи', f'vs:rot:{vid}'))
         rel = (vpsm().get('rel') or {}).get('tag')
         newer = rel and vl.get('ver') and vtuple(rel) > vtuple(vl['ver'])
         kb.append([btn('🎭 Другая маскировка', f'vs:sni:{vid}'),
@@ -5161,7 +5182,7 @@ def vs_action(uid, vid, act, chat, mid):
         return scr_vs_one(uid, vid, '⏳ С сервером уже идёт операция, подождите.')
     msgs = {'chk': '🔄 Проверяю сервер (до минуты)…', 'rot': '🔑 Меняю ключи и обновляю ссылку в шлюзе…',
             'upd': '⬆️ Обновляю Xray (до 2 минут)…', 'sni': '🎭 Ищу сайты для маскировки…',
-            'snok': '🎭 Применяю маскировку…', 'snnext': '🎭 Пробую следующую маскировку…',
+            'snok': '🎭 Применяю маскировку…', 'fix': '🛠 Чиню сервер…', 'snnext': '🎭 Пробую следующую маскировку…',
             'snno': '🎭 Возвращаю прежнюю маскировку…',
             'ins': '🚀 Устанавливаю VLESS (1–3 минуты)…', 'del': '🗑 Удаляю VLESS с сервера…',
             'att': '➕ Проверяю сервер и добавляю в шлюз…', 'goo': '🎯 Направляю Google через сервер и применяю…',
@@ -5176,6 +5197,8 @@ def vs_action(uid, vid, act, chat, mid):
             return scr_vs_one(uid, vid)
         if act in ('sni', 'snnext'):
             return vs_sni_search(uid, vid, chat, mid, resume=act == 'snnext')
+        if act == 'fix':
+            return vs_fix(uid, vid, chat, mid)
         if act == 'snok':
             return vs_sni_apply(uid, vid)
         if act == 'snno':
@@ -5312,6 +5335,12 @@ VS_CONFIRM = {
             'только после вашего подтверждения, а без ответа за 10 минут сервер сам вернёт прежнюю.'),
     'upd': ('⬆️ <b>Обновить Xray на сервере?</b>\n\nVPN через этот сервер прервётся на несколько секунд. До и после '
             'обновления бот проверит сервер из России; если новая версия не заработает, вернётся прежняя.'),
+    'fix': ('🛠 <b>Починить сервер?</b>\n\nБот будет перебирать варианты по очереди и каждый проверять из России:\n'
+            '1) прежнюю версию Xray (если сервер сломался после обновления) и предыдущие стабильные;\n'
+            '2) маски — соседей по сети и запасной список;\n3) другие свободные порты.\n\n'
+            'Это может занять 5–20 минут, VPN через этот сервер в это время прерывается. Возврат версии Xray '
+            'применяется сразу (это возврат к рабочему), смена маски или порта — только после вашего подтверждения; '
+            'без ответа за 10 минут сервер вернёт прежние настройки сам. Ключи не меняются.'),
     'osup': ('📦 <b>Обновить систему на сервере?</b>\n\nПакеты Ubuntu/Debian обновятся в фоне (обычно 2–10 минут), '
              'VLESS при этом работает. Если после обновления понадобится перезагрузка, бот сделает её ночью '
              '(если ночная перезагрузка включена) или её можно сделать кнопкой.'),
@@ -5371,7 +5400,7 @@ def handle_vs(uid, data, chat, mid):
     if act.endswith('!'):
         act = act[:-1]
     if act in ('chk', 'rot', 'sni', 'upd', 'ins', 'del', 'att', 'goo', 'paoff', 'paon', 'off', 'osup', 'rb',
-               'snok', 'snnext', 'snno'):
+               'snok', 'snnext', 'snno', 'fix'):
         return vs_action(uid, vid, act, chat, mid)
     return scr_vs_one(uid, vid)
 
@@ -8592,9 +8621,11 @@ def xray_release(force=False):
         return rel
     try:
         data = json.loads(fetch(XRAY_RELEASES, 20))
-        best = next((r for r in data if not r.get('draft') and not r.get('prerelease') and r.get('tag_name')), None)
-        if best:
-            rel = {'tag': best['tag_name'], 'pub': parse_iso(best.get('published_at') or ''), 'checked': time.time()}
+        stable = [r for r in data if not r.get('draft') and not r.get('prerelease') and r.get('tag_name')]
+        if stable:
+            best = stable[0]
+            rel = {'tag': best['tag_name'], 'pub': parse_iso(best.get('published_at') or ''), 'checked': time.time(),
+                   'stable': [r['tag_name'] for r in stable[:6]]}
     except Exception as e:
         log('релизы Xray:', e)
         rel = dict(rel, checked=time.time(), err=str(e)[:200])
@@ -8604,11 +8635,23 @@ def xray_release(force=False):
     return rel
 
 
+def xray_bad(tag):
+    """Версия, которая уже не заработала из России на одном из наших серверов."""
+    return bool(tag) and vtuple(tag) in {vtuple(t) for t in (vpsm().get('bad_ver') or {})}
+
+
+def xray_mark_bad(tag, why):
+    c = vpsm()
+    with lock:
+        c.setdefault('bad_ver', {})[tag if tag.startswith('v') else 'v' + tag] = {'ts': time.time(), 'why': why[:200]}
+        save_state()
+
+
 def xray_outdated(rel=None):
-    """[(vid, x)] серверов, где Xray старше последней стабильной версии."""
+    """[(vid, x)] серверов, где Xray старше последней стабильной версии (неудачные версии не предлагаем)."""
     rel = rel or (vpsm().get('rel') or {})
     tag = rel.get('tag')
-    if not tag:
+    if not tag or xray_bad(tag):
         return []
     return [(vid, x) for vid, x in sorted(vps_all().items())
             if (x.get('vless') or {}).get('ver') and vtuple((x['vless'] or {})['ver']) < vtuple(tag)]
@@ -8679,6 +8722,8 @@ def vs_xray_update(vid, tag=None, say=None):
     old, new = data.get('OLDVER') or '', data.get('VER') or ''
     with lock:
         x['vless'] = dict(x.get('vless') or {}, ver=new)
+        if old and old != new:
+            x['vless']['prev_ver'] = old         # для «🛠 Починить»: к чему откатываться
         save_state()
     if old == new:
         return True, f'уже стоит Xray {new}'
@@ -8686,6 +8731,7 @@ def vs_xray_update(vid, tag=None, say=None):
         say('Проверяю сервер из России после обновления…')
         chk = vless_check(link, geo=False)
         if not chk.get('ok'):
+            xray_mark_bad(new, f'{x["host"]}: {chk.get("err") or "нет ответа из России"}')
             try:
                 rb = vs_call(vs, 'xray-rollback', timeout=300)
                 with lock:
@@ -8786,6 +8832,8 @@ SNI_TTL = 600                     # через столько секунд се�
 
 
 def sni_kind(c):
+    if c['kind'] == 'o':
+        return 'прежняя маска'
     if c['kind'] == 'n':
         return '🏠 сосед по сети' if c['same'] else '🏘 сосед по сети (по IP)'
     return '🌐 из запасного списка'
@@ -8798,6 +8846,7 @@ def vs_sni_screen(vid):
     left = max(int(SNI_TTL - (time.time() - pd['ts'])), 0)
     text = (f'🎭 <b>Нашлась рабочая маскировка</b>\n\n<b>{h(c["dom"])}</b> — {sni_kind(c)}'
             + (f', адрес {h(c["dest"])}' if c['dest'] != c['dom'] else '')
+            + (f'\n<b>Порт {c["port"]}</b> вместо прежнего' if c.get('port') else '')
             + f'\nОт сервера до сайта {c["ms"]} мс; через сервер из России ответ за {c.get("ms_ru") or "?"} мс.'
             + f'\nПрежняя маска: {h(pd.get("orig") or "?")}.\n\nНовая маска уже стоит на сервере на пробу. '
             f'Применить её и обновить ссылку в шлюзе? Без ответа примерно через {max(left // 60, 1)} мин '
@@ -8820,35 +8869,15 @@ def vs_sni_search(uid, vid, chat, mid, resume=False):
         cands, tried, orig = list(pd['cands']), pd.get('tried', 0), pd.get('orig')
     else:
         say('Ищу сайты-соседи в сети сервера и проверяю запасной список (до минуты)…')
-        data = vs_call(vs, 'sni-scan', timeout=300)
-        orig = data.get('SNI') or (x.get('vless') or {}).get('sni')
-        cands, tried = [], 0
-        for line in data.get('CAND', []):
-            f = line.split()
-            if len(f) >= 5 and f[0] != orig:
-                cands.append({'dom': f[0], 'dest': f[1], 'ms': int(f[2]) if f[2].isdigit() else 0,
-                              'same': f[3] == '1', 'kind': f[4]})
-        with lock:
-            x['p443'] = data.get('P443') or ''
-            save_state()
+        orig, cands, _ = vs_sni_scan(x)
+        tried = 0
     limit = tried + SNI_TRY_MAX
     while cands and tried < limit:
         c = cands.pop(0)
         tried += 1
         say(f'Пробую {tried}-ю: <b>{h(c["dom"])}</b> — {sni_kind(c)}, {c["ms"]} мс от сервера.\n'
             'Проверяю из России… VPN через этот сервер сейчас может прерываться.')
-        try:
-            d = vs_call(vs, 'sni-try', {'DOMAIN': c['dom'], 'DEST': c['dest']}, timeout=180)
-        except VsError as e:
-            log('маска', c['dom'], e)
-            continue
-        link = d.get('LINK', '')
-        chk = vless_check(link, geo=False) if link else {'ok': False}
-        if chk.get('ok'):
-            with lock:
-                x['snip'] = {'cands': cands, 'tried': tried, 'orig': orig, 'ts': time.time(),
-                             'cur': dict(c, link=link, ms_ru=chk.get('ms'))}
-                save_state()
+        if vs_trial(x, c, cands, tried, orig):
             return vs_sni_screen(vid)
     try:
         vs_call(vs, 'sni-revert', timeout=120)
@@ -8871,6 +8900,149 @@ def vs_sni_search(uid, vid, chat, mid, resume=False):
     return scr_vs_one(uid, vid, note)
 
 
+def vs_sni_scan(x):
+    """Кандидаты в маски с сервера → (текущая маска, [кандидаты], [свободные порты])."""
+    data = vs_call(vs_conn(x), 'sni-scan', timeout=300)
+    orig = data.get('SNI') or (x.get('vless') or {}).get('sni')
+    cands = []
+    for line in data.get('CAND', []):
+        f = line.split()
+        if len(f) >= 5 and f[0] != orig:
+            cands.append({'dom': f[0], 'dest': f[1], 'ms': int(f[2]) if f[2].isdigit() else 0,
+                          'same': f[3] == '1', 'kind': f[4]})
+    ports = [int(p) for p in (data.get('PORTS') or '').split() if p.isdigit()]
+    with lock:
+        x['p443'] = data.get('P443') or ''
+        save_state()
+    return orig, cands, ports
+
+
+def vs_trial(x, c, cands, tried, orig):
+    """Поставить маску (и, возможно, порт) на пробу и проверить из России. True — работает, ждёт подтверждения."""
+    env = {'DOMAIN': c['dom'], 'DEST': c['dest']}
+    if c.get('port'):
+        env['NEWPORT'] = c['port']
+    try:
+        d = vs_call(vs_conn(x), 'sni-try', env, timeout=180)
+    except VsError as e:
+        log('проба', c['dom'], c.get('port'), e)
+        return False
+    link = d.get('LINK', '')
+    chk = vless_check(link, geo=False) if link else {'ok': False}
+    if not chk.get('ok'):
+        return False
+    with lock:
+        x['snip'] = {'cands': cands, 'tried': tried, 'orig': orig, 'ts': time.time(),
+                     'cur': dict(c, link=link, ms_ru=chk.get('ms'))}
+        save_state()
+    return True
+
+
+def vs_fix(uid, vid, chat, mid):
+    """🛠 Починить: версия Xray → маски → порты, каждый вариант — проверка из России."""
+    x = vps_all()[vid]
+    vs = vs_conn(x)
+    log_lines = []
+
+    def say(t):
+        edit(chat, mid, '🛠 <b>Чиню сервер</b>\n\n' + '\n'.join(log_lines[-6:] + [f'⏳ {t}']))
+
+    def note(t):
+        log_lines.append(t)
+    say('Проверяю сервер как есть…')
+    try:
+        link = vs_link(vs)
+    except VsError as e:
+        return scr_vs_one(uid, vid, f'🔴 Нет доступа по SSH: {h(str(e))}. Починить из бота не получится — '
+                                    'проверьте сервер в панели хостинга.')
+    chk = vless_check(link, geo=False) if link else {'ok': False}
+    if chk.get('ok'):
+        vs_attach(vid, link)
+        with lock:
+            x['last'] = dict(x.get('last') or {}, ok=True, ms=chk.get('ms'), ts=time.time(), stale=False)
+            save_state()
+        return scr_vs_one(uid, vid, '✅ Сервер из России работает. Ссылка в шлюзе сверена с сервером и при '
+                                    'необходимости обновлена.')
+    note(f'❌ Как есть: {h(chk.get("err") or "нет ответа")}')
+    # 0) совместимость: Xray ≥ 26.7.11 без minClientVer не пускает mihomo
+    say('Проверяю совместимость Xray с шлюзом (minClientVer)…')
+    try:
+        vs_call(vs, 'harden', timeout=300)
+        if vless_check(link, geo=False).get('ok'):
+            vs_attach(vid, link)
+            with lock:
+                x['last'] = dict(x.get('last') or {}, ok=True, ts=time.time(), stale=False)
+                save_state()
+            add_event(f'{admin_name(uid)}: {x["host"]} починен — совместимость Xray с шлюзом')
+            return scr_vs_one(uid, vid, '✅ <b>Починено:</b> Xray на сервере не пускал клиента шлюза (новые версии '
+                                        'требуют minClientVer). Настройка добавлена, сервер добавлен в шлюз.')
+        note('❌ Совместимость в порядке, дело не в ней')
+    except VsError as e:
+        note(f'❌ Совместимость: {h(str(e))[:120]}')
+    # 1) версия Xray
+    cur = (x.get('vless') or {}).get('ver') or ''
+    rel = xray_release(force=True)
+    vers = []
+    for t in [(x.get('vless') or {}).get('prev_ver')] + [t for t in rel.get('stable') or [] if vtuple(t) < vtuple(cur)]:
+        if t and vtuple(t) != vtuple(cur) and not xray_bad(t) and vtuple(t) not in {vtuple(v) for v in vers}:
+            vers.append(t if t.startswith('v') else 'v' + t)
+    for t in vers[:2]:
+        say(f'Пробую Xray {h(t)} (сейчас {h(cur)})…')
+        try:
+            d = vs_call(vs, 'update', {'XRAY_VERSION': t}, timeout=600)
+        except VsError as e:
+            note(f'❌ Xray {h(t)}: не встал ({h(str(e))[:120]})')
+            continue
+        ok = vless_check(link, geo=False).get('ok')
+        if ok:
+            xray_mark_bad(cur, f'{x["host"]}: заработал только после возврата на {t}')
+            with lock:
+                x['vless'] = dict(x.get('vless') or {}, ver=d.get('VER') or t, prev_ver=cur)
+                save_state()
+            vs_attach(vid, link)
+            add_event(f'{admin_name(uid)}: {x["host"]} починен возвратом Xray {cur} → {t}')
+            return scr_vs_one(uid, vid, f'✅ <b>Починено:</b> возвращён Xray {h(t)}. Версия {h(cur)} с шлюзом не '
+                                        'работает — бот запомнил её и сам больше не поставит. '
+                                        'Пока режим Xray лучше держать «сообщать».')
+        note(f'❌ Xray {h(t)}: тоже не отвечает')
+        try:
+            vs_call(vs, 'update', {'XRAY_VERSION': cur if cur.startswith('v') else 'v' + cur}, timeout=600)
+        except VsError as e:
+            log('починка: возврат версии', e)
+    # 2) маски, 3) порты
+    say('Ищу маски: соседи по сети и запасной список…')
+    try:
+        orig, cands, ports = vs_sni_scan(x)
+    except VsError as e:
+        return scr_vs_one(uid, vid, '🔴 Поиск масок не удался: ' + h(str(e)))
+    cur_port = (x.get('vless') or {}).get('port')
+    trials = list(cands)
+    best = [c for c in cands[:2]]
+    for p in sorted(ports, key=lambda q: (q != 443, q)):
+        trials.append({'dom': orig, 'dest': orig, 'ms': 0, 'same': False, 'kind': 'o', 'port': p})
+        trials += [dict(c, port=p) for c in best]
+    tried = 0
+    while trials and tried < 25:
+        c = trials.pop(0)
+        tried += 1
+        what = f'маска {h(c["dom"])}' + (f', порт {c["port"]}' if c.get('port') else '')
+        say(f'Пробую {tried}: {what}…')
+        if vs_trial(x, c, trials, tried, orig):
+            return vs_sni_screen(vid)
+        note(f'❌ {what}')
+    try:
+        vs_call(vs, 'sni-revert', timeout=120)
+    except VsError as e:
+        log('починка: откат', e)
+    with lock:
+        x.pop('snip', None)
+        save_state()
+    return scr_vs_one(uid, vid, f'⚠️ <b>Починить не удалось.</b> Перепробовано вариантов: {tried + len(vers[:2])}, '
+                                f'оставлены прежние настройки (порт {cur_port}, маска {h(orig or "?")}).\n\n'
+                                'Порт с сервера открыт, а VLESS не проходит ни с одной маской и портом — похоже, '
+                                'блокируют IP сервера целиком. Обычно помогает новый IP у хостинга.')
+
+
 def vs_sni_apply(uid, vid):
     x = vps_all()[vid]
     pd = x.get('snip')
@@ -8886,11 +9058,14 @@ def vs_sni_apply(uid, vid):
     vs_attach(vid, c['link'])
     with lock:
         x['vless'] = dict(x.get('vless') or {}, sni=c['dom'], ts=time.time())
+        if c.get('port'):
+            x['vless']['port'] = int(c['port'])
         x.pop('snip', None)
         x['last'] = dict(x.get('last') or {}, ok=True, ms=c.get('ms_ru'), ts=time.time(), stale=False)
         save_state()
     add_event(f'{admin_name(uid)}: {x["host"]} — маскировка {pd.get("orig")} → {c["dom"]}')
-    return scr_vs_one(uid, vid, f'✅ Маскировка: <b>{h(c["dom"])}</b> ({sni_kind(c)}). Ссылка в шлюзе обновлена — '
+    return scr_vs_one(uid, vid, f'✅ Маскировка: <b>{h(c["dom"])}</b> ({sni_kind(c)})'
+                                + (f', порт {c["port"]}' if c.get('port') else '') + '. Ссылка в шлюзе обновлена — '
                                 'VPN мог прерваться на 5–10 секунд.')
 
 
@@ -8949,7 +9124,7 @@ def vs_night():
                     log('harden', x['host'], e)
             ver = (x.get('vless') or {}).get('ver')
             if c.get('xray') == 'auto' and ver and rel.get('tag') and vtuple(rel['tag']) > vtuple(ver) \
-                    and time.time() - (rel.get('pub') or time.time()) >= XRAY_DELAY:
+                    and not xray_bad(rel['tag']) and time.time() - (rel.get('pub') or time.time()) >= XRAY_DELAY:
                 try:
                     ok, txt = vs_xray_update(vid, rel['tag'])
                 except VsError as e:
@@ -10756,6 +10931,12 @@ def main():
     threading.Thread(target=zt_startup, daemon=True).start()
     threading.Thread(target=maint_loop, daemon=True).start()
     mptcp_off()
+    c = vpsm()
+    if not c.get('minver_fix'):       # «плохие» версии Xray 2.3 — на деле не хватало minClientVer: забываем
+        with lock:
+            c.pop('bad_ver', None)
+            c['minver_fix'] = 1
+            save_state()
     if LINK_MODE:
         touch_alive()
         try:

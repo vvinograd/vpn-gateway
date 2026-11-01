@@ -93,6 +93,7 @@ write_conf() {   # порт маска [dest — по умолчанию сам 
       "realitySettings": {
         "dest": "${3:-$2}:443",
         "serverNames": ["$2"],
+        "minClientVer": "1.8.2",
         "privateKey": "$PRIV",
         "shortIds": ["$SID"]
       }
@@ -188,6 +189,7 @@ open_firewall() {
 # MPTCP не нужен, а через него атакуют ядро (CVE-2026-98432: Go 1.24+ открывает порты с MPTCP);
 # обновления безопасности ставятся сами (перезагрузку делает бот шлюза ночью)
 harden() {
+    compat_conf
     if [ -e /proc/sys/net/mptcp/enabled ]; then
         printf '# vpn-gateway: MPTCP выключен (CVE-2026-98432)\nnet.mptcp.enabled = 0\n' >"$MPTCP_CONF"
         run sysctl -q -w net.mptcp.enabled=0
@@ -205,9 +207,23 @@ harden() {
     return 0
 }
 
-# защита на месте: MPTCP выключен (автообновления — отдельно, строка UU)
+# защита и совместимость на месте: MPTCP выключен, в конфиге есть minClientVer (автообновления — строка UU)
 hard_ok() {
-    [ ! -e /proc/sys/net/mptcp/enabled ] || [ "$(cat /proc/sys/net/mptcp/enabled)" = 0 ]
+    { [ ! -e /proc/sys/net/mptcp/enabled ] || [ "$(cat /proc/sys/net/mptcp/enabled)" = 0 ]; } || return 1
+    [ ! -f "$CONF" ] || [ ! -f "$INFO" ] || grep -q '"minClientVer"' "$CONF"
+}
+
+# Xray с версии 26.7.11 по умолчанию пускает только клиентов от 26.3.27, а mihomo (клиент шлюза) называет
+# себя версией 1.8.2 — без minClientVer проверка REALITY у него не проходит («REALITY authentication failed»)
+compat_conf() {
+    [ -f "$CONF" ] && [ -f "$INFO" ] || return 0
+    grep -q '"minClientVer"' "$CONF" && return 0
+    cp -a "$CONF" "$CONF.bak-compat"
+    if ( load_conf; write_conf "$PORT" "$SNI" "$DEST" && restart_xray "$PORT" ); then
+        echo "minClientVer добавлен в конфиг" >>"$LOG"
+    else
+        cp -a "$CONF.bak-compat" "$CONF"; systemctl restart xray >/dev/null 2>&1
+    fi
 }
 
 # вернуть сохранённый бинарник Xray. Не через cp поверх: запущенный файл так не перезаписать
@@ -330,6 +346,9 @@ do_sni_scan() {
     who=$(ss -Hltnp 'sport = :443' 2>/dev/null | grep -oP 'users:\(\("\K[^"]+' | head -1)
     [ -n "$who" ] && out "P443 $who"
     [ -f "$CONF" ] && { load_conf; out "SNI $SNI"; out "PORT $PORT"; }
+    local p free=""
+    for p in $PORT_LIST; do [ "$p" = "${PORT:-}" ] || busy "$p" || free="$free $p"; done
+    out "PORTS${free}"
     out "OK"
 }
 
@@ -344,24 +363,31 @@ sni_restore() {
     return 0
 }
 
+# DOMAIN — маска, DEST — адрес сайта (по умолчанию домен), NEWPORT — другой порт (по умолчанию прежний)
 do_sni_try() {
     [ -n "${DOMAIN:-}" ] || die "не задан DOMAIN"
-    local want_dest=${DEST:-$DOMAIN}     # load_conf перепишет DEST текущим значением из конфига
+    local want_dest=${DEST:-$DOMAIN} want_port=${NEWPORT:-}   # load_conf перепишет DEST и PORT из конфига
     load_conf
+    want_port=${want_port:-$PORT}
+    if [ "$want_port" != "$PORT" ] && busy "$want_port" && ! [ -f "$CONF.sni-orig" ]; then
+        die "порт $want_port занят другой программой"
+    fi
     if ! systemctl is-active --quiet "$SNI_REVERT.timer"; then     # первая проба — запоминаем исходное
         cp -a "$CONF" "$CONF.sni-orig"; cp -a "$INFO" "$INFO.sni-orig"
     fi
     systemctl stop "$SNI_REVERT.timer" >/dev/null 2>&1
-    write_conf "$PORT" "$DOMAIN" "$want_dest" || { sni_restore; die "Xray отклонил конфиг с маской $DOMAIN"; }
-    if ! { restart_xray "$PORT" && selftest "$PORT" "$DOMAIN"; }; then
-        sni_restore; die "маска $DOMAIN не прошла самопроверку на сервере"
+    [ "$want_port" != "$PORT" ] && open_firewall "$want_port"
+    write_conf "$want_port" "$DOMAIN" "$want_dest" || { sni_restore; die "Xray отклонил конфиг с маской $DOMAIN"; }
+    if ! { restart_xray "$want_port" && selftest "$want_port" "$DOMAIN"; }; then
+        sni_restore; die "маска $DOMAIN на порту $want_port не прошла самопроверку на сервере"
     fi
-    SNI=$DOMAIN
+    SNI=$DOMAIN; PORT=$want_port
     save_info
     systemctl reset-failed "$SNI_REVERT.timer" "$SNI_REVERT.service" >/dev/null 2>&1
     run systemd-run --quiet --collect --unit "$SNI_REVERT" --on-active=600 /bin/bash "$(readlink -f "$0")" sni-revert \
         || { sni_restore; die "не удалось включить страховочный откат"; }
     out "SNI $SNI"
+    out "PORT $PORT"
     out "OK"
     show_link
 }
