@@ -160,8 +160,12 @@ system), `reboot`, `uninstall`.
 The bot watches Xray releases (skipping pre-releases and withdrawn versions) and, depending on the mode, either
 tells you about a new version or installs it itself at night once it is 3 days old. Each update is checked from
 Russia before and after — if it does not work, the previous version comes back. From 03:00 the servers are
-serviced one at a time: Xray and a reboot if the system asks for one; a report arrives in the morning. The
-Reality camouflage site changes only with the "🎭 Another camouflage" button.
+serviced one at a time: Xray and a reboot if the system asks for one; a report arrives in the morning.
+
+**Camouflage.** "🎭 Another camouflage" looks for neighbour sites in the server's own network (same data centre —
+much less suspicious than a big brand on a small hoster), then a fallback list. Each candidate is checked from
+Russia and applied only after you confirm; without an answer the server returns the previous one in 10 minutes.
+"🔄 Check" compares the link on the server with the one in the gateway and offers to update it if they differ.
 
 ## Several gateways in one bot
 

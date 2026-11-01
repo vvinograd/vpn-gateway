@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.2'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -4342,8 +4342,6 @@ SSH_KNOWN = os.path.join(SSH_DIR, 'known_hosts')
 VLESS_SCRIPT = '/usr/local/lib/vpngw/install-vless.sh'
 REMOTE_SCRIPT = '/usr/local/sbin/vpngw-vless'
 SUDOERS_FILE = '/etc/sudoers.d/zzz-vpngw-bot'   # последним: более поздние правила sudo главнее
-SNI_SITES = ['www.samsung.com', 'www.nvidia.com', 'www.amd.com', 'dl.google.com', 'addons.mozilla.org',
-             'www.apple.com']
 BAD_GL = {'RU': 'Россия', 'BY': 'Беларусь', 'IR': 'Иран', 'CN': 'Китай', 'KP': 'КНДР', 'SY': 'Сирия', 'CU': 'Куба'}
 CHROME_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
              'Chrome/131.0.0.0 Safari/537.36')
@@ -4532,7 +4530,7 @@ def parse_marks(out):
     for line in out.splitlines():
         if line.startswith('@@'):
             k, _, val = line[2:].partition(' ')
-            if k in ('STEP', 'SNI_SKIP', 'SNI_FAIL'):
+            if k in ('STEP', 'SNI_SKIP', 'SNI_FAIL', 'CAND'):
                 data.setdefault(k, []).append(val)
             else:
                 data[k] = val
@@ -4691,16 +4689,38 @@ def sub_for_host(host):
     return None
 
 
-def vs_attach(vid, link, gl=None):
-    """Добавляет сервер в шлюз отдельной подпиской (или обновляет ссылку в существующей)."""
-    x = vps_all()[vid]
-    pid = x.get('sub') if sub_by_id(x.get('sub') or '') else sub_for_host(x['host'])
+def link_in_sub(pid, link):
+    """Стоит ли в подписке шлюза именно эта ссылка: те же ключи, маска и порт."""
     p = vless_to_proxy(link) or {}
     try:
         cur = open(os.path.join(PROV_DIR, f'{pid}.yaml'), encoding='utf-8').read() if pid else ''
     except OSError:
-        cur = ''
-    same = bool(p) and p.get('uuid', '-') in cur and (p.get('reality-opts') or {}).get('public-key', '-') in cur
+        return False
+    return (bool(p) and p.get('uuid', '-') in cur and (p.get('reality-opts') or {}).get('public-key', '-') in cur
+            and f'"servername": {json.dumps(p.get("servername") or "-", ensure_ascii=False)}' in cur
+            and re.search(r'"port":\s*' + str(p.get('port')) + r'\b', cur) is not None)
+
+
+def subs_with_host(host, skip=None):
+    """Имена подписок шлюза со ссылками на этот сервер (кроме skip) — чтобы заметить дубли."""
+    out = []
+    for sb in subs():
+        if sb['id'] == skip or sb.get('type') != 'file':
+            continue
+        try:
+            txt = open(os.path.join(PROV_DIR, f'{sb["id"]}.yaml'), encoding='utf-8').read()
+        except OSError:
+            continue
+        if re.search(r'"server":\s*"' + re.escape(host) + '"', txt):
+            out.append(sb['name'])
+    return out
+
+
+def vs_attach(vid, link, gl=None):
+    """Добавляет сервер в шлюз отдельной подпиской (или обновляет ссылку в существующей)."""
+    x = vps_all()[vid]
+    pid = x.get('sub') if sub_by_id(x.get('sub') or '') else sub_for_host(x['host'])
+    same = link_in_sub(pid, link)
     if pid and same:
         pass                            # ссылка уже стоит в шлюзе — лишний раз VPN не перезапускаем
     elif pid:
@@ -5023,6 +5043,15 @@ def scr_vs_one(uid, vid, note=''):
     osl = vs_os_line(x)
     if osl:
         lines.append(osl)
+    if last.get('stale') and sb:
+        lines.append(f'⚠️ <b>В подписке «{h(sb["name"])}» устаревшая ссылка</b>: ключи, маска или порт на сервере '
+                     'другие. Шлюз через этот сервер не пройдёт — нажмите «🔄 Обновить ссылку в шлюзе».')
+    dup = subs_with_host(x['host'], skip=x.get('sub'))
+    if dup:
+        lines.append('ℹ️ Этот сервер есть и в других подписках: ' + h(', '.join(dup))
+                     + '. Если это старая ссылка, лишнюю подписку можно удалить (📦 Подписки).')
+    if x.get('snip') and time.time() - x['snip'].get('ts', 0) < SNI_TTL:
+        lines.append(f'🎭 На пробе маска {h(x["snip"]["cur"]["dom"])} — ждёт подтверждения.')
     if x.get('pass_off'):
         lines.append('🔒 Вход на сервер по паролю выключен (только по ключу)')
     v = vpn()
@@ -5041,6 +5070,8 @@ def scr_vs_one(uid, vid, note=''):
             kb.append([btn('🎯 Google и Gemini через него', f'vs:goo:{vid}')])
         if not sb:
             kb.append([btn('➕ Добавить в шлюз', f'vs:att:{vid}')])
+        elif last.get('stale'):
+            kb.insert(0, [btn('🔄 Обновить ссылку в шлюзе', f'vs:att:{vid}')])
     else:
         kb.append([btn('🚀 Установить VLESS', f'vs:ins:{vid}')])
     o = x.get('sysi') or {}
@@ -5111,6 +5142,8 @@ def vs_check(vid):
         if link:
             res.update(vless_check(link))
             res['link_host'] = list(vs_link_host(link))
+            if x.get('sub') and sub_by_id(x['sub']) and not link_in_sub(x['sub'], link):
+                res['stale'] = True     # на сервере другие ключи/маска/порт, чем в шлюзе
     with lock:
         x['last'] = res
         save_state()
@@ -5127,7 +5160,9 @@ def vs_action(uid, vid, act, chat, mid):
     if key in VS_BUSY:
         return scr_vs_one(uid, vid, '⏳ С сервером уже идёт операция, подождите.')
     msgs = {'chk': '🔄 Проверяю сервер (до минуты)…', 'rot': '🔑 Меняю ключи и обновляю ссылку в шлюзе…',
-            'upd': '⬆️ Обновляю Xray (до 2 минут)…', 'sni': '🎭 Подбираю другую маскировку (1–3 минуты)…',
+            'upd': '⬆️ Обновляю Xray (до 2 минут)…', 'sni': '🎭 Ищу сайты для маскировки…',
+            'snok': '🎭 Применяю маскировку…', 'snnext': '🎭 Пробую следующую маскировку…',
+            'snno': '🎭 Возвращаю прежнюю маскировку…',
             'ins': '🚀 Устанавливаю VLESS (1–3 минуты)…', 'del': '🗑 Удаляю VLESS с сервера…',
             'att': '➕ Проверяю сервер и добавляю в шлюз…', 'goo': '🎯 Направляю Google через сервер и применяю…',
             'paoff': '🔒 Выключаю вход по паролю…', 'paon': '🔓 Возвращаю вход по паролю…',
@@ -5139,22 +5174,29 @@ def vs_action(uid, vid, act, chat, mid):
         if act == 'chk':
             vs_check(vid)
             return scr_vs_one(uid, vid)
-        if act in ('rot', 'sni', 'ins', 'att'):
+        if act in ('sni', 'snnext'):
+            return vs_sni_search(uid, vid, chat, mid, resume=act == 'snnext')
+        if act == 'snok':
+            return vs_sni_apply(uid, vid)
+        if act == 'snno':
+            try:
+                vs_call(vs, 'sni-revert', timeout=120)
+            finally:
+                with lock:
+                    x.pop('snip', None)
+                    save_state()
+            return scr_vs_one(uid, vid, '↩️ Оставлена прежняя маскировка.')
+        if act in ('rot', 'ins', 'att'):
             if act == 'rot':
                 data = vs_call(vs, 'rotate', timeout=300)
             elif act == 'att':
                 data = vs_call(vs, 'show', timeout=60)
             else:
                 env = {'ADDR': x['host'], 'NAME': re.sub(r'[^A-Za-z0-9._-]+', '-', x.get('name') or 'vpn')[:40]}
-                if act == 'sni':
-                    cur = (x.get('vless') or {}).get('sni')
-                    env.update(FORCE=1, PORT=(x.get('vless') or {}).get('port') or '',
-                               SNI=' '.join(s for s in SNI_SITES if s != cur))
-                    if not env['PORT']:
-                        env.pop('PORT')
                 data = vs_call(vs, 'install', env, timeout=1500,
                                on_step=lambda s: edit(chat, mid, f'{msgs[act]}\n\n<i>{h(s)}</i>'))
             link = data.get('LINK', '')
+            sb_was = bool(x.get('sub') and sub_by_id(x['sub']))
             with lock:
                 x['vless'] = dict(x.get('vless') or {}, port=int(data.get('PORT') or 0), sni=data.get('SNI', ''),
                                   ts=time.time())
@@ -5169,8 +5211,9 @@ def vs_action(uid, vid, act, chat, mid):
                 return scr_vs_one(uid, vid, f'⚠️ Установлено, но из России VLESS не отвечает: {h(chk.get("err", ""))}.'
                                             ' В шлюз не добавлял. Проверьте файрвол хостинга или смените маскировку.')
             vs_attach(vid, link, chk.get('gl'))
-            what = {'rot': 'Ключи заменены, ссылка в шлюзе обновлена', 'sni': f'Маскировка: {data.get("SNI")}',
-                    'ins': 'VLESS установлен и добавлен в шлюз', 'att': 'Сервер добавлен в шлюз'}[act]
+            what = {'rot': 'Ключи заменены, ссылка в шлюзе обновлена',
+                    'ins': 'VLESS установлен и добавлен в шлюз',
+                    'att': 'Ссылка в шлюзе совпадает с сервером' if sb_was else 'Сервер добавлен в шлюз'}[act]
             add_event(f'{who}: {x["host"]} — {what}')
             return scr_vs_one(uid, vid, f'✅ {h(what)}.' + ('' if chk.get('ok') else
                                                             f'\n⚠️ Проверка из России не прошла: {h(chk.get("err", ""))}'))
@@ -5262,8 +5305,11 @@ VS_CONFIRM = {
     'rot': ('🔑 <b>Новые ключи?</b>\n\nНа сервере будут созданы новые ключи, старая ссылка перестанет работать. '
             'Ссылка в шлюзе обновится сама (VPN прервётся на 5–10 секунд). Если эту ссылку вы давали '
             'кому-то ещё, им понадобится новая.'),
-    'sni': ('🎭 <b>Сменить маскировку?</b>\n\nПомогает, если провайдер начал резать подключение. Бот подберёт другой '
-            'сайт для маскировки и создаст новые ключи, ссылка в шлюзе обновится сама.'),
+    'sni': ('🎭 <b>Подобрать другую маскировку?</b>\n\nПомогает, если провайдер начал резать подключение. Сервер '
+            'поищет сайты-соседи в своей сети (тот же дата-центр — такую маску труднее заподозрить) и проверит '
+            'запасной список. Бот будет пробовать их по одному и проверять из России, это 1–5 минут; VPN через '
+            'этот сервер в это время может прерываться.\n\nКлючи останутся прежними. Новую маску бот применит '
+            'только после вашего подтверждения, а без ответа за 10 минут сервер сам вернёт прежнюю.'),
     'upd': ('⬆️ <b>Обновить Xray на сервере?</b>\n\nVPN через этот сервер прервётся на несколько секунд. До и после '
             'обновления бот проверит сервер из России; если новая версия не заработает, вернётся прежняя.'),
     'osup': ('📦 <b>Обновить систему на сервере?</b>\n\nПакеты Ubuntu/Debian обновятся в фоне (обычно 2–10 минут), '
@@ -5324,7 +5370,8 @@ def handle_vs(uid, data, chat, mid):
         return VS_CONFIRM[act], [[btn('✅ Да', f'vs:{act}!:{vid}'), btn('✖️ Отмена', f'vs:v:{vid}')]]
     if act.endswith('!'):
         act = act[:-1]
-    if act in ('chk', 'rot', 'sni', 'upd', 'ins', 'del', 'att', 'goo', 'paoff', 'paon', 'off', 'osup', 'rb'):
+    if act in ('chk', 'rot', 'sni', 'upd', 'ins', 'del', 'att', 'goo', 'paoff', 'paon', 'off', 'osup', 'rb',
+               'snok', 'snnext', 'snno'):
         return vs_action(uid, vid, act, chat, mid)
     return scr_vs_one(uid, vid)
 
@@ -8642,10 +8689,14 @@ def vs_xray_update(vid, tag=None, say=None):
             try:
                 rb = vs_call(vs, 'xray-rollback', timeout=300)
                 with lock:
-                    x['vless'] = dict(x.get('vless') or {}, ver=rb.get('VER') or old)
+                    x['vless'] = dict(x.get('vless') or {}, ver=rb.get('VER') or new)
                     save_state()
+                if not rb.get('VER') or rb['VER'] == new:
+                    return False, f'Xray {new} не работает из России, а вернуть прежнюю версию не удалось'
+                chk2 = vless_check(link, geo=False)
                 return False, (f'Xray {new} не работает из России ({chk.get("err") or "нет ответа"}) — '
-                               f'возвращена версия {rb.get("VER") or old}')
+                               f'возвращена версия {rb["VER"]}' + ('' if chk2.get('ok') else
+                                                                  ', но и с ней сервер из России не отвечает'))
             except VsError as e:
                 return False, f'Xray {new} не работает из России, а откатить не удалось: {e}'
     return True, f'Xray {old} → {new}'
@@ -8727,6 +8778,120 @@ def vs_os_upgrade(vid, say=None):
     if job.startswith('running'):
         return False, 'обновление идёт дольше 30 минут — проверьте позже кнопкой «🔄 Проверить»'
     return False, f'обновление завершилось с ошибкой ({job or "нет ответа"}): {st.get("TAIL", "")[-200:]}'
+
+
+# --- подбор маскировки: соседи по сети, проверка из России, применение после подтверждения ---
+SNI_TRY_MAX = 6                   # сколько масок пробовать за один заход
+SNI_TTL = 600                     # через столько секунд сервер сам вернёт прежнюю маску
+
+
+def sni_kind(c):
+    if c['kind'] == 'n':
+        return '🏠 сосед по сети' if c['same'] else '🏘 сосед по сети (по IP)'
+    return '🌐 из запасного списка'
+
+
+def vs_sni_screen(vid):
+    x = vps_all()[vid]
+    pd = x['snip']
+    c = pd['cur']
+    left = max(int(SNI_TTL - (time.time() - pd['ts'])), 0)
+    text = (f'🎭 <b>Нашлась рабочая маскировка</b>\n\n<b>{h(c["dom"])}</b> — {sni_kind(c)}'
+            + (f', адрес {h(c["dest"])}' if c['dest'] != c['dom'] else '')
+            + f'\nОт сервера до сайта {c["ms"]} мс; через сервер из России ответ за {c.get("ms_ru") or "?"} мс.'
+            + f'\nПрежняя маска: {h(pd.get("orig") or "?")}.\n\nНовая маска уже стоит на сервере на пробу. '
+            f'Применить её и обновить ссылку в шлюзе? Без ответа примерно через {max(left // 60, 1)} мин '
+            'сервер сам вернёт прежнюю.')
+    kb = [[btn('✅ Применить', f'vs:snok:{vid}')]]
+    if pd.get('cands'):
+        kb.append([btn(f'➡️ Попробовать другую (ещё {len(pd["cands"])})', f'vs:snnext:{vid}')])
+    kb.append([btn('✖️ Вернуть прежнюю', f'vs:snno:{vid}')])
+    return text, kb
+
+
+def vs_sni_search(uid, vid, chat, mid, resume=False):
+    x = vps_all()[vid]
+    vs = vs_conn(x)
+
+    def say(t):
+        edit(chat, mid, f'🎭 <b>Подбор маскировки</b>\n\n{t}')
+    pd = x.get('snip') or {}
+    if resume and 'cands' in pd:
+        cands, tried, orig = list(pd['cands']), pd.get('tried', 0), pd.get('orig')
+    else:
+        say('Ищу сайты-соседи в сети сервера и проверяю запасной список (до минуты)…')
+        data = vs_call(vs, 'sni-scan', timeout=300)
+        orig = data.get('SNI') or (x.get('vless') or {}).get('sni')
+        cands, tried = [], 0
+        for line in data.get('CAND', []):
+            f = line.split()
+            if len(f) >= 5 and f[0] != orig:
+                cands.append({'dom': f[0], 'dest': f[1], 'ms': int(f[2]) if f[2].isdigit() else 0,
+                              'same': f[3] == '1', 'kind': f[4]})
+        with lock:
+            x['p443'] = data.get('P443') or ''
+            save_state()
+    limit = tried + SNI_TRY_MAX
+    while cands and tried < limit:
+        c = cands.pop(0)
+        tried += 1
+        say(f'Пробую {tried}-ю: <b>{h(c["dom"])}</b> — {sni_kind(c)}, {c["ms"]} мс от сервера.\n'
+            'Проверяю из России… VPN через этот сервер сейчас может прерываться.')
+        try:
+            d = vs_call(vs, 'sni-try', {'DOMAIN': c['dom'], 'DEST': c['dest']}, timeout=180)
+        except VsError as e:
+            log('маска', c['dom'], e)
+            continue
+        link = d.get('LINK', '')
+        chk = vless_check(link, geo=False) if link else {'ok': False}
+        if chk.get('ok'):
+            with lock:
+                x['snip'] = {'cands': cands, 'tried': tried, 'orig': orig, 'ts': time.time(),
+                             'cur': dict(c, link=link, ms_ru=chk.get('ms'))}
+                save_state()
+            return vs_sni_screen(vid)
+    try:
+        vs_call(vs, 'sni-revert', timeout=120)
+    except VsError as e:
+        log('маска: откат', e)
+    with lock:
+        x.pop('snip', None)
+        save_state()
+    if not tried:
+        note = ('⚠️ Подходящих сайтов для маскировки не нашлось (нужны TLS 1.3, HTTP/2 и настоящий сертификат). '
+                f'Оставлена прежняя: {h(orig or "?")}.')
+    else:
+        note = (f'⚠️ Проверено масок: {tried} — ни одна не прошла проверку из России. Оставлена прежняя '
+                f'({h(orig or "?")}).\n\nПохоже, дело не в маске: из России режут IP сервера или порт '
+                f'{(x.get("vless") or {}).get("port") or "?"}. Попробуйте другой порт (лучше 443) или другой IP у хостинга.')
+        if cands:
+            note += f'\nНепроверенных вариантов осталось: {len(cands)} — «🎭 Другая маскировка» начнёт заново.'
+    if x.get('p443') and (x.get('vless') or {}).get('port') != 443:
+        note += f'\nℹ️ Порт 443 на сервере занят программой {h(x["p443"])}.'
+    return scr_vs_one(uid, vid, note)
+
+
+def vs_sni_apply(uid, vid):
+    x = vps_all()[vid]
+    pd = x.get('snip')
+    if not pd:
+        return scr_vs_one(uid, vid, '⚠️ Нет маски на пробе — запустите подбор заново.')
+    if time.time() - pd['ts'] > SNI_TTL - 15:
+        with lock:
+            x.pop('snip', None)
+            save_state()
+        return scr_vs_one(uid, vid, '⌛ Время пробы вышло — сервер вернул прежнюю маску. Запустите подбор заново.')
+    c = pd['cur']
+    vs_call(vs_conn(x), 'sni-confirm', timeout=60)
+    vs_attach(vid, c['link'])
+    with lock:
+        x['vless'] = dict(x.get('vless') or {}, sni=c['dom'], ts=time.time())
+        x.pop('snip', None)
+        x['last'] = dict(x.get('last') or {}, ok=True, ms=c.get('ms_ru'), ts=time.time(), stale=False)
+        save_state()
+    add_event(f'{admin_name(uid)}: {x["host"]} — маскировка {pd.get("orig")} → {c["dom"]}')
+    return scr_vs_one(uid, vid, f'✅ Маскировка: <b>{h(c["dom"])}</b> ({sni_kind(c)}). Ссылка в шлюзе обновлена — '
+                                'VPN мог прерваться на 5–10 секунд.')
 
 
 def vs_update_all(uid, chat, mid):

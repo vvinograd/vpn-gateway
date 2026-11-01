@@ -11,6 +11,7 @@
 #     sudo bash install-vless.sh status      состояние
 #     sudo bash install-vless.sh os-upgrade  обновить Ubuntu/Debian в фоне (ход: os-job)
 #     sudo bash install-vless.sh reboot      перезагрузить сервер через 5 секунд
+#     sudo bash install-vless.sh sni-scan    найти сайты для маскировки: соседи по сети и запасной список
 #     sudo bash install-vless.sh uninstall   удалить VLESS с сервера
 #  Настройки через переменные: PORT=8443 SNI=www.nvidia.com NAME=latvia sudo -E bash install-vless.sh
 #
@@ -25,7 +26,13 @@ XRAY_INSTALLER=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 # сайты для маскировки: поддерживают TLS 1.3 и HTTP/2 и проходят рукопожатие Reality
 # (www.microsoft.com не подходит — Reality с ним не устанавливает соединение)
 SNI_LIST="www.samsung.com www.nvidia.com www.amd.com dl.google.com addons.mozilla.org www.apple.com"
+# запасной список: сайты средней известности (соседи по сети предпочтительнее — см. sni_scan)
+SNI_MORE="www.ikea.com www.philips.com www.siemens.com www.bosch.com www.dw.com www.zalando.de www.bol.com
+www.lidl.de www.otto.de www.ing.nl www.airbaltic.com www.delfi.lv www.lsm.lv www.rimi.lv www.err.ee www.delfi.lt
+www.yle.fi www.finnair.com www.nrk.no www.dr.dk www.svt.se www.postnord.se www.orange.fr www.rtve.es
+www.corriere.it www.heise.de www.tagesschau.de www.booking.com www.skyscanner.net www.ricardo.ch"
 PORT_LIST="443 8443 2053 2083 2087 2096 9443"
+SNI_REVERT=vpngw-sni-revert
 PASS_CONF=/etc/ssh/sshd_config.d/00-vpngw.conf
 MPTCP_CONF=/etc/sysctl.d/99-vpngw-mptcp.conf
 JOB_DIR=/var/lib/vpngw-vless
@@ -66,10 +73,11 @@ load_conf() {
     [ -f "$CONF" ] || die "VLESS не установлен (нет $CONF)"
     PORT=$(conf_port); SNI=$(conf_str serverNames); UUID=$(conf_str id)
     PRIV=$(conf_str privateKey); SID=$(conf_str shortIds); PUB=$(pub_of "$PRIV")
+    DEST=$(grep -oP '"dest": *"\K[^"]+' "$CONF" 2>/dev/null | head -1); DEST=${DEST%:443}
     [ -n "$PORT" ] && [ -n "$SNI" ] && [ -n "$UUID" ] && [ -n "$PUB" ] || die "не смог прочитать настройки из $CONF"
 }
 
-write_conf() {   # порт маска
+write_conf() {   # порт маска [dest — по умолчанию сам домен маски]
     mkdir -p "$(dirname "$CONF")"
     cat >"$CONF" <<EOF
 {
@@ -83,7 +91,7 @@ write_conf() {   # порт маска
       "network": "tcp",
       "security": "reality",
       "realitySettings": {
-        "dest": "$2:443",
+        "dest": "${3:-$2}:443",
         "serverNames": ["$2"],
         "privateKey": "$PRIV",
         "shortIds": ["$SID"]
@@ -142,12 +150,17 @@ fetch_installer() {
     return 1
 }
 
-save_info() {
-    local ip name
-    ip=${ADDR:-}
+pub_ip() {
+    local ip=${ADDR:-}
     if [ -z "$ip" ] && [ -f "$INFO" ]; then ip=$(grep -oP '^LINK=.*@\K[^:]+' "$INFO" | tr -d "'\\\\"); fi
     [ -n "$ip" ] || ip=$(curl -4 -s -m 10 https://ifconfig.me/ip || curl -4 -s -m 10 https://api.ipify.org)
     [ -n "$ip" ] || ip=$(hostname -I | awk '{print $1}')
+    echo "$ip"
+}
+
+save_info() {
+    local ip name
+    ip=$(pub_ip)
     name=${NAME:-}
     if [ -z "$name" ] && [ -f "$INFO" ]; then name=$(grep -oP '^LINK=.*#\K.*' "$INFO" | tr -d "'\\\\"); fi
     name=$(printf '%s' "${name:-$(hostname)}" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-40)
@@ -192,10 +205,15 @@ harden() {
     return 0
 }
 
+# защита на месте: MPTCP выключен (автообновления — отдельно, строка UU)
 hard_ok() {
-    { [ ! -e /proc/sys/net/mptcp/enabled ] || [ "$(cat /proc/sys/net/mptcp/enabled)" = 0 ]; } || return 1
-    command -v apt-get >/dev/null || return 0
-    apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'
+    [ ! -e /proc/sys/net/mptcp/enabled ] || [ "$(cat /proc/sys/net/mptcp/enabled)" = 0 ]
+}
+
+# вернуть сохранённый бинарник Xray. Не через cp поверх: запущенный файл так не перезаписать
+# («Text file busy»), поэтому копия рядом и атомарная замена
+put_prev() {   # путь к xray
+    cp -a "$1.prev" "$1.new" && mv -f "$1.new" "$1"
 }
 
 # обновления системы и перезагрузка: строки @@ для бота
@@ -253,6 +271,112 @@ do_os_job() {
 do_reboot() {
     run systemd-run --quiet --collect --unit "vpngw-reboot-$(date +%s)" --on-active=5 /bin/systemctl reboot \
         || die "не удалось запланировать перезагрузку"
+    out "OK"
+}
+
+# ---- подбор маскировки ----
+# Сосед по сети: на 443 TLS 1.3 + HTTP/2 + X25519 и настоящий сертификат на домен. SNI такого домена рядом с IP
+# сервера выглядит правдоподобно (тот же дата-центр), в отличие от «www.nvidia.com» на маленьком хостинге.
+# Строка вывода: домен dest задержка_мс тот_же_адресный_блок(1/0) вид(n — сосед, l — из списка)
+probe_ip() {
+    local ip=$1 out dom r v code t same=0 dest
+    out=$(timeout 4 openssl s_client -connect "$ip:443" -tls1_3 -alpn h2 -groups X25519 </dev/null 2>/dev/null) || return 0
+    grep -q 'ALPN protocol: h2' <<<"$out" || return 0
+    dom=$(openssl x509 -noout -subject -ext subjectAltName 2>/dev/null <<<"$out" \
+        | grep -oE '(CN ?= ?|DNS:)[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sed -E 's/^(CN ?= ?|DNS:)//' | grep -v '^\*' | head -1)
+    [ -n "$dom" ] || return 0
+    # с правильным SNI сертификат должен быть настоящим, а ответ — по HTTP/2
+    r=$(curl -s -o /dev/null --max-time 6 --tlsv1.3 --http2 --resolve "$dom:443:$ip" \
+        -w '%{http_version} %{http_code} %{time_appconnect}' "https://$dom/") || return 0
+    read -r v code t <<<"$r"
+    [ "$v" = 2 ] && [ "$code" != 000 ] || return 0
+    if getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1}' | grep -q "^$NET\."; then same=1; dest=$dom; else dest=$ip; fi
+    echo "$dom $dest $(awk -v t="$t" 'BEGIN{printf "%d", t*1000}') $same n"
+}
+
+probe_name() {
+    local dom=$1 r v code t
+    r=$(curl -s -o /dev/null --max-time 6 --tlsv1.3 --http2 -w '%{http_version} %{http_code} %{time_appconnect}' \
+        "https://$dom/") || return 0
+    read -r v code t <<<"$r"
+    [ "$v" = 2 ] && [ "$code" != 000 ] || return 0
+    timeout 6 openssl s_client -connect "$dom:443" -servername "$dom" -tls1_3 -groups X25519 -alpn h2 </dev/null 2>/dev/null \
+        | grep -q 'ALPN protocol: h2' || return 0
+    echo "$dom $dom $(awk -v t="$t" 'BEGIN{printf "%d", t*1000}') 0 l"
+}
+
+sni_scan() {   # → строки кандидатов, лучшие первыми
+    local ip
+    ip=$(pub_ip)
+    export -f probe_ip probe_name
+    {
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            export NET="${ip%.*}"
+            seq 1 254 | grep -vx "${ip##*.}" | sed "s/^/$NET./" | xargs -P 48 -I{} bash -c 'probe_ip {}' 2>/dev/null
+        fi
+        # shellcheck disable=SC2086
+        printf '%s\n' $SNI_MORE $SNI_LIST | xargs -P 16 -I{} bash -c 'probe_name {}' 2>/dev/null
+    } | awk '!seen[$1]++ { r = ($5 == "n") ? ($4 == 1 ? 0 : 1) : 2; print r, $0 }' | sort -k1,1n -k4,4n | cut -d' ' -f2-
+}
+
+do_sni_scan() {
+    local c n=0 who
+    say "Ищу сайты для маскировки: соседи по сети и запасной список (до минуты)…"
+    while read -r c; do
+        [ -n "$c" ] || continue
+        out "CAND $c"; n=$((n + 1))
+        [ "$n" -ge 15 ] && break
+    done < <(sni_scan)
+    who=$(ss -Hltnp 'sport = :443' 2>/dev/null | grep -oP 'users:\(\("\K[^"]+' | head -1)
+    [ -n "$who" ] && out "P443 $who"
+    [ -f "$CONF" ] && { load_conf; out "SNI $SNI"; out "PORT $PORT"; }
+    out "OK"
+}
+
+# Проба маски: ключи прежние, меняются только маска и dest. Если бот не подтвердит за 10 минут,
+# вернётся исходная маска (на случай, если проба оборвала связь).
+sni_restore() {
+    [ -f "$CONF.sni-orig" ] || return 0
+    cp -a "$CONF.sni-orig" "$CONF"
+    [ -f "$INFO.sni-orig" ] && cp -a "$INFO.sni-orig" "$INFO"
+    systemctl restart xray >/dev/null 2>&1
+    mv -f "$CONF.sni-orig" "$CONF.sni-old"; [ -f "$INFO.sni-orig" ] && mv -f "$INFO.sni-orig" "$INFO.sni-old"
+    return 0
+}
+
+do_sni_try() {
+    [ -n "${DOMAIN:-}" ] || die "не задан DOMAIN"
+    local want_dest=${DEST:-$DOMAIN}     # load_conf перепишет DEST текущим значением из конфига
+    load_conf
+    if ! systemctl is-active --quiet "$SNI_REVERT.timer"; then     # первая проба — запоминаем исходное
+        cp -a "$CONF" "$CONF.sni-orig"; cp -a "$INFO" "$INFO.sni-orig"
+    fi
+    systemctl stop "$SNI_REVERT.timer" >/dev/null 2>&1
+    write_conf "$PORT" "$DOMAIN" "$want_dest" || { sni_restore; die "Xray отклонил конфиг с маской $DOMAIN"; }
+    if ! { restart_xray "$PORT" && selftest "$PORT" "$DOMAIN"; }; then
+        sni_restore; die "маска $DOMAIN не прошла самопроверку на сервере"
+    fi
+    SNI=$DOMAIN
+    save_info
+    systemctl reset-failed "$SNI_REVERT.timer" "$SNI_REVERT.service" >/dev/null 2>&1
+    run systemd-run --quiet --collect --unit "$SNI_REVERT" --on-active=600 /bin/bash "$(readlink -f "$0")" sni-revert \
+        || { sni_restore; die "не удалось включить страховочный откат"; }
+    out "SNI $SNI"
+    out "OK"
+    show_link
+}
+
+do_sni_confirm() {
+    systemctl stop "$SNI_REVERT.timer" >/dev/null 2>&1
+    [ -f "$CONF.sni-orig" ] && mv -f "$CONF.sni-orig" "$CONF.sni-old"
+    [ -f "$INFO.sni-orig" ] && mv -f "$INFO.sni-orig" "$INFO.sni-old"
+    out "OK"
+}
+
+do_sni_revert() {
+    systemctl stop "$SNI_REVERT.timer" >/dev/null 2>&1
+    sni_restore
+    [ -f "$CONF" ] && { load_conf; out "SNI $SNI"; }
     out "OK"
 }
 
@@ -314,7 +438,12 @@ do_install() {
     say "4/5 Генерирую ключи и подбираю маскировку…"
     new_keys
     local s good=""
-    for s in ${SNI:-$SNI_LIST}; do
+    local list=${SNI:-}
+    if [ -z "$list" ]; then
+        echo "  ищу сайты-соседи по сети для маскировки…"
+        list="$(sni_scan | awk '$4 == 1 && $5 == "n" {print $1}' | head -3 | tr '\n' ' ')$SNI_LIST"
+    fi
+    for s in $list; do
         if ! curl -s -m 8 -o /dev/null --tlsv1.3 "https://$s"; then
             echo "  $s — сайт недоступен по TLS 1.3, пропускаю"; out "SNI_SKIP $s"; continue
         fi
@@ -324,7 +453,7 @@ do_install() {
     done
     if [ -z "$good" ]; then
         if [ -n "$bak" ]; then cp -a "$bak" "$CONF"; systemctl restart xray >/dev/null 2>&1; fi
-        die "ни один сайт для маскировки не прошёл самопроверку (${SNI:-$SNI_LIST}). Подробности в журнале"
+        die "ни один сайт для маскировки не прошёл самопроверку ($list). Подробности в журнале"
     fi
     SNI=$good
     echo "Маскировка: $SNI, самопроверка пройдена."
@@ -347,7 +476,7 @@ do_rotate() {
     say "Генерирую новые ключи…"
     cp -a "$CONF" "$CONF.bak-rotate"
     new_keys
-    write_conf "$PORT" "$SNI" || { cp -a "$CONF.bak-rotate" "$CONF"; die "Xray отклонил конфиг"; }
+    write_conf "$PORT" "$SNI" "$DEST" || { cp -a "$CONF.bak-rotate" "$CONF"; die "Xray отклонил конфиг"; }
     if ! { restart_xray "$PORT" && selftest "$PORT" "$SNI"; }; then
         cp -a "$CONF.bak-rotate" "$CONF"; systemctl restart xray >/dev/null 2>&1
         die "новые ключи не прошли самопроверку, оставлены старые"
@@ -365,8 +494,13 @@ do_update() {
     local old new x
     x=$(xray_bin)
     old=$(xver)
+    if [ -n "${XRAY_VERSION:-}" ] && [ "v${old#v}" = "v${XRAY_VERSION#v}" ]; then
+        out "VER $old"; out "OLDVER $old"; say "Уже стоит Xray $old"; out "OK"; return
+    fi
     say "Обновляю Xray (сейчас $old)…"
-    cp -a "$x" "$x.prev" 2>/dev/null
+    # копия до установки; прежней версией (.prev) она станет, только если версия действительно сменилась —
+    # иначе повторное обновление затёрло бы сохранённую старую версию новой
+    cp -a "$x" "$x.before" 2>/dev/null
     fetch_installer || die "не удалось скачать установщик Xray с GitHub"
     if [ -n "${XRAY_VERSION:-}" ]; then
         run bash /tmp/xray-install.sh install --version "$XRAY_VERSION" || die "не удалось установить Xray $XRAY_VERSION"
@@ -375,10 +509,12 @@ do_update() {
     fi
     harden
     new=$(xver)
+    if [ "$new" != "$old" ] && [ -f "$x.before" ]; then mv -f "$x.before" "$x.prev"; fi
     if ! { restart_xray "$PORT" && selftest "$PORT" "$SNI"; }; then
         if [ -f "$x.prev" ]; then
-            cp -a "$x.prev" "$x"; restart_xray "$PORT"
-            die "Xray $new не прошёл самопроверку — возвращена прежняя версия $old"
+            put_prev "$x" || die "Xray $new не прошёл самопроверку, а вернуть прежнюю версию не удалось"
+            restart_xray "$PORT"
+            die "Xray $new не прошёл самопроверку — возвращена прежняя версия $(xver)"
         fi
         die "после обновления Xray самопроверка не прошла"
     fi
@@ -395,7 +531,8 @@ do_xray_rollback() {
     x=$(xray_bin)
     [ -f "$x.prev" ] || die "нет сохранённой прежней версии Xray"
     cur=$(xver)
-    cp -a "$x.prev" "$x"
+    put_prev "$x" || die "не удалось заменить файл Xray"
+    [ "$(xver)" != "$cur" ] || die "сохранённая версия совпадает с текущей ($cur) — возвращать нечего"
     restart_xray "$PORT" && selftest "$PORT" "$SNI" || die "прежняя версия Xray тоже не прошла самопроверку"
     out "VER $(xver)"
     out "OLDVER $cur"
@@ -485,5 +622,9 @@ case "$MODE" in
     os-upgrade) do_os_upgrade ;;
     os-job)  do_os_job ;;
     reboot)  do_reboot ;;
+    sni-scan) do_sni_scan ;;
+    sni-try) do_sni_try ;;
+    sni-confirm) do_sni_confirm ;;
+    sni-revert) do_sni_revert ;;
     *) echo "Команды: install | show | rotate | update | status | uninstall | os-upgrade | os-job | reboot"; exit 1 ;;
 esac
