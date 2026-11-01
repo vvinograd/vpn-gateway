@@ -1188,6 +1188,9 @@ self_update() {
     cp -a /usr/local/lib/vpngw/vpngw.py "$B/vpngw.py" 2>/dev/null
     cp -a /usr/local/lib/vpngw/install.sh "$B/install.sh" 2>/dev/null
     cp -a "$CONF_DIR/version" "$B/version" 2>/dev/null
+    # для страховки: если новая версия будет работать хуже, бот вернёт и конфиг mihomo с подписками
+    cp -a /etc/mihomo/config.yaml "$B/mihomo-config.yaml" 2>/dev/null
+    [ -d /etc/mihomo/providers ] && tar -C /etc/mihomo -czf "$B/providers.tgz" providers 2>/dev/null
     install -m 700 -o root -g root "$TMP/vpnbot.py" /usr/local/bin/vpnbot.py
     install_tools
     ensure_killswitch
@@ -1214,6 +1217,30 @@ self_update() {
     echo "fail версия $GW_VERSION не запустилась за минуту: $(journalctl -u vpnbot -n 3 --no-pager 2>/dev/null | tail -1 | cut -c1-200)" >"$UPD_RESULT"
     systemctl restart vpnbot
     return 1
+}
+
+# Откат на версию до последнего обновления (запускает бот, если новая версия работает хуже прежней).
+rollback() {
+    local B=/var/lib/vpngw/backup why=${1:-ручной откат}
+    touch "$LOG"
+    [ -f "$B/vpnbot.py" ] || { log "откат: нет сохранённой версии"; return 1; }
+    log "===== откат обновления: $why"
+    python3 -m py_compile "$B/vpnbot.py" || { log "откат: сохранённая версия повреждена"; return 1; }
+    install -m 700 -o root -g root "$B/vpnbot.py" /usr/local/bin/vpnbot.py
+    [ -f "$B/vpngw.py" ] && install -m 755 "$B/vpngw.py" /usr/local/lib/vpngw/vpngw.py
+    [ -f "$B/version" ] && cp "$B/version" "$CONF_DIR/version"
+    if [ -f "$B/mihomo-config.yaml" ]; then
+        cp -a "$B/mihomo-config.yaml" /etc/mihomo/config.yaml
+        [ -f "$B/providers.tgz" ] && tar -C /etc/mihomo -xzf "$B/providers.tgz"
+        systemctl restart mihomo
+    fi
+    echo "fail $why" >"$UPD_RESULT"
+    # этот же файл сейчас выполняется — заменяем через переименование, чтобы bash дочитал старый
+    if [ -f "$B/install.sh" ]; then
+        install -m 700 "$B/install.sh" /usr/local/lib/vpngw/install.sh.new && mv -f /usr/local/lib/vpngw/install.sh.new /usr/local/lib/vpngw/install.sh
+    fi
+    systemctl restart vpnbot
+    log "откат выполнен"
 }
 
 check_updates_interactive() {
@@ -1243,6 +1270,10 @@ check_updates_interactive() {
 if [ "${1:-}" = "--self-update" ]; then
     [ "$(id -u)" -eq 0 ] || { echo "нужен root"; exit 1; }
     self_update; exit $?
+fi
+if [ "${1:-}" = "--rollback" ]; then
+    [ "$(id -u)" -eq 0 ] || { echo "нужен root"; exit 1; }
+    rollback "${2:-}"; exit $?
 fi
 preflight
 if [ -f "$CONF_DIR/installed" ]; then

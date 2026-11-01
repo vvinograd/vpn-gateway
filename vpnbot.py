@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.4'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.5'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -1906,6 +1906,15 @@ def scr_diag(uid, note=''):
     n = len([t for t in tunq['restarts'] if time.time() - t < 86400])
     lines.append(f'Зависаний mihomo за сутки: {n}' + (f', последнее {fmt_ago(tunq["last_restart"])}' if n else ''))
     lines.append(f'Автопереход на gvisor при частых зависаниях: {"✅" if v.get("tun_auto", True) else "⛔"}')
+    g = state.get('upd_guard')
+    if g and g.get('to') == BOT_VERSION:
+        lines.append(f'🛡 Страховка обновления {h(g.get("from") or "?")} → {h(BOT_VERSION)}: ещё '
+                     f'{max(int((GUARD_WINDOW - (time.time() - g["ts"])) // 60), 0)} мин, при ухудшении — откат')
+    for ver, rb in (state.get('upd_bad') or {}).items():
+        if time.time() - rb.get('ts', 0) < 7 * 86400:
+            lines.append(f'↩️ Версия {h(ver)} откатана {fmt_ago(rb.get("ts"))}: {h(rb.get("why", ""))}')
+    if mptcp_on():
+        lines.append('⚠️ MPTCP включён (CVE-2026-98432) — выключится при перезапуске бота')
     if zt_status_line():
         lines += ['', zt_status_line()]
     if note:
@@ -3940,8 +3949,10 @@ def os_tick():
     if not (need and c.get('auto') and in_window(os_slot())):
         return
     if c.get('auto_day') == time.strftime('%Y-%m-%d') or uptime_s() < 3600 or c.get('job') \
-            or state.get('upd_pending') or vps_rt.get('night') or zt_rt.get('worker'):
+            or state.get('upd_pending') or state.get('upd_guard') or vps_rt.get('night') or zt_rt.get('worker'):
         return
+    if run(['pgrep', '-x', 'dpkg|apt-get|apt|unattended-upgr'], 10).returncode == 0:
+        return                            # идёт установка пакетов — перезагрузка сломала бы её, попробуем позже
     os_reboot('night')
 
 
@@ -4115,7 +4126,9 @@ def vless_to_proxy(link):
         if qs.get('fp'):
             p['client-fingerprint'] = qs['fp']
     if sec == 'reality':
-        p['reality-opts'] = {'public-key': qs.get('pbk', ''), 'short-id': qs.get('sid', '')}
+        # Xray ≥ 26.9.8 пускает только клиентов, которые предлагают ключ X25519MLKEM768 (mihomo ≥ 1.19.9 умеет)
+        p['reality-opts'] = {'public-key': qs.get('pbk', ''), 'short-id': qs.get('sid', ''),
+                             'support-x25519mlkem768': True}
         p.setdefault('client-fingerprint', 'chrome')
     if qs.get('flow'):
         p['flow'] = qs['flow']
@@ -4126,6 +4139,52 @@ def vless_to_proxy(link):
     if p['network'] == 'grpc':
         p['grpc-opts'] = {'grpc-service-name': qs.get('serviceName', '')}
     return p
+
+
+def mlkem_migrate():
+    """Подписки из ссылок vless://, сохранённые до 2.4.1: добавить support-x25519mlkem768, без перезапуска mihomo."""
+    for sb in list(subs()):
+        if sb.get('type') != 'file':
+            continue
+        path = os.path.join(PROV_DIR, f'{sb["id"]}.yaml')
+        try:
+            lines = open(path, encoding='utf-8').read().splitlines()
+        except OSError:
+            continue
+        out, changed = [], False
+        for line in lines:
+            m = re.match(r'^(\s*-\s*)(\{.*\})\s*$', line)
+            if m:
+                try:
+                    pr = json.loads(m.group(2))
+                except ValueError:
+                    pr = None
+                ro = (pr or {}).get('reality-opts')
+                if isinstance(ro, dict) and not ro.get('support-x25519mlkem768'):
+                    ro['support-x25519mlkem768'] = True
+                    line = m.group(1) + json.dumps(pr, ensure_ascii=False)
+                    changed = True
+            out.append(line)
+        if not changed:
+            continue
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
+            f.write('\n'.join(out) + '\n')
+        os.chmod(path + '.tmp', 0o600)
+        os.replace(path + '.tmp', path)
+        log('подписка', sb['name'], ': добавлен support-x25519mlkem768')
+        threading.Thread(target=provider_reload, args=(sb['id'],), daemon=True).start()
+
+
+def provider_reload(pid, tries=10):
+    """Перечитать файл подписки в mihomo; при запуске шлюза mihomo может ещё не отвечать — повторяем."""
+    for _ in range(tries):
+        try:
+            api(f'/providers/proxies/{pid}', 'PUT', timeout=40)
+            return True
+        except Exception:
+            time.sleep(15)
+    log('подписка', pid, ': mihomo не перечитал файл, перечитает при следующем запуске')
+    return False
 
 
 def sub_names(text):
@@ -8731,6 +8790,9 @@ def vs_xray_update(vid, tag=None, say=None):
         say('Проверяю сервер из России после обновления…')
         chk = vless_check(link, geo=False)
         if not chk.get('ok'):
+            time.sleep(10)                # разовый сбой сети не повод записывать версию в неудачные
+            chk = vless_check(link, geo=False)
+        if not chk.get('ok'):
             xray_mark_bad(new, f'{x["host"]}: {chk.get("err") or "нет ответа из России"}')
             try:
                 rb = vs_call(vs, 'xray-rollback', timeout=300)
@@ -9116,6 +9178,8 @@ def vs_night():
                 continue
             with lock:
                 x['sysi'] = vs_parse_os(st)
+                if st.get('VER') and x.get('vless'):
+                    x['vless']['ver'] = st['VER']      # версию могли поменять вручную на сервере
                 save_state()
             if st.get('HARD') == 'no':
                 try:
@@ -9311,8 +9375,13 @@ def start_self_update(chat):
     r = run(['bash', '-n', path], 20)
     if r.returncode != 0:
         raise RuntimeError('скачанный install.sh с ошибкой: ' + r.stderr[-200:])
+    try:
+        base = health_snapshot()
+    except Exception:
+        base = None
     with lock:
         state['upd_pending'] = {'to': u.get('latest'), 'chat': chat, 'from': BOT_VERSION}
+        state['upd_guard'] = {'from': BOT_VERSION, 'to': u.get('latest'), 'ts': time.time() + 60, 'base': base}
         save_state()
     unit = f'vpngw-update-{int(time.time())}'
     r = run(['systemd-run', f'--unit={unit}', '--collect', '/bin/bash', path, '--self-update'], 30)
@@ -9356,12 +9425,133 @@ def report_update_result():
 upd_retry = [0]
 
 
+# --- страховка обновления: новая версия должна работать не хуже прежней, иначе откат ---
+GUARD_WINDOW = 15 * 60            # сколько минут после обновления следить
+GUARD_EVERY = 30
+GUARD_BAD = 5                     # столько проверок подряд хуже, чем до обновления (~2,5 мин) → откат
+INSTALLER = '/usr/local/lib/vpngw/install.sh'
+
+
+def health_snapshot():
+    """Основные признаки жизни шлюза: mihomo отвечает, VPN проходит, интернет напрямую есть, WireGuard поднят."""
+    snap = {}
+    try:
+        snap['api'] = bool(api('/version', timeout=5))
+    except Exception:
+        snap['api'] = False
+    snap['vpn'] = False
+    if snap['api']:
+        for _ in range(2):
+            try:
+                d = (api(f'/proxies/{q(SELECT_GROUP)}/delay?url={q(TEST_URL)}&timeout=6000', timeout=10) or {}).get('delay')
+                if d:
+                    snap['vpn'] = True
+                    break
+            except Exception:
+                pass
+    snap['direct'] = False
+    for url in ('https://ya.ru', 'https://www.gosuslugi.ru'):
+        try:
+            with direct_opener.open(urllib.request.Request(url, headers={'User-Agent': CHROME_UA}), timeout=8) as r:
+                snap['direct'] = r.status < 500
+                break
+        except urllib.error.HTTPError as e:
+            snap['direct'] = e.code < 500
+            break
+        except Exception:
+            continue
+    try:
+        snap['wg'] = unit_info(f'wg-quick@{WG_IF}')[0] == 'active'
+    except Exception:
+        snap['wg'] = True
+    return snap
+
+
+def guard_worse(base, now):
+    """Чем текущее состояние хуже снимка до обновления. Пустая строка — не хуже."""
+    base = base or {}
+    if not now['api'] and base.get('api', True):
+        return 'mihomo не отвечает'
+    if base.get('wg', True) and not now['wg']:
+        return 'WireGuard остановлен'
+    # VPN: только если до обновления он работал и интернет напрямую сейчас есть (иначе виноват не бот)
+    if base.get('vpn') and not now['vpn'] and now['direct']:
+        return 'VPN перестал работать'
+    return ''
+
+
+def guard_rollback(g, why):
+    with lock:
+        state.setdefault('upd_bad', {})[g['to']] = {'ts': time.time(), 'why': why}
+        state.pop('upd_guard', None)
+        save_state()
+    add_event(f'Версия {g["to"]}: {why} — откат на {g.get("from")}')
+    log('страховка обновления: откат —', why)
+    if not os.path.exists(INSTALLER):
+        notify('actions', f'⚠️ <b>Версия {h(g["to"])} работает хуже прежней</b> ({h(why)}), а откатиться нечем: '
+                          'нет установщика. Обновите шлюз заново: <code>sudo vpngw-setup</code>.')
+        return
+    run(['systemd-run', f'--unit=vpngw-rollback-{int(time.time())}', '--collect', '/bin/bash', INSTALLER,
+         '--rollback', f'версия {g["to"]}: {why} — возвращена {g.get("from")}'], 30)
+
+
+def upd_guard_loop():
+    g = state.get('upd_guard')
+    if not g:
+        return
+    bad = 0
+    while time.time() - g['ts'] < GUARD_WINDOW:
+        time.sleep(GUARD_EVERY)
+        try:
+            why = guard_worse(g.get('base'), health_snapshot())
+        except Exception:
+            log('страховка обновления:', traceback.format_exc())
+            continue
+        bad = bad + 1 if why else 0
+        if bad >= GUARD_BAD:
+            guard_rollback(g, why)
+            return
+    with lock:
+        state.pop('upd_guard', None)
+        save_state()
+    add_event(f'Версия {BOT_VERSION} работает стабильно {GUARD_WINDOW // 60} мин — страховка снята')
+
+
+def upd_guard_start():
+    """При запуске новой версии: взять страховку из снимка, сделанного прежней версией перед обновлением."""
+    g = state.get('upd_guard')
+    pend = state.get('upd_pending') or {}
+    if not g and pend.get('to') == BOT_VERSION and pend.get('from') and pend['from'] != BOT_VERSION:
+        g = {'from': pend['from'], 'to': BOT_VERSION, 'ts': time.time(), 'base': None}   # прежняя версия снимка не делала
+        with lock:
+            state['upd_guard'] = g
+            save_state()
+    if not g:
+        return
+    if g.get('to') != BOT_VERSION:          # уже откатились или обновились дальше
+        with lock:
+            state.pop('upd_guard', None)
+            save_state()
+        return
+    threading.Thread(target=upd_guard_loop, daemon=True).start()
+
+
+
+
 def scr_upd(uid, note=''):
     u = state.get('upd') or {}
     lines = ['🆕 <b>Обновления</b>', '', f'Установлена версия: <b>{h(BOT_VERSION)}</b>']
     if u.get('latest'):
         lines.append(f'На GitHub: <b>{h(u["latest"])}</b> (проверено {time.strftime("%d.%m %H:%M", time.localtime(u["checked"]))})')
     lines.append(f'Источник: <code>{h(UPDATE_REPO)}</code>, ветка {h(UPDATE_BRANCH)}')
+    bad = (state.get('upd_bad') or {}).get(u.get('latest'))
+    if bad:
+        lines += ['', f'↩️ Версия {h(u["latest"])} уже ставилась и была откатана автоматически: {h(bad.get("why", ""))}. '
+                      'Можно попробовать ещё раз, но лучше дождаться следующей.']
+    g = state.get('upd_guard')
+    if g and g.get('to') == BOT_VERSION:
+        lines += ['', f'🛡 Страховка обновления: ещё {max(int((GUARD_WINDOW - (time.time() - g["ts"])) // 60), 0)} мин '
+                      'слежу, что всё работает не хуже, чем до обновления; если нет — верну прежнюю версию сам.']
     if update_available():
         lines += ['', '<b>Что нового:</b>', h((u.get('changes') or 'описание изменений не найдено')[:1500])]
     elif u.get('latest'):
@@ -9389,7 +9579,8 @@ def handle_upd(uid, data, chat, mid):
         u = state.get('upd') or {}
         return (f'⬇️ <b>Обновить шлюз до {h(u.get("latest", "?"))}?</b>\n\nОбновятся бот и утилита vpngw. '
                 'Настройки, клиенты, админы и статистика сохранятся. Бот перезапустится и примерно через '
-                'минуту пришлёт результат. Если новая версия не запустится, вернётся прежняя.\n\n'
+                'минуту пришлёт результат. Если новая версия не запустится или в первые 15 минут VPN, mihomo или '
+                'WireGuard будут работать хуже, чем до обновления, сама вернётся прежняя.\n\n'
                 'VPN и WireGuard при этом не прерываются.',
                 [[btn('✅ Обновить', 'upd:go'), btn('✖️ Отмена', 'upd')]])
     if act == 'go':
@@ -9539,6 +9730,8 @@ def update_tick():
         return
     if LINK_MODE:
         return
+    if u['latest'] in (state.get('upd_bad') or {}):
+        return                            # эта версия у нас уже откатывалась — ждём следующую
     if (update_available() or gw_outdated(u['latest'])) and u.get('notified') != u['latest']:
         with lock:
             state['upd']['notified'] = u['latest']
@@ -10930,7 +11123,15 @@ def main():
     threading.Thread(target=queue_upgrade, daemon=True).start()
     threading.Thread(target=zt_startup, daemon=True).start()
     threading.Thread(target=maint_loop, daemon=True).start()
+    try:
+        upd_guard_start()
+    except Exception:
+        log('страховка обновления:', traceback.format_exc())
     mptcp_off()
+    try:
+        mlkem_migrate()
+    except Exception:
+        log('mlkem_migrate:', traceback.format_exc())
     c = vpsm()
     if not c.get('minver_fix'):       # «плохие» версии Xray 2.3 — на деле не хватало minClientVer: забываем
         with lock:

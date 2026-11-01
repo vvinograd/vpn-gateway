@@ -285,6 +285,9 @@ do_os_job() {
 }
 
 do_reboot() {
+    if pgrep -x 'dpkg|apt-get|apt|unattended-upgr' >/dev/null 2>&1; then
+        die "сейчас устанавливаются пакеты — перезагрузка их сломает, попробуйте через несколько минут"
+    fi
     run systemd-run --quiet --collect --unit "vpngw-reboot-$(date +%s)" --on-active=5 /bin/systemctl reboot \
         || die "не удалось запланировать перезагрузку"
     out "OK"

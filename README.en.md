@@ -66,7 +66,8 @@ Notifications arrive by themselves: "⚠️ Server X blocks Telegram — switche
 - **self-healing**: switching to a working server without ping-pong, restarting a stalled mihomo,
   manual server choice with an expiry;
 - **scheduled encrypted backups** and migration to a new server from a backup;
-- **one-click updates** with automatic rollback if the new version fails to start; all gateways with one button
+- **one-click updates** with a safety net: if the new version fails to start or works worse than the previous one
+  during the first 15 minutes (mihomo, VPN, WireGuard), the gateway rolls back by itself; all gateways with one button
   from the main one, in turn;
 - **Ubuntu maintenance**: security updates install themselves, the rest with a button, a reboot after updates
   happens at night (03:30–05:00) with a report in the morning; the same for your own VPS, including Xray updates
