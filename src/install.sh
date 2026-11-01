@@ -161,6 +161,7 @@ step_packages() {
     mkdir -p /usr/local/lib/vpngw
     install_tools
     install_bot_files
+    ensure_os
 }
 
 # утилита vpngw и копия установщика (команда vpngw-setup открывает это меню)
@@ -177,6 +178,24 @@ install_tools() {
         printf '#!/bin/sh\nexec bash /usr/local/lib/vpngw/install.sh "$@"\n' >/usr/local/bin/vpngw-setup
         chmod 755 /usr/local/bin/vpngw-setup
     fi
+}
+
+# MPTCP выключен (CVE-2026-98432: через него атакуют ядро), обновления безопасности Ubuntu ставятся сами.
+# Перезагрузку после них бот делает ночью, в 03:30–05:00.
+ensure_os() {
+    if [ -e /proc/sys/net/mptcp/enabled ]; then
+        printf '# vpn-gateway: MPTCP выключен (CVE-2026-98432)\nnet.mptcp.enabled = 0\n' >/etc/sysctl.d/99-vpngw-mptcp.conf
+        sysctl -q -w net.mptcp.enabled=0 >>"$LOG" 2>&1 || true
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    dpkg -s unattended-upgrades >/dev/null 2>&1 \
+        || apt-get -o DPkg::Lock::Timeout=60 install -y -qq unattended-upgrades >>"$LOG" 2>&1 || return 0
+    if ! apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'; then
+        printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
+            >/etc/apt/apt.conf.d/20auto-upgrades
+        log "включены автообновления безопасности"
+    fi
+    return 0
 }
 
 step_network() {
@@ -1131,7 +1150,7 @@ uninstall() {
     rm -rf /etc/systemd/system/vpnbot.service /etc/systemd/system/mihomo.service /etc/systemd/system/mihomo.service.d \
         /etc/systemd/system/wg-quick@wg0.service.d /etc/wireguard/wg0.conf /etc/vpnbot.env /etc/vpnnotify.env \
         /var/lib/vpnbot /usr/local/bin/vpnbot.py /usr/local/bin/vpngw /usr/local/bin/vpngw-setup \
-        /usr/local/lib/vpngw /var/lib/vpngw "$CONF_DIR" /etc/sysctl.d/99-vpngw.conf /run/vpngw
+        /usr/local/lib/vpngw /var/lib/vpngw "$CONF_DIR" /etc/sysctl.d/99-vpngw.conf /etc/sysctl.d/99-vpngw-mptcp.conf /run/vpngw
     id vpngw-link >/dev/null 2>&1 && run userdel -r vpngw-link     # вход главного бота на ведомый шлюз
     run systemctl disable --now vpngw-zapret; rm -f /etc/systemd/system/vpngw-zapret.service   # zapret
     nft delete table inet vpngw_zapret >/dev/null 2>&1; id vpngw-zt >/dev/null 2>&1 && run userdel vpngw-zt
@@ -1172,6 +1191,7 @@ self_update() {
     install -m 700 -o root -g root "$TMP/vpnbot.py" /usr/local/bin/vpnbot.py
     install_tools
     ensure_killswitch
+    ensure_os
     grep -q '^UPDATE_REPO=' /etc/vpnbot.env 2>/dev/null || printf 'UPDATE_REPO=%s\nUPDATE_BRANCH=%s\n' "$REPO" "$BRANCH" >>/etc/vpnbot.env
     if ! systemctl is-enabled --quiet vpnbot 2>/dev/null; then
         echo "$GW_VERSION" >"$CONF_DIR/version"

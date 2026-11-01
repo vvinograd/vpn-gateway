@@ -7,8 +7,10 @@
 #  Повторный запуск покажет ссылку подключения. Другие команды:
 #     sudo bash install-vless.sh show        ссылка и QR-код
 #     sudo bash install-vless.sh rotate      новые ключи (старая ссылка перестанет работать)
-#     sudo bash install-vless.sh update      обновить Xray
+#     sudo bash install-vless.sh update      обновить Xray (при неудаче вернётся прежняя версия)
 #     sudo bash install-vless.sh status      состояние
+#     sudo bash install-vless.sh os-upgrade  обновить Ubuntu/Debian в фоне (ход: os-job)
+#     sudo bash install-vless.sh reboot      перезагрузить сервер через 5 секунд
 #     sudo bash install-vless.sh uninstall   удалить VLESS с сервера
 #  Настройки через переменные: PORT=8443 SNI=www.nvidia.com NAME=latvia sudo -E bash install-vless.sh
 #
@@ -25,6 +27,10 @@ XRAY_INSTALLER=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 SNI_LIST="www.samsung.com www.nvidia.com www.amd.com dl.google.com addons.mozilla.org www.apple.com"
 PORT_LIST="443 8443 2053 2083 2087 2096 9443"
 PASS_CONF=/etc/ssh/sshd_config.d/00-vpngw.conf
+MPTCP_CONF=/etc/sysctl.d/99-vpngw-mptcp.conf
+JOB_DIR=/var/lib/vpngw-vless
+JOB_UNIT=vpngw-osupgrade
+JOB_LOG=/var/log/vpngw-os-upgrade.log
 MODE=${1:-install}
 
 if [ -t 1 ]; then C1=$'\033[1;36m'; C2=$'\033[1;31m'; C0=$'\033[0m'; else C1=; C2=; C0=; fi
@@ -38,6 +44,7 @@ touch "$LOG"; chmod 600 "$LOG"
 echo "===== $(date '+%F %T') $MODE" >>"$LOG"
 
 xray_bin() { command -v xray 2>/dev/null || echo /usr/local/bin/xray; }
+xver()     { "$(xray_bin)" version 2>/dev/null | awk 'NR==1{print $2}'; }
 busy()     { ss -Htln "sport = :$1" 2>/dev/null | grep -q .; }
 conf_str() { grep -oP "\"$1\": *\\[?\"\\K[^\"]+" "$CONF" 2>/dev/null | head -1; }
 conf_port(){ grep -oP '"port": *\K[0-9]+' "$CONF" 2>/dev/null | head -1; }
@@ -165,6 +172,90 @@ open_firewall() {
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then run ufw allow "$1/tcp"; fi
 }
 
+# MPTCP не нужен, а через него атакуют ядро (CVE-2026-98432: Go 1.24+ открывает порты с MPTCP);
+# обновления безопасности ставятся сами (перезагрузку делает бот шлюза ночью)
+harden() {
+    if [ -e /proc/sys/net/mptcp/enabled ]; then
+        printf '# vpn-gateway: MPTCP выключен (CVE-2026-98432)\nnet.mptcp.enabled = 0\n' >"$MPTCP_CONF"
+        run sysctl -q -w net.mptcp.enabled=0
+        # порт, открытый до выключения, остаётся MPTCP — перезапускаем Xray
+        if ss -HMltnp 2>/dev/null | grep -q '"xray"'; then run systemctl restart xray; fi
+    fi
+    command -v apt-get >/dev/null || return 0
+    export DEBIAN_FRONTEND=noninteractive
+    dpkg -s unattended-upgrades >/dev/null 2>&1 \
+        || run apt-get -o DPkg::Lock::Timeout=120 install -y -qq unattended-upgrades || return 0
+    if ! apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'; then
+        printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
+            >/etc/apt/apt.conf.d/20auto-upgrades
+    fi
+    return 0
+}
+
+hard_ok() {
+    { [ ! -e /proc/sys/net/mptcp/enabled ] || [ "$(cat /proc/sys/net/mptcp/enabled)" = 0 ]; } || return 1
+    command -v apt-get >/dev/null || return 0
+    apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'
+}
+
+# обновления системы и перезагрузка: строки @@ для бота
+os_info() {
+    local newk sim
+    out "KERNEL $(uname -r)"
+    newk=$(find /boot -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | sed 's#.*/vmlinuz-##' | sort -V | tail -1)
+    out "KNEW ${newk:-?}"
+    if [ -f /var/run/reboot-required ]; then
+        out "REBOOT yes $(sort -u /var/run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+    else
+        out "REBOOT no"
+    fi
+    out "MPTCP $(cat /proc/sys/net/mptcp/enabled 2>/dev/null || echo -)"
+    if hard_ok; then out "HARD yes"; else out "HARD no"; fi
+    command -v apt-get >/dev/null || return 0
+    [ -n "${APTUPDATE:-}" ] && run apt-get -o DPkg::Lock::Timeout=120 update -qq
+    sim=$(apt-get -s -o Debug::NoLocking=1 upgrade --with-new-pkgs 2>/dev/null | grep '^Inst ')
+    out "OSUPD $(grep -c . <<<"$sim") $(grep -ci -- '-security' <<<"$sim")"
+    if apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'; then out "UU yes"; else out "UU no"; fi
+}
+
+do_os_upgrade() {
+    command -v apt-get >/dev/null || die "обновление системы поддерживается только в Ubuntu и Debian"
+    if systemctl is-active --quiet "$JOB_UNIT"; then out "JOB running"; out "OK"; return; fi
+    mkdir -p "$JOB_DIR"
+    if [ -f "$JOB_DIR/rc" ]; then mv -f "$JOB_DIR/rc" "$JOB_DIR/rc.old"; fi
+    cat >"$JOB_DIR/upgrade.sh" <<EOF
+#!/bin/sh
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+O='-o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold'
+{ echo "===== \$(date '+%F %T') обновление системы"
+  apt-get \$O update -q && apt-get \$O -y -q upgrade --with-new-pkgs && apt-get \$O -y -q autoremove --purge
+} >>$JOB_LOG 2>&1
+echo \$? >$JOB_DIR/rc
+EOF
+    systemctl reset-failed "$JOB_UNIT" >/dev/null 2>&1
+    run systemd-run --quiet --collect --unit "$JOB_UNIT" /bin/sh "$JOB_DIR/upgrade.sh" \
+        || die "не удалось запустить обновление системы"
+    harden
+    out "JOB started"
+    out "OK"
+}
+
+do_os_job() {
+    if systemctl is-active --quiet "$JOB_UNIT"; then out "JOB running"
+    elif [ -s "$JOB_DIR/rc" ]; then out "JOB done $(cat "$JOB_DIR/rc")"
+    else out "JOB none"; fi
+    out "TAIL $(grep -Ev '^(Get|Hit|Ign|Reading|Building|Preparing|Unpacking|Selecting|\(Reading)' "$JOB_LOG" 2>/dev/null \
+        | tail -n 3 | tr '\n' ' ' | cut -c1-300)"
+    os_info
+    out "OK"
+}
+
+do_reboot() {
+    run systemd-run --quiet --collect --unit "vpngw-reboot-$(date +%s)" --on-active=5 /bin/systemctl reboot \
+        || die "не удалось запланировать перезагрузку"
+    out "OK"
+}
+
 do_install() {
     if [ -f "$INFO" ] && [ -f "$CONF" ] && [ -z "${FORCE:-}" ]; then
         if systemctl is-active --quiet xray || { load_conf; restart_xray "$PORT"; }; then
@@ -242,6 +333,7 @@ do_install() {
     say "5/5 Запускаю…"
     open_firewall "$PORT"
     run systemctl enable xray
+    harden
     save_info
     say "Готово! VLESS Reality работает на порту $PORT."
     out "OK"
@@ -267,18 +359,46 @@ do_rotate() {
     show_link
 }
 
+# XRAY_VERSION=v26.10.31 — поставить именно эту версию (бот передаёт проверенную стабильную)
 do_update() {
     load_conf
-    local old new
-    old=$("$(xray_bin)" version 2>/dev/null | awk 'NR==1{print $2}')
+    local old new x
+    x=$(xray_bin)
+    old=$(xver)
     say "Обновляю Xray (сейчас $old)…"
+    cp -a "$x" "$x.prev" 2>/dev/null
     fetch_installer || die "не удалось скачать установщик Xray с GitHub"
-    run bash /tmp/xray-install.sh install || die "обновление Xray не удалось"
-    new=$("$(xray_bin)" version 2>/dev/null | awk 'NR==1{print $2}')
-    restart_xray "$PORT" && selftest "$PORT" "$SNI" || die "после обновления Xray самопроверка не прошла"
+    if [ -n "${XRAY_VERSION:-}" ]; then
+        run bash /tmp/xray-install.sh install --version "$XRAY_VERSION" || die "не удалось установить Xray $XRAY_VERSION"
+    else
+        run bash /tmp/xray-install.sh install || die "обновление Xray не удалось"
+    fi
+    harden
+    new=$(xver)
+    if ! { restart_xray "$PORT" && selftest "$PORT" "$SNI"; }; then
+        if [ -f "$x.prev" ]; then
+            cp -a "$x.prev" "$x"; restart_xray "$PORT"
+            die "Xray $new не прошёл самопроверку — возвращена прежняя версия $old"
+        fi
+        die "после обновления Xray самопроверка не прошла"
+    fi
     out "VER $new"
     out "OLDVER $old"
     say "Xray: $old → $new"
+    out "OK"
+}
+
+# вернуть версию Xray, которая стояла до последнего обновления
+do_xray_rollback() {
+    load_conf
+    local x cur
+    x=$(xray_bin)
+    [ -f "$x.prev" ] || die "нет сохранённой прежней версии Xray"
+    cur=$(xver)
+    cp -a "$x.prev" "$x"
+    restart_xray "$PORT" && selftest "$PORT" "$SNI" || die "прежняя версия Xray тоже не прошла самопроверку"
+    out "VER $(xver)"
+    out "OLDVER $cur"
     out "OK"
 }
 
@@ -286,7 +406,7 @@ do_status() {
     local x
     x=$(xray_bin)
     out "XRAY $(systemctl is-active xray 2>/dev/null | head -1)"
-    [ -x "$x" ] && out "VER $("$x" version 2>/dev/null | awk 'NR==1{print $2}')"
+    [ -x "$x" ] && out "VER $(xver)"
     if [ -f "$CONF" ] && [ -f "$INFO" ]; then
         load_conf
         out "PORT $PORT"; out "SNI $SNI"
@@ -299,6 +419,7 @@ do_status() {
     out "MEM $(free -b | awk '/^Mem:/{print $2, $3}')"
     out "DISK $(df -PB1 / | awk 'NR==2{print $2, $4}')"
     out "PASSAUTH $(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')"
+    os_info
     out "OK"
 }
 
@@ -359,5 +480,10 @@ case "$MODE" in
     status)  do_status ;;
     uninstall) do_uninstall ;;
     passauth) do_passauth "$@" ;;
-    *) echo "Команды: install | show | rotate | update | status | uninstall"; exit 1 ;;
+    harden)  harden; if hard_ok; then out "HARD yes"; else out "HARD no"; fi; out "OK" ;;
+    xray-rollback) do_xray_rollback ;;
+    os-upgrade) do_os_upgrade ;;
+    os-job)  do_os_job ;;
+    reboot)  do_reboot ;;
+    *) echo "Команды: install | show | rotate | update | status | uninstall | os-upgrade | os-job | reboot"; exit 1 ;;
 esac

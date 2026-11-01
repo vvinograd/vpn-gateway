@@ -66,7 +66,11 @@ Notifications arrive by themselves: "⚠️ Server X blocks Telegram — switche
 - **self-healing**: switching to a working server without ping-pong, restarting a stalled mihomo,
   manual server choice with an expiry;
 - **scheduled encrypted backups** and migration to a new server from a backup;
-- **one-click updates** with automatic rollback if the new version fails to start.
+- **one-click updates** with automatic rollback if the new version fails to start; all gateways with one button
+  from the main one, in turn;
+- **Ubuntu maintenance**: security updates install themselves, the rest with a button, a reboot after updates
+  happens at night (03:30–05:00) with a report in the morning; the same for your own VPS, including Xray updates
+  with rollback.
 
 **Management**
 - **Telegram bot**: status, servers, traffic, speed test, WireGuard clients with QR and `.conf` (also by email),
@@ -149,7 +153,15 @@ sudo bash install-vless.sh
 ```
 
 The script prints a `vless://` link — add it in the bot: Subscriptions → "➕ Add subscription". Other commands:
-`show`, `rotate` (new keys), `update` (update Xray), `status`, `uninstall`.
+`show`, `rotate` (new keys), `update` (update Xray, rolls back on failure), `status`, `os-upgrade` (update the
+system), `reboot`, `uninstall`.
+
+**Maintenance.** The server screen shows the Xray version, pending system updates and whether a reboot is needed.
+The bot watches Xray releases (skipping pre-releases and withdrawn versions) and, depending on the mode, either
+tells you about a new version or installs it itself at night once it is 3 days old. Each update is checked from
+Russia before and after — if it does not work, the previous version comes back. From 03:00 the servers are
+serviced one at a time: Xray and a reboot if the system asks for one; a report arrives in the morning. The
+Reality camouflage site changes only with the "🎭 Another camouflage" button.
 
 ## Several gateways in one bot
 
@@ -166,6 +178,22 @@ The code contains only the main gateway's public key. The secondary gateway allo
 (`restrict` + forced command) — a bridge to its bot; no shell, no port forwarding. The owner sees all gateways;
 admins get access per gateway. If the main server is gone, run `sudo python3 /usr/local/bin/vpnbot.py --unlink`
 on the secondary one to bring its own bot back.
+
+## Ubuntu updates and the nightly reboot
+
+Management → "🐧 Ubuntu". The gateway checks for updates daily. Security fixes install themselves
+(unattended-upgrades), everything else with the "📦 Update" button: packages are updated in the background, VPN
+keeps working, the result arrives as a message. If Ubuntu asks for a reboot (usually after a new kernel), the
+gateway reboots itself at night, at most once a night, and reports afterwards how long VPN was down and which
+kernel is running now.
+
+The window is 03:00–05:00 server time: own VPS from 03:00, secondary gateways from 03:30, the main one from
+04:15. The nightly reboot can be switched off. MPTCP is disabled on the gateway and VPS
+(`net.mptcp.enabled=0`) because of CVE-2026-98432.
+
+To update all gateways: Settings → "🏢 Gateways" shows each gateway's version; "⬆️ Update all gateways" updates
+the secondary ones one by one (the next starts only when the previous is back with the new version) and the main
+one last.
 
 ## WireGuard clients
 

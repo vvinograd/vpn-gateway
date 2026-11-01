@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.0'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -156,6 +156,7 @@ NOTIFY_KINDS = [
     ('actions', '👤 Действия админов, запуск, обновления'),
     ('backup', '💾 Резервные копии'),
     ('zapret', '🚀 zapret: сервисы напрямую и их переход на VPN'),
+    ('os', '🐧 Обновления Ubuntu и Xray, ночная перезагрузка'),
 ]
 UI_FILE = '/var/lib/vpnbot/ui.json'      # чистый чат: живое меню, отправленные сообщения, таймеры удаления
 CLEAN_DEFAULTS = {'files': 3600, 'backup': 86400, 'notif': 86400}
@@ -3021,8 +3022,8 @@ def scr_manage(uid, note=''):
           [btn('🩺 Самодиагностика', 'diag')]]
     if is_owner(uid):
         kb.append([btn('🛰 Свои серверы', 'vs')])
-        kb.append([btn('🆕 Обновления' + (' •' if update_available() else ''), 'upd')])
-        kb.append([btn('🖥 Перезагрузить сервер', 'ask:reboot')])
+        kb.append([btn('🆕 Обновления' + (' •' if update_available() else ''), 'upd'),
+                   btn('🐧 Ubuntu' + (' •' if reboot_needed()[0] or (state.get('os') or {}).get('sec') else ''), 'os')])
     kb.append([btn('🏠 Меню', 'menu')])
     return '\n'.join(lines), kb
 
@@ -3517,12 +3518,15 @@ def scr_srv(uid, note=''):
         act, rss = unit_info(unit)
         svc.append(f'{"🟢" if act == "active" else "🔴"} {title}' + (f' ({fmt_bytes(rss)})' if rss else ''))
     lines.append('⚙️ Службы: ' + ' · '.join(svc))
-    upd, sec = apt_updates()
+    oc = state.get('os') or {}
+    upd, sec = (oc.get('upd'), oc.get('sec')) if oc.get('chk') else apt_updates()
     if upd:
         lines.append(f'📦 Обновлений Ubuntu: {upd}' + (f', из них безопасности: {sec}' if sec else '') +
-                     ' — <code>sudo apt upgrade</code>')
+                     ' — 🔧 Управление → 🐧 Ubuntu')
     if sn['reboot']:
-        lines.append('🔁 После обновлений Ubuntu нужна перезагрузка (🔧 Управление → 🖥 Перезагрузить).')
+        lines.append('🔁 После обновлений Ubuntu нужна перезагрузка' + (
+            f' — шлюз сделает её ночью ({os_slot_text(os_slot())}).' if oc.get('auto', True) else
+            ' (🔧 Управление → 🐧 Ubuntu).'))
     lines += ['', f'🚨 Уведомлю, если: диск ≥ {c["disk"]}%, память ≥ {c["ram"]}%, '
                   f'нагрузка ≥ {c["load"]:g} на ядро, упадёт служба.']
     if note:
@@ -3615,14 +3619,415 @@ def srv_tick():
             boot = open('/proc/sys/kernel/random/boot_id').read().strip()
         except Exception:
             boot = ''
-        if al.get('reboot_note') != boot:
+        if al.get('reboot_note') != boot and not os_cfg().get('auto'):
             al['reboot_note'] = boot
             msgs.append('🔁 Ubuntu установила обновления, которым нужна перезагрузка сервера. '
-                        'Сделайте её в удобное время: 🔧 Управление → 🖥 Перезагрузить сервер.')
+                        'Ночная перезагрузка выключена — сделайте её сами: 🔧 Управление → 🐧 Ubuntu.')
     save_state()
     for t in msgs:
         add_event(plain(t).split('\n')[0])
         notify('server', t)
+
+
+# ---------------- Ubuntu: обновления и ночная перезагрузка ----------------
+OS_UNIT = 'vpngw-osupgrade'
+OS_DIR = '/var/lib/vpngw/os'
+OS_LOG = '/var/log/vpngw-os-upgrade.log'
+OS_WIN_END = 5 * 60                 # окно обслуживания заканчивается в 05:00 (время сервера)
+OS_SLOT_VPS = 3 * 60                # 03:00 — свои VPS по одному
+OS_SLOT_GW = 3 * 60 + 30            # 03:30 — ведомые и самостоятельные шлюзы
+OS_SLOT_MAIN = 4 * 60 + 15          # 04:15 — главный шлюз последним
+OS_CHECK_EVERY = 20 * 3600
+OS_SEC_NAG = 3 * 86400              # обновления безопасности висят дольше — напомнить
+MPTCP_SYSCTL = '/etc/sysctl.d/99-vpngw-mptcp.conf'
+os_rt = {'busy': False, 'last': 0.0}
+
+
+def os_cfg():
+    with lock:
+        c = state.setdefault('os', {})
+        c.setdefault('auto', True)
+        return c
+
+
+def os_slot():
+    if not LINK_MODE and gw_nodes():
+        return OS_SLOT_MAIN
+    return OS_SLOT_GW
+
+
+def os_slot_text(start):
+    return f'{start // 60:02d}:{start % 60:02d}–{OS_WIN_END // 60:02d}:00'
+
+
+def in_window(start, now=None):
+    t = time.localtime(now or time.time())
+    m = t.tm_hour * 60 + t.tm_min
+    return start <= m < OS_WIN_END
+
+
+def boot_id():
+    try:
+        return open('/proc/sys/kernel/random/boot_id').read().strip()
+    except Exception:
+        return ''
+
+
+def uptime_s():
+    try:
+        return float(open('/proc/uptime').read().split()[0])
+    except Exception:
+        return 0.0
+
+
+def kernel_newest():
+    try:
+        ks = [f[8:] for f in os.listdir('/boot') if f.startswith('vmlinuz-')]
+    except OSError:
+        return None
+    return max(ks, key=vtuple) if ks else None
+
+
+def reboot_needed():
+    """(нужна ли перезагрузка, с какого времени, пакеты)."""
+    p = '/var/run/reboot-required'
+    if not os.path.exists(p):
+        return False, None, []
+    try:
+        pkgs = sorted({x.strip() for x in open(p + '.pkgs', encoding='utf-8', errors='ignore') if x.strip()})
+    except OSError:
+        pkgs = []
+    try:
+        since = os.path.getmtime(p)
+    except OSError:
+        since = None
+    return True, since, pkgs
+
+
+def mptcp_on():
+    try:
+        return open('/proc/sys/net/mptcp/enabled').read().strip() == '1'
+    except OSError:
+        return False
+
+
+def mptcp_off():
+    """CVE-2026-98432: ядро можно взломать через MPTCP. Шлюзу MPTCP не нужен — выключаем навсегда."""
+    if not mptcp_on():
+        return False
+    try:
+        with open(MPTCP_SYSCTL, 'w') as f:
+            f.write('# vpn-gateway: MPTCP выключен (CVE-2026-98432)\nnet.mptcp.enabled = 0\n')
+        run(['sysctl', '-q', '-w', 'net.mptcp.enabled=0'], 10)
+        log('MPTCP выключен (CVE-2026-98432)')
+        return True
+    except Exception as e:
+        log('MPTCP:', e)
+        return False
+
+
+def uu_on():
+    try:
+        return 'APT::Periodic::Unattended-Upgrade "1"' in run(['apt-config', 'dump'], 20).stdout
+    except Exception:
+        return False
+
+
+def apt_sim():
+    """Сколько пакетов обновится и сколько из них — исправления безопасности."""
+    r = run(['apt-get', '-s', '-o', 'Debug::NoLocking=1', 'upgrade', '--with-new-pkgs'], 180)
+    inst = [x for x in r.stdout.splitlines() if x.startswith('Inst ')]
+    return len(inst), sum(1 for x in inst if '-security' in x)
+
+
+def os_job_running():
+    return run(['systemctl', 'is-active', OS_UNIT], 10).stdout.strip() in ('active', 'activating')
+
+
+def os_check(refresh=True):
+    """Обновить сведения об обновлениях (apt-get update — до пары минут). Вызывать в отдельном потоке."""
+    c = os_cfg()
+    err = ''
+    if refresh and not os_job_running():
+        r = run(['apt-get', '-o', 'DPkg::Lock::Timeout=120', 'update', '-qq'], 400)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip().splitlines()[-1:] or ['ошибка apt-get update']
+            err = err[0][:200]
+    n, sec = apt_sim()
+    with lock:
+        c.update(chk=time.time(), upd=n, sec=sec, uu=uu_on(), err=err)
+        if sec:
+            c.setdefault('sec_since', time.time())
+        else:
+            c.pop('sec_since', None)
+            c.pop('sec_nag', None)
+        save_state()
+    return c
+
+
+def os_check_async(refresh=True):
+    if os_rt['busy']:
+        return False
+
+    def job():
+        try:
+            os_check(refresh)
+        except Exception:
+            log('os_check:', traceback.format_exc())
+        finally:
+            os_rt['busy'] = False
+    os_rt['busy'] = True
+    threading.Thread(target=job, daemon=True).start()
+    return True
+
+
+def os_upgrade_script(job_dir, log_file):
+    return ('#!/bin/sh\n'
+            'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a\n'
+            "O='-o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold'\n"
+            '{ echo "===== $(date \'+%F %T\') обновление системы"\n'
+            '  apt-get $O update -q && apt-get $O -y -q upgrade --with-new-pkgs && apt-get $O -y -q autoremove --purge\n'
+            f'}} >>{log_file} 2>&1\n'
+            f'echo $? >{job_dir}/rc\n')
+
+
+def os_start_upgrade(uid):
+    """Обновление пакетов отдельной службой: если needrestart перезапустит бота, обновление продолжится."""
+    if os_job_running():
+        return 'обновление уже идёт'
+    os.makedirs(OS_DIR, exist_ok=True)
+    rc = os.path.join(OS_DIR, 'rc')
+    if os.path.exists(rc):
+        os.replace(rc, rc + '.old')
+    path = os.path.join(OS_DIR, 'upgrade.sh')
+    with open(path, 'w') as f:
+        f.write(os_upgrade_script(OS_DIR, OS_LOG))
+    c = os_cfg()
+    with lock:
+        c['job'] = {'ts': time.time(), 'uid': uid, 'n': c.get('upd')}
+        save_state()
+    run(['systemctl', 'reset-failed', OS_UNIT], 10)
+    r = run(['systemd-run', '--quiet', '--collect', f'--unit={OS_UNIT}', '/bin/sh', path], 30)
+    if r.returncode != 0:
+        with lock:
+            c.pop('job', None)
+            save_state()
+        return 'не удалось запустить: ' + (r.stderr or r.stdout).strip()[-200:]
+    return None
+
+
+def os_log_tail():
+    try:
+        lines = open(OS_LOG, encoding='utf-8', errors='ignore').read().splitlines()[-200:]
+    except OSError:
+        return ''
+    skip = ('Get:', 'Hit:', 'Ign:', 'Reading', 'Building', 'Preparing', 'Unpacking', 'Selecting', '(Reading')
+    return ' '.join(x.strip() for x in lines if x.strip() and not x.startswith(skip))[-300:]
+
+
+def os_job_tick():
+    c = os_cfg()
+    job = c.get('job')
+    if not job or os_job_running():
+        return
+    try:
+        rc = open(os.path.join(OS_DIR, 'rc')).read().strip()
+    except OSError:
+        rc = ''
+    if not rc and time.time() - job['ts'] < 120:
+        return                            # служба только стартует
+    try:
+        os_check(refresh=False)
+    except Exception:
+        log('os_check:', traceback.format_exc())
+    need, _, _ = reboot_needed()
+    with lock:
+        c.pop('job', None)
+        c['last_job'] = {'ts': time.time(), 'rc': rc or '?'}
+        save_state()
+    kb = None
+    if rc == '0':
+        text = '✅ <b>Ubuntu обновлена</b>' + (f' ({job["n"]} пакетов)' if job.get('n') else '')
+        if need:
+            if c.get('auto'):
+                text += f'\n\n🔁 Нужна перезагрузка — сделаю её ночью, {os_slot_text(os_slot())}. VPN пропадёт примерно на минуту.'
+            else:
+                text += '\n\n🔁 Нужна перезагрузка. Ночная перезагрузка выключена — перезагрузите, когда удобно.'
+            kb = [[btn('🔁 Перезагрузить сейчас', 'os:rb'), btn('🐧 Ubuntu', 'os')]]
+    else:
+        text = (f'⚠️ <b>Обновление Ubuntu завершилось с ошибкой</b> (код {h(rc or "неизвестен")})\n'
+                f'<code>{h(os_log_tail())}</code>\nПолный журнал: <code>{OS_LOG}</code>')
+    add_event(plain(text).split('\n')[0])
+    owner_on = (state['admins'].get(str(OWNER)) or {}).get('notify', {}).get('os', True)
+    if kb and owner_on:                   # владельцу — с кнопкой перезагрузки, остальным — просто сообщение
+        send(OWNER, gw_prefix(text), kb)
+        notify('os', text, exclude=OWNER)
+    else:
+        notify('os', text)
+
+
+def os_reboot(why, uid=None):
+    """why: 'night' или 'manual'. Отметка нужна, чтобы после загрузки сообщить, как всё прошло."""
+    need, _, pkgs = reboot_needed()
+    c = os_cfg()
+    with lock:
+        c['boot'] = {'ts': time.time(), 'kernel': platform.release(), 'why': why, 'boot_id': boot_id(),
+                     'pkgs': pkgs[:6], 'uid': uid}
+        if why == 'night':
+            c['auto_day'] = time.strftime('%Y-%m-%d')
+        save_state()
+    if why == 'night':
+        newk = kernel_newest()
+        text = ('🌙 <b>Ночное обслуживание: перезагружаю шлюз</b>\n\nПосле обновлений Ubuntu нужна перезагрузка'
+                + (f' (ядро {h(platform.release())} → {h(newk)})' if newk and newk != platform.release() else '')
+                + '. VPN пропадёт примерно на минуту, MikroTik на это время уйдёт на резервный канал, если он настроен.')
+        add_event('Ночная перезагрузка шлюза')
+        notify('os', text, keep=False)
+    time.sleep(3)
+    run(['systemctl', 'reboot'], 10)
+
+
+def os_after_boot():
+    """При запуске бота: если перед этим перезагружали шлюз — сообщить итог. True — сообщение отправлено."""
+    c = os_cfg()
+    b = c.get('boot')
+    if not b:
+        return False
+    if b.get('boot_id') == boot_id():
+        if time.time() - b['ts'] < 600:
+            return False                  # бот перезапустился, а перезагрузка ещё впереди
+        with lock:
+            c.pop('boot', None)
+            save_state()
+        notify('os', '⚠️ <b>Перезагрузка шлюза не произошла</b>\nПопробуйте ещё раз: 🔧 Управление → 🐧 Ubuntu.')
+        return True
+    down = max(time.time() - b['ts'], 0)
+    kern = platform.release()
+    title = {'night': '🌙 Ночное обслуживание завершено', 'manual': '✅ Шлюз перезагружен'}.get(b.get('why'), '✅ Шлюз перезагружен')
+    lines = [f'<b>{title}</b>', '',
+             f'VPN был недоступен ~{fmt_dur(down)}' if down < 3600 else f'Шлюз вернулся через {fmt_dur(down)}',
+             f'Ядро: {h(b.get("kernel") or "?")} → <b>{h(kern)}</b>' if b.get('kernel') != kern else f'Ядро: {h(kern)}']
+    need, _, _ = reboot_needed()
+    if need:
+        lines.append('⚠️ Ubuntu по-прежнему просит перезагрузку — посмотрите 🔧 Управление → 🐧 Ubuntu.')
+    lines.append(f'Бот {h(BOT_VERSION)} на связи.')
+    with lock:
+        c.pop('boot', None)
+        c['last_boot'] = {'ts': b['ts'], 'down': down, 'why': b.get('why'), 'from': b.get('kernel'), 'to': kern}
+        save_state()
+    text = '\n'.join(lines)
+    add_event(plain(text).split('\n')[0])
+    notify('os' if b.get('why') == 'night' else 'actions', text, keep=False)
+    return True
+
+
+def os_tick():
+    if time.time() - os_rt['last'] < 55:
+        return
+    os_rt['last'] = time.time()
+    c = os_cfg()
+    os_job_tick()
+    if time.time() - (c.get('chk') or 0) > OS_CHECK_EVERY and not in_window(OS_SLOT_VPS):
+        os_check_async(True)
+    if c.get('sec') and not c.get('uu') and c.get('sec_since') and time.time() - c['sec_since'] > OS_SEC_NAG \
+            and time.time() - (c.get('sec_nag') or 0) > 7 * 86400:
+        with lock:
+            c['sec_nag'] = time.time()
+            save_state()
+        notify('os', f'🛡 <b>{c["sec"]} обновлений безопасности Ubuntu не установлены</b>\n'
+                     'Автообновления выключены. Установите их: 🔧 Управление → 🐧 Ubuntu → 📦 Обновить.')
+    need, _, _ = reboot_needed()
+    if not (need and c.get('auto') and in_window(os_slot())):
+        return
+    if c.get('auto_day') == time.strftime('%Y-%m-%d') or uptime_s() < 3600 or c.get('job') \
+            or state.get('upd_pending') or vps_rt.get('night') or zt_rt.get('worker'):
+        return
+    os_reboot('night')
+
+
+def scr_os(uid, note=''):
+    c = os_cfg()
+    try:
+        osname = re.search(r'^PRETTY_NAME="?([^"\n]*)', open('/etc/os-release').read(), re.M).group(1)
+    except Exception:
+        osname = 'Linux'
+    kern, newk = platform.release(), kernel_newest()
+    lines = ['🐧 <b>Ubuntu</b>', '', f'{h(osname)} · ядро {h(kern)}'
+             + (f' (установлено новее: {h(newk)})' if newk and vtuple(newk) > vtuple(kern) else '')]
+    if c.get('job'):
+        lines.append(f'⏳ Идёт обновление пакетов (запущено {fmt_ago(c["job"]["ts"])})…')
+    if c.get('chk'):
+        if c.get('upd'):
+            lines.append(f'📦 Обновлений: {c["upd"]}' + (f', из них безопасности: <b>{c["sec"]}</b>' if c.get('sec') else '')
+                         + f' · проверено {fmt_ago(c["chk"])}')
+        else:
+            lines.append(f'📦 Все пакеты обновлены · проверено {fmt_ago(c["chk"])}')
+        if c.get('err'):
+            lines.append(f'⚠️ apt-get update: {h(c["err"])}')
+        lines.append('🛡 Обновления безопасности ставятся сами' if c.get('uu') else
+                     '⚠️ Автообновления безопасности выключены (unattended-upgrades)')
+    else:
+        lines.append('📦 Обновления ещё не проверялись')
+    need, since, pkgs = reboot_needed()
+    if need:
+        lines.append('🔁 <b>Нужна перезагрузка</b>' + (f' (с {time.strftime("%d.%m %H:%M", time.localtime(since))})' if since else '')
+                     + (f': {h(", ".join(pkgs[:4]))}' if pkgs else ''))
+    lines.append(f'🌙 Ночная перезагрузка: ' + (f'<b>включена</b>, {os_slot_text(os_slot())}, только если она нужна'
+                                               if c.get('auto') else '<b>выключена</b>'))
+    lb = c.get('last_boot')
+    if lb:
+        lines.append(f'Последняя перезагрузка: {time.strftime("%d.%m %H:%M", time.localtime(lb["ts"]))}'
+                     f' ({"ночная" if lb.get("why") == "night" else "вручную"}), без VPN ~{fmt_dur(lb.get("down") or 0)}')
+    lj = c.get('last_job')
+    if lj:
+        lines.append(f'Последнее обновление пакетов: {time.strftime("%d.%m %H:%M", time.localtime(lj["ts"]))} — '
+                     + ('успешно' if lj.get('rc') == '0' else f'ошибка (код {h(str(lj.get("rc")))})'))
+    lines.append('🔒 MPTCP: ' + ('<b>включён</b> ⚠️ (CVE-2026-98432)' if mptcp_on() else 'выключен'))
+    lines += ['', 'Очерёдность ночью: свои VPS с 03:00, ведомые шлюзы с 03:30, главный с 04:15. '
+                  'Перезагрузка — только когда её просит Ubuntu, не чаще раза за ночь.']
+    if note:
+        lines += ['', note]
+    kb = [[btn('🔍 Проверить', 'os:chk')]]
+    if c.get('upd') and not c.get('job'):
+        kb[0].append(btn(f'📦 Обновить ({c["upd"]})', 'os:ask'))
+    kb.append([btn('🔁 Перезагрузить сейчас', 'ask:reboot')])
+    kb.append([btn('🌙 Ночная перезагрузка: ' + ('вкл' if c.get('auto') else 'выкл'), 'os:auto')])
+    kb.append([btn('⬅️ Управление', 'manage'), btn('🏠 Меню', 'menu')])
+    return '\n'.join(lines), kb
+
+
+def handle_os(uid, data, chat, mid):
+    act = data.split(':', 1)[1] if ':' in data else ''
+    c = os_cfg()
+    if act == 'chk':
+        edit(chat, mid, '🔍 Проверяю обновления Ubuntu (до пары минут)…')
+        try:
+            os_check(True)
+        except Exception as e:
+            return scr_os(uid, f'🔴 {h(str(e))[:300]}')
+        return scr_os(uid)
+    if act == 'ask':
+        return ('📦 <b>Обновить Ubuntu?</b>\n\n'
+                f'Обновится пакетов: {c.get("upd") or "?"}. Это идёт в фоне 2–10 минут, VPN не прерывается. '
+                'Бот может перезапуститься сам — это нормально. По окончании придёт сообщение.\n\n'
+                'Если после обновления понадобится перезагрузка, ' + (
+                    f'шлюз сделает её ночью ({os_slot_text(os_slot())}).' if c.get('auto') else 'бот предложит её.'),
+                [[btn('✅ Обновить', 'os:go'), btn('✖️ Отмена', 'os')]])
+    if act == 'go':
+        err = os_start_upgrade(uid)
+        if err:
+            return scr_os(uid, f'🔴 {h(err)}')
+        add_event(f'{admin_name(uid)}: обновление Ubuntu')
+        return scr_os(uid, '⏳ Обновление запущено. Пришлю сообщение, когда закончится.')
+    if act == 'auto':
+        with lock:
+            c['auto'] = not c.get('auto')
+            save_state()
+        add_event(f'{admin_name(uid)}: ночная перезагрузка ' + ('включена' if c['auto'] else 'выключена'))
+        return scr_os(uid, '✅ Сохранено')
+    if act == 'rb':
+        return CONFIRM['reboot'][0], [[btn('✅ Да', 'yes:reboot'), btn('✖️ Отмена', 'os')]]
+    return scr_os(uid)
 
 
 # ---------------- экран подписок ----------------
@@ -4566,10 +4971,24 @@ def scr_vs(uid, note=''):
         kb.append([btn(f'{icon} {x.get("name") or x["host"]}'[:40], f'vs:v:{vid}')])
     if not lst:
         lines.append('Пока нет ни одного сервера.')
+    c = vpsm()
+    old = []
+    if lst:
+        rel = c.get('rel') or {}
+        old = xray_outdated(rel)
+        lines += ['', f'⬆️ Последний Xray: <b>{h(rel["tag"])}</b>' + (f', старее на {len(old)} из {len(lst)}' if old else ', у всех свежий')
+                  if rel.get('tag') else '⬆️ Последний Xray: ещё не проверялся',
+                  '🌙 Ночью с 03:00, по одному: ' + ('Xray — ' + dict(XRAY_MODES)[c['xray']]) + '; перезагрузка, '
+                  + ('когда её просит система' if c.get('os') else 'выключена')]
     lines += ['', 'Понадобятся IP сервера и пароль (или SSH-ключ). Пароль бот использует один раз: '
                   'кладёт на сервер свой ключ и дальше входит по нему.']
     if note:
         lines += ['', note]
+    if old:
+        kb.append([btn(f'⬆️ Обновить Xray на всех ({len(old)})', 'vs:updall')])
+    if lst:
+        kb.append([btn('⬆️ Xray: ' + {'notify': 'сообщать', 'auto': 'ставить сам', 'off': 'не следить'}[c['xray']], 'vs:xm'),
+                   btn('🌙 Перезагрузка ночью: ' + ('вкл' if c.get('os') else 'выкл'), 'vs:osn')])
     kb.append([btn('➕ Развернуть сервер', 'vs:new')])
     kb.append([btn('⬅️ Управление', 'manage'), btn('🏠 Меню', 'menu')])
     return '\n'.join(lines), kb
@@ -4601,6 +5020,9 @@ def scr_vs_one(uid, vid, note=''):
         st = last.get('sys')
         if st:
             lines.append(st)
+    osl = vs_os_line(x)
+    if osl:
+        lines.append(osl)
     if x.get('pass_off'):
         lines.append('🔒 Вход на сервер по паролю выключен (только по ключу)')
     v = vpn()
@@ -4611,13 +5033,19 @@ def scr_vs_one(uid, vid, note=''):
     kb = [[btn('🔄 Проверить', f'vs:chk:{vid}')]]
     if vl:
         kb[0].append(btn('🔑 Новые ключи', f'vs:rot:{vid}'))
-        kb.append([btn('🎭 Другая маскировка', f'vs:sni:{vid}'), btn('⬆️ Обновить Xray', f'vs:upd:{vid}')])
+        rel = (vpsm().get('rel') or {}).get('tag')
+        newer = rel and vl.get('ver') and vtuple(rel) > vtuple(vl['ver'])
+        kb.append([btn('🎭 Другая маскировка', f'vs:sni:{vid}'),
+                   btn(f'⬆️ Xray {rel}' if newer else '⬆️ Обновить Xray', f'vs:upd:{vid}')])
         if sb and (v.get('svc') or {}).get('google') != sb['id']:
             kb.append([btn('🎯 Google и Gemini через него', f'vs:goo:{vid}')])
         if not sb:
             kb.append([btn('➕ Добавить в шлюз', f'vs:att:{vid}')])
     else:
         kb.append([btn('🚀 Установить VLESS', f'vs:ins:{vid}')])
+    o = x.get('sysi') or {}
+    kb.append([btn(f'📦 Обновить систему ({o["upd"]})' if o.get('upd') else '📦 Обновить систему', f'vs:osup:{vid}'),
+               btn('🔁 Перезагрузить' + (' •' if o.get('reboot') else ''), f'vs:rb:{vid}')])
     kb.append([btn('🔓 Вернуть вход по паролю' if x.get('pass_off') else '🔒 Вход только по ключу', f'vs:pa:{vid}')])
     row = [btn('🔌 Отключить бота', f'vs:off:{vid}')]
     if vl:
@@ -4649,6 +5077,14 @@ def vs_check(vid):
                     + f', память {fmt_bytes(mu)} из {fmt_bytes(mt)}, диск свободно {fmt_bytes(df)} из {fmt_bytes(dt)}')
     except Exception:
         pass
+    if st.get('HARD') == 'no':             # MPTCP и автообновления — один раз, дальше держится само
+        try:
+            hd = vs_call(vs, 'harden', timeout=300)
+            st['HARD'] = hd.get('HARD', 'no')
+            st['MPTCP'] = '0' if hd.get('HARD') == 'yes' else st.get('MPTCP')
+            add_event(f'{x["host"]}: выключен MPTCP, включены автообновления безопасности')
+        except VsError as e:
+            log('harden', x['host'], e)
     with lock:
         if 'PORT' in st:
             x['vless'] = dict(x.get('vless') or {}, port=int(st['PORT']), sni=st.get('SNI', ''), ver=st.get('VER', ''))
@@ -4656,6 +5092,8 @@ def vs_check(vid):
             x['vless'] = None          # Xray не установлен или настроен не этим ботом
         if st.get('PASSAUTH'):
             x['pass_off'] = st['PASSAUTH'] == 'no'
+        if 'REBOOT' in st:
+            x['sysi'] = vs_parse_os(st)
         save_state()
     res = {'ts': time.time(), 'xray': st.get('XRAY'), 'sys': '; '.join(sysl)}
     if not x.get('vless'):
@@ -4693,7 +5131,8 @@ def vs_action(uid, vid, act, chat, mid):
             'ins': '🚀 Устанавливаю VLESS (1–3 минуты)…', 'del': '🗑 Удаляю VLESS с сервера…',
             'att': '➕ Проверяю сервер и добавляю в шлюз…', 'goo': '🎯 Направляю Google через сервер и применяю…',
             'paoff': '🔒 Выключаю вход по паролю…', 'paon': '🔓 Возвращаю вход по паролю…',
-            'off': '🔌 Удаляю ключ бота с сервера…'}
+            'off': '🔌 Удаляю ключ бота с сервера…', 'osup': '📦 Обновляю систему на сервере…',
+            'rb': '🔁 Перезагружаю сервер…'}
     edit(chat, mid, msgs.get(act, '⏳ Выполняю…'))
     VS_BUSY.add(key)
     try:
@@ -4736,14 +5175,18 @@ def vs_action(uid, vid, act, chat, mid):
             return scr_vs_one(uid, vid, f'✅ {h(what)}.' + ('' if chk.get('ok') else
                                                             f'\n⚠️ Проверка из России не прошла: {h(chk.get("err", ""))}'))
         if act == 'upd':
-            data = vs_call(vs, 'update', timeout=600)
-            with lock:
-                x['vless'] = dict(x.get('vless') or {}, ver=data.get('VER', ''))
-                save_state()
-            old, new = data.get('OLDVER'), data.get('VER')
-            add_event(f'{who}: Xray на {x["host"]} {old} → {new}')
-            return scr_vs_one(uid, vid, f'✅ Xray {h(old or "")} → {h(new or "")}' if old != new
-                              else f'✅ Уже последняя версия Xray: {h(new or "")}')
+            rel = xray_release(force=True)
+            ok, txt = vs_xray_update(vid, rel.get('tag'), say=lambda t: edit(chat, mid, f'{msgs[act]}\n\n<i>{h(t)}</i>'))
+            add_event(f'{who}: {x["host"]} — {txt}')
+            return scr_vs_one(uid, vid, ('✅ ' if ok else '⚠️ ') + h(txt))
+        if act == 'osup':
+            ok, txt = vs_os_upgrade(vid, say=lambda t: edit(chat, mid, f'{msgs[act]}\n\n<i>{h(t)}</i>'))
+            add_event(f'{who}: {x["host"]} — {txt}')
+            return scr_vs_one(uid, vid, ('✅ ' if ok else '⚠️ ') + h(txt))
+        if act == 'rb':
+            ok, txt = vs_reboot(vid, say=lambda t: edit(chat, mid, f'{msgs[act]}\n\n<i>{h(t)}</i>'))
+            add_event(f'{who}: {x["host"]} — {txt}')
+            return scr_vs_one(uid, vid, ('✅ ' if ok else '🔴 ') + h(txt))
         if act == 'del':
             vs_call(vs, 'uninstall', timeout=300)
             note = '🗑 VLESS удалён с сервера.'
@@ -4821,7 +5264,13 @@ VS_CONFIRM = {
             'кому-то ещё, им понадобится новая.'),
     'sni': ('🎭 <b>Сменить маскировку?</b>\n\nПомогает, если провайдер начал резать подключение. Бот подберёт другой '
             'сайт для маскировки и создаст новые ключи, ссылка в шлюзе обновится сама.'),
-    'upd': '⬆️ <b>Обновить Xray на сервере?</b>\n\nVPN через этот сервер прервётся на несколько секунд.',
+    'upd': ('⬆️ <b>Обновить Xray на сервере?</b>\n\nVPN через этот сервер прервётся на несколько секунд. До и после '
+            'обновления бот проверит сервер из России; если новая версия не заработает, вернётся прежняя.'),
+    'osup': ('📦 <b>Обновить систему на сервере?</b>\n\nПакеты Ubuntu/Debian обновятся в фоне (обычно 2–10 минут), '
+             'VLESS при этом работает. Если после обновления понадобится перезагрузка, бот сделает её ночью '
+             '(если ночная перезагрузка включена) или её можно сделать кнопкой.'),
+    'rb': ('🔁 <b>Перезагрузить сервер?</b>\n\nVPN через этот сервер пропадёт на 1–3 минуты — шлюз на это время '
+           'переключится на другие серверы. Бот дождётся возвращения сервера и проверит VLESS из России.'),
     'del': ('🗑 <b>Удалить VLESS с сервера?</b>\n\nXray и его настройки будут удалены, подписка этого сервера '
             'пропадёт из шлюза. Доступ бота к серверу останется — VLESS можно будет поставить заново.'),
     'off': ('🔌 <b>Отключить бота от сервера?</b>\n\nБот удалит свой SSH-ключ с сервера и забудет его. VLESS '
@@ -4846,6 +5295,24 @@ def handle_vs(uid, data, chat, mid):
                 'порту или нужен другой пользователь, можно так: <code>ubuntu@203.0.113.5:2222</code>\n\n'
                 'Подойдёт чистый VPS с Ubuntu или Debian. Уже работающие там SSTP, WireGuard и т.п. бот не тронет.'
                 '\n\nОтмена: /cancel', [[btn('✖️ Отмена', 'vs')]])
+    if act == 'xm':
+        c = vpsm()
+        modes = [m for m, _ in XRAY_MODES]
+        with lock:
+            c['xray'] = modes[(modes.index(c['xray']) + 1) % len(modes)]
+            save_state()
+        add_event(f'{admin_name(uid)}: Xray на своих серверах — {dict(XRAY_MODES)[c["xray"]]}')
+        if c['xray'] != 'off':
+            threading.Thread(target=xray_release, args=(True,), daemon=True).start()
+        return scr_vs(uid, f'✅ Xray: {dict(XRAY_MODES)[c["xray"]]}')
+    if act == 'osn':
+        c = vpsm()
+        with lock:
+            c['os'] = not c.get('os')
+            save_state()
+        return scr_vs(uid, '✅ Ночная перезагрузка своих серверов ' + ('включена' if c['os'] else 'выключена'))
+    if act == 'updall':
+        return vs_update_all(uid, chat, mid)
     x = vps_all().get(vid)
     if act == 'v':
         return scr_vs_one(uid, vid)
@@ -4857,7 +5324,7 @@ def handle_vs(uid, data, chat, mid):
         return VS_CONFIRM[act], [[btn('✅ Да', f'vs:{act}!:{vid}'), btn('✖️ Отмена', f'vs:v:{vid}')]]
     if act.endswith('!'):
         act = act[:-1]
-    if act in ('chk', 'rot', 'sni', 'upd', 'ins', 'del', 'att', 'goo', 'paoff', 'paon', 'off'):
+    if act in ('chk', 'rot', 'sni', 'upd', 'ins', 'del', 'att', 'goo', 'paoff', 'paon', 'off', 'osup', 'rb'):
         return vs_action(uid, vid, act, chat, mid)
     return scr_vs_one(uid, vid)
 
@@ -6508,10 +6975,10 @@ def wg_mass(uid, chat, mid, via):
 SCREENS = {'menu': scr_menu, 'status': scr_status, 'servers': scr_servers, 'traffic': scr_traffic,
            'manage': scr_manage, 'notif': scr_notif, 'admins': scr_admins, 'log': scr_log,
            'set': scr_settings, 'em': scr_email, 'subs': scr_subs, 'srv': scr_srv,
-           'srvthr': scr_srv_thr, 'vs': scr_vs, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'diag': scr_diag, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
+           'srvthr': scr_srv_thr, 'vs': scr_vs, 'os': scr_os, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'diag': scr_diag, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
            'swi': lambda uid: scr_sw_choice(uid, 'i'), 'swt': lambda uid: scr_sw_choice(uid, 't')}
 # клиентами WireGuard управляют все админы; общие настройки шлюза — только владелец
-OWNER_ONLY = ('zt:', 'diag:set:', 'diag:auto', 'vs', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
+OWNER_ONLY = ('zt:', 'diag:set:', 'diag:auto', 'vs', 'os', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
               'upd:', 'subs', 'sub:', 'srvthr', 'srvt:', 'srvclean')
 
 CONFIRM = {
@@ -7522,8 +7989,7 @@ def handle_callback(cq):
             edit(chat, mid, '🖥 Сервер перезагружается. Бот вернётся через 1–2 минуты и пришлёт сообщение.')
             add_event(f'{admin_name(uid)}: перезагрузка сервера')
             notify('actions', f'👤 {who} перезагружает сервер', exclude=uid)
-            time.sleep(2)
-            run(['systemctl', 'reboot'], 10)
+            os_reboot('manual', uid)
             return
         elif data.startswith('yes:') and data[4:] in UNITS:
             unit, label = UNITS[data[4:]]
@@ -7601,6 +8067,8 @@ def handle_callback(cq):
             text, kb = scr_srv(uid, f'✅ Освобождено {fmt_bytes(max(freed, 0))}: ' + '; '.join(steps))
         elif data.startswith('upd'):
             text, kb = scr_upd(uid) if data == 'upd' else handle_upd(uid, data, chat, mid)
+        elif data.startswith('os:'):
+            text, kb = handle_os(uid, data, chat, mid)
         elif data.startswith('wg'):
             res = handle_wg(uid, data, chat, mid)
             if res is None:
@@ -8037,6 +8505,376 @@ def handle_admin_message(m, uid, chat, text):
     send(chat, t, kb)
 
 
+# ---------------- свои серверы: Xray, Ubuntu и ночное обслуживание ----------------
+XRAY_RELEASES = 'https://api.github.com/repos/XTLS/Xray-core/releases?per_page=15'
+XRAY_DELAY = 3 * 86400            # «ставить сам»: только версия, которой уже 3 дня (отозванные успевают убрать)
+XRAY_MODES = [('notify', 'сообщать о новой версии'), ('auto', 'ставить сам ночью (версии от 3 дней)'),
+              ('off', 'не следить')]
+VS_BACK_WAIT = 600                # сколько ждать сервер после перезагрузки
+vps_rt = {'night': False, 'last': 0.0, 'rel_last': 0.0}
+
+
+def vpsm():
+    with lock:
+        c = state.setdefault('vpsm', {})
+        c.setdefault('xray', 'notify')
+        c.setdefault('os', True)
+        return c
+
+
+def vs_conn(x):
+    return {'host': x['host'], 'port': x['port'], 'user': x['user']}
+
+
+def vs_name(x):
+    return x.get('name') or x['host']
+
+
+def parse_iso(s):
+    try:
+        return calendar.timegm(time.strptime(s[:19], '%Y-%m-%dT%H:%M:%S'))
+    except Exception:
+        return 0
+
+
+def xray_release(force=False):
+    """Последняя стабильная версия Xray: не черновик, не пререлиз (отозванные XTLS переводит в пререлизы)."""
+    c = vpsm()
+    rel = c.get('rel') or {}
+    if not force and time.time() - (rel.get('checked') or 0) < 6 * 3600:
+        return rel
+    try:
+        data = json.loads(fetch(XRAY_RELEASES, 20))
+        best = next((r for r in data if not r.get('draft') and not r.get('prerelease') and r.get('tag_name')), None)
+        if best:
+            rel = {'tag': best['tag_name'], 'pub': parse_iso(best.get('published_at') or ''), 'checked': time.time()}
+    except Exception as e:
+        log('релизы Xray:', e)
+        rel = dict(rel, checked=time.time(), err=str(e)[:200])
+    with lock:
+        c['rel'] = rel
+        save_state()
+    return rel
+
+
+def xray_outdated(rel=None):
+    """[(vid, x)] серверов, где Xray старше последней стабильной версии."""
+    rel = rel or (vpsm().get('rel') or {})
+    tag = rel.get('tag')
+    if not tag:
+        return []
+    return [(vid, x) for vid, x in sorted(vps_all().items())
+            if (x.get('vless') or {}).get('ver') and vtuple((x['vless'] or {})['ver']) < vtuple(tag)]
+
+
+def vs_parse_os(st):
+    """Строки os_info из install-vless.sh → словарь для state."""
+    o = {'ts': time.time()}
+    if 'KERNEL' in st:
+        o['kernel'] = st['KERNEL']
+    if st.get('KNEW') and st['KNEW'] != '?':
+        o['knew'] = st['KNEW']
+    rb = st.get('REBOOT', '')
+    o['reboot'] = rb.startswith('yes')
+    o['pkgs'] = rb[4:].split()[:6] if o['reboot'] else []
+    try:
+        n, sec = (int(z) for z in st.get('OSUPD', '').split()[:2])
+        o['upd'], o['sec'] = n, sec
+    except Exception:
+        pass
+    if 'UU' in st:
+        o['uu'] = st['UU'] == 'yes'
+    if 'HARD' in st:
+        o['hard'] = st['HARD'] == 'yes'
+    if 'MPTCP' in st:
+        o['mptcp'] = st['MPTCP'] == '1'
+    return o
+
+
+def vs_os_line(x):
+    o = x.get('sysi') or {}
+    if not o:
+        return ''
+    parts = []
+    if 'upd' in o:
+        parts.append(f'обновлений {o["upd"]}' + (f' (безопасности {o["sec"]})' if o.get('sec') else '') if o['upd']
+                     else 'пакеты обновлены')
+    if o.get('reboot'):
+        parts.append('🔁 нужна перезагрузка')
+    if 'uu' in o and not o['uu']:
+        parts.append('⚠️ автообновления выключены')
+    if o.get('mptcp'):
+        parts.append('⚠️ MPTCP включён')
+    kern = o.get('kernel')
+    return 'Система: ' + (f'ядро {h(kern)}, ' if kern else '') + ', '.join(parts)
+
+
+def vs_link(vs):
+    return vs_call(vs, 'show', timeout=60).get('LINK', '')
+
+
+def vs_xray_update(vid, tag=None, say=None):
+    """Обновить Xray на сервере; если из России сервер перестал работать — вернуть прежнюю версию.
+    → (ok, текст)."""
+    x = vps_all()[vid]
+    vs = vs_conn(x)
+    say = say or (lambda t: None)
+    link = ''
+    before = None
+    try:
+        link = vs_link(vs)
+        say('Проверяю сервер из России до обновления…')
+        before = vless_check(link, geo=False).get('ok') if link else None
+    except VsError:
+        pass
+    say('Ставлю новую версию Xray…')
+    data = vs_call(vs, 'update', {'XRAY_VERSION': tag} if tag else None, timeout=600)
+    old, new = data.get('OLDVER') or '', data.get('VER') or ''
+    with lock:
+        x['vless'] = dict(x.get('vless') or {}, ver=new)
+        save_state()
+    if old == new:
+        return True, f'уже стоит Xray {new}'
+    if link and before:
+        say('Проверяю сервер из России после обновления…')
+        chk = vless_check(link, geo=False)
+        if not chk.get('ok'):
+            try:
+                rb = vs_call(vs, 'xray-rollback', timeout=300)
+                with lock:
+                    x['vless'] = dict(x.get('vless') or {}, ver=rb.get('VER') or old)
+                    save_state()
+                return False, (f'Xray {new} не работает из России ({chk.get("err") or "нет ответа"}) — '
+                               f'возвращена версия {rb.get("VER") or old}')
+            except VsError as e:
+                return False, f'Xray {new} не работает из России, а откатить не удалось: {e}'
+    return True, f'Xray {old} → {new}'
+
+
+def vs_wait_back(x, since, timeout=VS_BACK_WAIT, say=None):
+    """Ждёт, пока сервер вернётся после перезагрузки (новый SSH-вход и свежее время работы). → статус или None."""
+    vs = vs_conn(x)
+    t0 = time.time()
+    time.sleep(40)
+    while time.time() - t0 < timeout:
+        if say:
+            say(f'Жду, пока сервер загрузится… {fmt_dur(time.time() - since)}')
+        if tcp_open(x['host'], x['port'], 5, 1):
+            try:
+                st = vs_call(vs, 'status', timeout=90)
+                if int(st.get('UPTIME') or 1e9) < time.time() - since + 30:
+                    return st
+            except (VsError, ValueError):
+                pass
+        time.sleep(15)
+    return None
+
+
+def vs_reboot(vid, say=None):
+    """Перезагрузить сервер и дождаться его. → (ok, текст)."""
+    x = vps_all()[vid]
+    vs = vs_conn(x)
+    kern = (x.get('sysi') or {}).get('kernel')
+    since = time.time()
+    vs_call(vs, 'reboot', timeout=60)
+    st = vs_wait_back(x, since, say=say)
+    if not st:
+        with lock:
+            x['last'] = {'ok': False, 'err': f'не вернулся после перезагрузки за {VS_BACK_WAIT // 60} мин',
+                         'ts': time.time()}
+            save_state()
+        return False, f'не вернулся после перезагрузки за {VS_BACK_WAIT // 60} минут — проверьте панель хостинга'
+    down = time.time() - since
+    with lock:
+        x['sysi'] = vs_parse_os(st)
+        save_state()
+    if say:
+        say('Проверяю VLESS из России…')
+    vs_check(vid)
+    last = vps_all().get(vid, {}).get('last') or {}
+    newk = (x.get('sysi') or {}).get('kernel')
+    txt = f'перезагружен за {fmt_dur(down)}' + (f', ядро {kern} → {newk}' if kern and newk and kern != newk else '')
+    if x.get('vless'):
+        txt += ', VLESS работает' if last.get('ok') else f', ⚠️ VLESS не отвечает: {last.get("err") or "?"}'
+    return bool(last.get('ok')) or not x.get('vless'), txt
+
+
+def vs_os_upgrade(vid, say=None):
+    """Обновить пакеты на сервере (в фоне на сервере, бот следит за ходом). → (ok, текст)."""
+    x = vps_all()[vid]
+    vs = vs_conn(x)
+    vs_call(vs, 'os-upgrade', timeout=120)
+    t0 = time.time()
+    st = {}
+    while time.time() - t0 < 1800:
+        time.sleep(15)
+        if say:
+            say(f'Обновляю пакеты на сервере… {fmt_dur(time.time() - t0)}')
+        try:
+            st = vs_call(vs, 'os-job', timeout=120)
+        except VsError:
+            continue
+        if not st.get('JOB', '').startswith('running'):
+            break
+    with lock:
+        if st:
+            x['sysi'] = vs_parse_os(st)
+        save_state()
+    job = st.get('JOB', '')
+    if job == 'done 0':
+        o = x.get('sysi') or {}
+        return True, 'пакеты обновлены' + ('; нужна перезагрузка' if o.get('reboot') else '')
+    if job.startswith('running'):
+        return False, 'обновление идёт дольше 30 минут — проверьте позже кнопкой «🔄 Проверить»'
+    return False, f'обновление завершилось с ошибкой ({job or "нет ответа"}): {st.get("TAIL", "")[-200:]}'
+
+
+def vs_update_all(uid, chat, mid):
+    """Кнопка «Обновить Xray на всех»: по одному, с проверкой из России и откатом."""
+    rel = xray_release(force=True)
+    old = xray_outdated(rel)
+    if not old:
+        return scr_vs(uid, '✅ На всех серверах уже последний Xray' + (f' ({h(rel["tag"])})' if rel.get('tag') else ''))
+    res = []
+    for i, (vid, x) in enumerate(old, 1):
+        key = (x['host'], int(x['port']))
+        name = vs_name(x)
+        if key in VS_BUSY:
+            res.append(f'⏳ {h(name)}: с сервером идёт другая операция')
+            continue
+        VS_BUSY.add(key)
+        try:
+            ok, txt = vs_xray_update(vid, rel['tag'], say=lambda t, n=name, i=i: edit(
+                chat, mid, f'⬆️ Обновляю Xray до {h(rel["tag"])} — {i} из {len(old)}: {h(n)}\n\n<i>{h(t)}</i>'))
+        except VsError as e:
+            ok, txt = False, f'не обновлён: {e}'
+        finally:
+            VS_BUSY.discard(key)
+        res.append(f'{"✅" if ok else "⚠️"} {h(name)}: {h(txt)}')
+        add_event(f'{admin_name(uid)}: {x["host"]} — {txt}')
+    return scr_vs(uid, '\n'.join(res))
+
+
+def vs_night():
+    """Ночью по одному: Xray (если «ставить сам»), затем перезагрузка, если её просит система."""
+    c = vpsm()
+    rel = xray_release()
+    report = []
+    stop_reboots = False
+    for vid, x in sorted(vps_all().items()):
+        key = (x['host'], int(x['port']))
+        if key in VS_BUSY:
+            continue
+        VS_BUSY.add(key)
+        name = h(vs_name(x))
+        try:
+            vs = vs_conn(x)
+            try:
+                st = vs_call(vs, 'status', {'APTUPDATE': 1}, timeout=400)
+            except VsError as e:
+                report.append(f'🔴 {name}: нет доступа по SSH — {h(str(e))[:150]}')
+                continue
+            with lock:
+                x['sysi'] = vs_parse_os(st)
+                save_state()
+            if st.get('HARD') == 'no':
+                try:
+                    vs_call(vs, 'harden', timeout=300)
+                except VsError as e:
+                    log('harden', x['host'], e)
+            ver = (x.get('vless') or {}).get('ver')
+            if c.get('xray') == 'auto' and ver and rel.get('tag') and vtuple(rel['tag']) > vtuple(ver) \
+                    and time.time() - (rel.get('pub') or time.time()) >= XRAY_DELAY:
+                try:
+                    ok, txt = vs_xray_update(vid, rel['tag'])
+                except VsError as e:
+                    ok, txt = False, f'Xray не обновлён: {e}'
+                report.append(f'{"⬆️" if ok else "⚠️"} {name}: {h(txt)}')
+            if c.get('os') and (x.get('sysi') or {}).get('reboot') and not stop_reboots:
+                try:
+                    ok, txt = vs_reboot(vid)
+                except VsError as e:
+                    ok, txt = False, f'перезагрузить не удалось: {e}'
+                report.append(f'{"🔁" if ok else "🔴"} {name}: {h(txt)}')
+                if not ok:
+                    stop_reboots = True           # что-то не так — остальные сегодня не трогаем
+        except Exception:
+            log('vs_night:', traceback.format_exc())
+        finally:
+            VS_BUSY.discard(key)
+    if report:
+        text = '🌙 <b>Ночное обслуживание своих серверов</b>\n\n' + '\n'.join(report)
+        add_event('Ночное обслуживание своих серверов')
+        notify('os', text, keep=any(r.startswith(('🔴', '⚠️')) for r in report))
+
+
+def vs_rel_tick():
+    """Раз в сутки: вышел ли новый Xray. Сообщить один раз на версию."""
+    c = vpsm()
+    if c.get('xray') == 'off' or not any((x.get('vless') or {}).get('ver') for x in vps_all().values()):
+        return
+    if time.time() - vps_rt['rel_last'] < 6 * 3600:
+        return
+    vps_rt['rel_last'] = time.time()
+    rel = xray_release(force=True)
+    old = xray_outdated(rel)
+    if not old or c.get('notified') == rel.get('tag'):
+        return
+    with lock:
+        c['notified'] = rel['tag']
+        save_state()
+    lst = ', '.join(f'{h(vs_name(x))} ({h(x["vless"]["ver"])})' for _, x in old)
+    text = f'⬆️ <b>Вышел Xray {h(rel["tag"])}</b>\nНа ваших серверах старее: {lst}.'
+    if c.get('xray') == 'auto':
+        when = max(rel.get('pub') or 0, time.time() - XRAY_DELAY) + XRAY_DELAY
+        text += f'\n\nПоставлю сам ночью, начиная с {time.strftime("%d.%m", time.localtime(when))}, ' \
+                'с проверкой из России и откатом, если что-то сломается.'
+    owner_on = (state['admins'].get(str(OWNER)) or {}).get('notify', {}).get('os', True)
+    add_event(f'Вышел Xray {rel["tag"]}')
+    if owner_on:
+        send(OWNER, gw_prefix(text), [[btn('⬆️ Обновить сейчас', 'vs:updall'), btn('🛰 Серверы', 'vs')]])
+    notify('os', text, exclude=OWNER)
+
+
+def vs_tick():
+    if not vps_all():
+        return
+    try:
+        vs_rel_tick()
+    except Exception:
+        log('vs_rel_tick:', traceback.format_exc())
+    c = vpsm()
+    today = time.strftime('%Y-%m-%d')
+    if vps_rt['night'] or c.get('night_day') == today or not in_window(OS_SLOT_VPS):
+        return
+    with lock:
+        c['night_day'] = today
+        save_state()
+    vps_rt['night'] = True
+
+    def job():
+        try:
+            vs_night()
+        finally:
+            vps_rt['night'] = False
+    threading.Thread(target=job, daemon=True).start()
+
+
+def maint_loop():
+    """Обслуживание: обновления Ubuntu, ночные перезагрузки, свои серверы."""
+    time.sleep(90)
+    while True:
+        try:
+            os_tick()
+        except Exception:
+            log('os_tick:', traceback.format_exc())
+        try:
+            vs_tick()
+        except Exception:
+            log('vs_tick:', traceback.format_exc())
+        time.sleep(30)
+
+
 # ---------------- обновления ----------------
 def vtuple(v):
     return tuple(int(x) for x in re.findall(r'\d+', v or '0'))
@@ -8359,17 +9197,25 @@ def update_tick():
             state.setdefault('upd', {})['checked'] = time.time()
             save_state()
         return
-    if update_available() and u.get('notified') != u['latest']:
+    if LINK_MODE:
+        return
+    if (update_available() or gw_outdated(u['latest'])) and u.get('notified') != u['latest']:
         with lock:
             state['upd']['notified'] = u['latest']
             save_state()
-        text = (f'🆕 <b>Доступна новая версия шлюза: {h(u["latest"])}</b> (у вас {h(BOT_VERSION)})')
+        old = gw_outdated(u['latest'])
+        text = (f'🆕 <b>Доступна новая версия шлюза: {h(u["latest"])}</b> (у вас {h(BOT_VERSION)})'
+                if update_available() else f'🆕 <b>Ведомые шлюзы можно обновить до {h(u["latest"])}</b>')
+        if old:
+            text += '\nВедомые шлюзы на старой версии: ' + h(', '.join(gw_name(x) for x in old))
         if u.get('changes'):
             text += '\n\n' + h(u['changes'][:1200])
         with lock:
             owner_on = state['admins'].get(str(OWNER), {}).get('notify', {}).get('actions', True)
         if owner_on:
-            send(OWNER, text, [[btn('⬇️ Обновить', 'upd:ask'), btn('Подробнее', 'upd')]])
+            kb = [[btn('⬇️ Обновить все шлюзы', 'gw:updall')]] if gw_nodes() else \
+                [[btn('⬇️ Обновить', 'upd:ask'), btn('Подробнее', 'upd')]]
+            send(OWNER, text, kb)
 
 
 # ---------------- фоновый наблюдатель ----------------
@@ -8734,6 +9580,8 @@ def gw_session(lk, hello):
     lk.info = hello.get('info') or {}
     first = not n.get('paired')
     with lock:
+        if lk.info.get('ver'):
+            n['ver'] = lk.info['ver']
         n['paired'] = True
         n['seen'] = time.time()
         n['err'] = ''
@@ -8906,6 +9754,112 @@ def gw_route(u):
     return True
 
 
+# --- обновление ведомых шлюзов с главного ---
+gwu_rt = {'busy': False}
+GWU_WAIT = 360                    # сколько ждать, пока ведомый обновится и снова выйдет на связь
+
+
+def gw_latest():
+    return (state.get('upd') or {}).get('latest')
+
+
+def gw_outdated(latest=None):
+    latest = latest or gw_latest()
+    if not latest:
+        return []
+    return [nid for nid, n in gw_nodes().items() if n.get('ver') and vtuple(n['ver']) < vtuple(latest)]
+
+
+def gw_push_update(nid, frm):
+    """Нажать на ведомом «🔍 Проверить» и «⬇️ Обновить» от имени владельца. Так обновляются и шлюзы 2.0,
+    которые не знают особых команд. Экраны ведомого никуда не выводятся (сообщения 0 нет) — ход
+    показывает главный, а итог ведомый присылает сам после перезапуска."""
+    with links_lock:
+        lk = links.get(nid)
+    if not lk:
+        raise RuntimeError('не на связи')
+
+    def press(data):
+        lk.send({'t': 'upd', 'u': {'update_id': 0, 'callback_query': {
+            'id': '0', 'from': frm, 'data': data, 'message': {'message_id': 0, 'chat': {'id': frm['id'], 'type': 'private'}}}}})
+    press('upd:check')
+    time.sleep(20)                         # ведомый успевает узнать версию и контрольную сумму на GitHub
+    press('upd:go')
+
+
+def gw_update_run(uid, chat, mid, only=None):
+    """Ведомые по одному (ждём, пока каждый вернётся с новой версией), главный — последним."""
+    frm = {'id': OWNER, 'first_name': (state['admins'].get(str(OWNER)) or {}).get('name') or 'owner'}
+    try:
+        latest = check_update().get('latest')
+    except Exception:
+        latest = gw_latest()
+    if not latest:
+        edit(chat, mid, '🔴 Не удалось узнать последнюю версию на GitHub.', [[btn('🏢 Шлюзы', 'gw:adm')]])
+        return
+    todo = [only] if only else gw_outdated(latest)
+    res, stop = [], False
+    head = f'⬆️ <b>Обновление шлюзов до {h(latest)}</b>\n\n'
+    for i, nid in enumerate(todo, 1):
+        n = gw_nodes().get(nid) or {}
+        name = h(n.get('name') or nid)
+        old = n.get('ver') or '?'
+        if not gw_online(nid):
+            res.append(f'🔴 {name}: не на связи — пропущен')
+            continue
+        edit(chat, mid, head + '\n'.join(res + [f'⏳ {name} ({i} из {len(todo)}): {h(old)} → {h(latest)}…']))
+        try:
+            gw_push_update(nid, frm)
+        except Exception as e:
+            res.append(f'🔴 {name}: {h(str(e))}')
+            stop = True
+            break
+        t0, ver = time.time(), old
+        while time.time() - t0 < GWU_WAIT:
+            time.sleep(5)
+            ver = (gw_nodes().get(nid) or {}).get('ver') or ver
+            if vtuple(ver) >= vtuple(latest) and gw_online(nid):
+                break
+        if vtuple(ver) >= vtuple(latest):
+            res.append(f'✅ {name}: {h(old)} → {h(ver)}')
+            add_event(f'Шлюз {n.get("name")} обновлён: {old} → {ver}')
+        else:
+            res.append(f'⚠️ {name}: за {GWU_WAIT // 60} минут не обновился (сейчас {h(ver)}). '
+                       'Остальные шлюзы не трогаю — посмотрите сообщение от этого шлюза.')
+            stop = True
+            break
+    if not res:
+        res.append('Все ведомые шлюзы уже на последней версии.')
+    if not only and not stop and update_available():
+        edit(chat, mid, head + '\n'.join(res + ['', '⏳ Теперь главный: бот перезапустится и пришлёт результат.']))
+        try:
+            start_self_update(chat)
+            add_event(f'{admin_name(uid)}: обновление всех шлюзов до {latest}')
+            return
+        except Exception as e:
+            res.append(f'🔴 Главный: {h(str(e))[:300]}')
+    edit(chat, mid, head + '\n'.join(res), [[btn('🏢 Шлюзы', 'gw:adm'), btn('🏠 Меню', 'menu')]])
+
+
+def gw_update_start(uid, chat, mid, only=None):
+    if gwu_rt['busy']:
+        return scr_gw_adm(uid, '⏳ Обновление шлюзов уже идёт.')
+    gwu_rt['busy'] = True
+
+    def job():
+        try:
+            gw_update_run(uid, chat, mid, only)
+        except Exception:
+            log('обновление шлюзов:', traceback.format_exc())
+            edit(chat, mid, '🔴 Обновление шлюзов прервалось с ошибкой, подробности в журнале бота.',
+                 [[btn('🏢 Шлюзы', 'gw:adm')]])
+        finally:
+            gwu_rt['busy'] = False
+    threading.Thread(target=job, daemon=True).start()
+    edit(chat, mid, '⏳ Начинаю обновление шлюзов…')
+    return None
+
+
 # --- экраны главного ---
 def scr_gws(uid, note=''):
     if LINK_MODE:                         # сюда ведомый не попадает: «gws» обрабатывает главный
@@ -8932,12 +9886,20 @@ def scr_gw_adm(uid, note=''):
              'их собственные боты молчат.', '',
              f'👑 <b>{h(GW_NAME)}</b> — главный, {h(platform.node())}']
     kb = []
+    latest = gw_latest()
+    old = gw_outdated(latest)
+    lines[-1] += f' · {h(BOT_VERSION)}' + (' ⬆️' if update_available() else '')
     for nid, n in gw_nodes().items():
         on = gw_online(nid)
         st = ('🟢 на связи' if on else ('🔴 не на связи' if n.get('paired') else '⏳ ждёт кода'))
-        lines.append(f'{"🟢" if on else "🔴"} <b>{h(n["name"])}</b> — {st} · <code>{h(n["host"])}:{n["port"]}</code>')
+        ver = f' · {h(n["ver"])}' + (' ⬆️' if nid in old else '') if n.get('ver') else ''
+        lines.append(f'{"🟢" if on else "🔴"} <b>{h(n["name"])}</b> — {st}{ver} · <code>{h(n["host"])}:{n["port"]}</code>')
         kb.append([btn(f'{"🟢" if on else "🔴"} {n["name"]}'[:40], f'gw:n:{nid}')])
     lines += ['', 'Доступ админов к шлюзам: 👥 Админы → 🏢 у каждого админа.']
+    if old or update_available():
+        lines += ['', f'⬆️ Есть версия {h(latest)}: обновится ведомых — {len(old)}' +
+                  (', затем главный.' if update_available() else '.')]
+        kb.append([btn(f'⬆️ Обновить все шлюзы до {latest}', 'gw:updall')])
     if note:
         lines += ['', note]
     kb.append([btn('➕ Подключить шлюз', 'gw:new')])
@@ -8971,6 +9933,8 @@ def scr_gw_node(uid, nid, note=''):
         lines += ['', note]
     kb = [[btn('✏️ Переименовать', f'gw:ren:{nid}'), btn('🌐 Адрес', f'gw:addr:{nid}')],
           [btn('🔑 Код подключения', f'gw:code:{nid}')]]
+    if nid in gw_outdated() and lk:
+        kb.insert(0, [btn(f'⬆️ Обновить до {gw_latest()}', f'gw:upd:{nid}')])
     if 'IDENTIFICATION HAS CHANGED' in (n.get('err') or '') or 'Host key verification' in (n.get('err') or ''):
         kb.append([btn('🔁 Принять новый ключ сервера', f'gw:hk:{nid}')])
     kb += [[btn('🔌 Отключить шлюз', f'gw:del:{nid}')], [btn('⬅️ Шлюзы', 'gw:adm'), btn('🏠 Меню', 'menu')]]
@@ -9089,6 +10053,17 @@ def handle_gw(uid, data, chat, mid):
                 [[btn('✖️ Отмена', 'gw:solo')]])
     if act == 'adm':
         return scr_gw_adm(uid)
+    if act == 'updall':
+        old = gw_outdated()
+        return (f'⬆️ <b>Обновить все шлюзы до {h(gw_latest() or "?")}?</b>\n\n'
+                + (f'Ведомые ({len(old)}): ' + h(', '.join(gw_name(x) for x in old)) + ' — по одному: следующий начнёт '
+                   'обновляться, только когда предыдущий вернётся на связь с новой версией.\n' if old else '')
+                + ('Главный — последним.\n' if update_available() else '')
+                + '\nVPN и WireGuard при этом не прерываются, перезапускаются только боты. Если шлюз не обновится '
+                'за 6 минут, остальные трогать не буду.',
+                [[btn('✅ Обновить', 'gw:updall!'), btn('✖️ Отмена', 'gw:adm')]])
+    if act == 'updall!':
+        return gw_update_start(uid, chat, mid)
     if act == 'new':
         awaiting[uid] = ('gw_name', None)
         return ('➕ <b>Новый шлюз</b>\n\nКак его назвать? Например <code>Офис</code> или <code>Москва-2</code>.'
@@ -9106,6 +10081,12 @@ def handle_gw(uid, data, chat, mid):
         return (f'🌐 <b>Адрес шлюза «{h(n["name"])}»</b>\n\nСейчас: <code>{h(n["host"])}:{n["port"]}</code>.\n'
                 'Отправьте новый: <code>адрес</code> или <code>адрес:порт</code>.\n\nОтмена: /cancel',
                 [[btn('✖️ Отмена', f'gw:n:{nid}')]])
+    if act == 'upd':
+        return (f'⬆️ <b>Обновить шлюз «{h(n["name"])}» до {h(gw_latest() or "?")}?</b>\n\nСейчас у него '
+                f'{h(n.get("ver") or "?")}. Перезапустится только его бот, VPN не прервётся. Итог шлюз пришлёт сам.',
+                [[btn('✅ Обновить', f'gw:upd!:{nid}'), btn('✖️ Отмена', f'gw:n:{nid}')]])
+    if act == 'upd!':
+        return gw_update_start(uid, chat, mid, only=nid)
     if act == 'code':
         gw_send_code(chat, nid)
         return scr_gw_node(uid, nid, '🔑 Код отправлен отдельным сообщением.')
@@ -9561,6 +10542,8 @@ def startup_reports():
         report_restored()
     elif os.path.exists(UPDATE_RESULT):
         report_update_result()
+    elif os_after_boot():
+        pass
     elif not state.get('upd_pending'):
         notify('actions', f'✅ <b>Бот запущен</b> · версия {h(BOT_VERSION)}\nVPN-шлюз на связи.')
 
@@ -9606,6 +10589,8 @@ def main():
     threading.Thread(target=health_loop, daemon=True).start()
     threading.Thread(target=queue_upgrade, daemon=True).start()
     threading.Thread(target=zt_startup, daemon=True).start()
+    threading.Thread(target=maint_loop, daemon=True).start()
+    mptcp_off()
     if LINK_MODE:
         touch_alive()
         try:
