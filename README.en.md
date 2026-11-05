@@ -86,7 +86,9 @@ sudo bash install.sh
 ```
 
 The wizard asks questions — you just answer. You will need a VPN subscription link (or `vless://` links)
-and a bot token from [@BotFather](https://t.me/BotFather).
+and a bot token from [@BotFather](https://t.me/BotFather). No subscription but a VPS abroad? Choose
+"Deploy your own VLESS server": the installer sets up Xray on it, picks a camouflage site, checks it from Russia
+and connects it — without a VPN the Telegram bot cannot work from Russia.
 
 After installation, the management menu opens with `sudo vpngw-setup`.
 
@@ -168,9 +170,15 @@ much less suspicious than a big brand on a small hoster), then a fallback list. 
 Russia and applied only after you confirm; without an answer the server returns the previous one in 10 minutes.
 "🔄 Check" compares the link on the server with the one in the gateway and offers to update it if they differ.
 
-**Repair.** If the server does not work from Russia, "🛠 Repair" tries, one at a time, the Xray version (the previous
-one and earlier stable releases), camouflage sites and free ports, checking each from Russia until one works. An
-Xray version that broke the server is remembered and never installed automatically again.
+**Repair.** If the server does not work from Russia, "🛠 Repair" tries, one at a time, gateway compatibility, the
+Xray version (the previous one and earlier stable releases), new REALITY keys with the same camouflage, camouflage
+sites and free ports, checking each from Russia until one works. An Xray version that broke the server is
+remembered and never installed automatically again.
+
+**Keys and rollback.** If after an Xray update the server no longer accepts the gateway with the old parameters,
+the bot adds the compatibility setting, then tries new keys (UUID, x25519, shortId) on a timer: it checks them from
+Russia and only then confirms and updates the link in the gateway. Otherwise the server restores the old keys by
+itself and the bot rolls Xray back.
 
 ## Several gateways in one bot
 
@@ -212,20 +220,37 @@ one last.
 
 If the gateway is behind a router, forward the WireGuard UDP port (51820 by default) to it.
 
-A MikroTik is added in the bot (WireGuard → "➕ 📡 MikroTik"): the bot asks for the output of
-`/ip address print terse proplist=address,interface; /interface wireguard print terse proplist=name,listen-port`,
-picks a free port, checks the subnet and produces an `.rsc` file: tunnel only, the whole LAN, or selected addresses
-via VPN. The gateway itself and local networks are excluded to avoid loops.
+A MikroTik is added in the bot (WireGuard → "➕ 📡 MikroTik") or with
+`sudo vpngw mikrotik "Office" 192.168.88.0/24 [wan_interface]`. The bot asks for the output of a check command
+(addresses, WireGuard interfaces, default route), picks a free port, checks the subnet, finds the WAN interface and
+produces RouterOS 7.4+ commands: tunnel only, the whole LAN, or selected addresses via VPN.
+- The gateway itself and local networks are excluded (no loops); forwarded ports keep answering via the ISP;
+  tunnelled connections bypass fasttrack.
+- If the gateway or the VPN stops passing traffic (netwatch opens a real connection through the tunnel every
+  10 seconds), the tunnel route is disabled and the LAN goes direct; it switches back when things recover.
+- The commands can be run again: they first remove what they added before.
 
-## Server commands
+## Console: management without Telegram
+
+If Telegram is unreachable, manage the gateway over SSH. `sudo vpngw` with no arguments opens **the bot menu in
+the console**: the same screens and buttons, chosen by number; typed text is sent as a message to the bot. Files the
+bot would send to the chat are saved to `/root/vpngw-files/`. If Telegram is down for more than 10 minutes, the
+admins get an e-mail explaining this.
 
 | Command | What it does |
 |---|---|
-| `sudo vpngw-setup` | menu: clients, status, updates, reinstall, uninstall |
-| `vpngw status` | service status and the IP seen through the VPN |
-| `vpngw peers` | list of clients |
-| `vpngw add "Name" phone` | new client (`phone` or `pc`) |
-| `vpngw qr "Name"` | QR code in the terminal and a file in `/root/wg-clients/` |
+| `sudo vpngw` / `help` | bot menu in the console / all commands |
+| `sudo vpngw status` / `top` | service status / live panel: CPU, memory, network, connections, server |
+| `sudo vpngw diag`, `servers`, `use <server\|auto>`, `mode`, `route`, `site <host>` | same as in the bot |
+| `sudo vpngw direct on\|off` | emergency: WireGuard clients go direct, bypassing the VPN |
+| `sudo vpngw peers` / `add` / `qr` / `del` / `mikrotik` | WireGuard clients |
+| `sudo vpngw vps`, `tg test`, `tg owner <ID>`, `backup now\|list\|check <file>` | own servers, Telegram, backups |
+| `sudo vpngw update [check\|mihomo]` / `rollback` / `os` | updates with automatic rollback, Ubuntu |
+| `sudo vpngw restart <service>` / `logs <service> [N]` | bot, mihomo, wg, install, os |
+| `sudo vpngw-setup` | installer menu: the bot menu, clients, updates, rollback, reinstall, uninstall |
+
+The bot also has a live monitor (🖥 Server → 📊 Monitor, every 5 seconds). mihomo updates itself at night once a
+release is 3 days old and rolls back if the VPN gets worse.
 
 ## Files on the server
 

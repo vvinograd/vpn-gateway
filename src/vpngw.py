@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vpngw — служебная утилита VPN-шлюза (mihomo + WireGuard).
-# Используется установщиком и вручную:  vpngw peers | vpngw add ИМЯ phone|pc | vpngw qr ИМЯ | vpngw status
+# Без аргументов — меню бота прямо в консоли; vpngw help — все команды. Работает и без Telegram.
 import base64
 import json
 import os
@@ -98,7 +98,9 @@ def vless_to_proxy(link):
         if qs.get('fp'):
             p['client-fingerprint'] = qs['fp']
     if sec == 'reality':
-        p['reality-opts'] = {'public-key': qs.get('pbk', ''), 'short-id': qs.get('sid', '')}
+        # mlkem: Xray ≥ 26.9.8 без него не пускает клиента (mihomo ≥ 1.19.9 понимает), старым серверам не мешает
+        p['reality-opts'] = {'public-key': qs.get('pbk', ''), 'short-id': qs.get('sid', ''),
+                             'support-x25519mlkem768': True}
         p.setdefault('client-fingerprint', 'chrome')
     if qs.get('flow'):
         p['flow'] = qs['flow']
@@ -317,18 +319,310 @@ def cmd_status():
     print(f'{"IP через VPN":<14} {ip or "нет ответа"}')
 
 
+# ---------------- консоль: меню, команды бота, живая панель ----------------
+BOT = '/usr/local/bin/vpnbot.py'
+SOCK = '/run/vpngw/cli.sock'
+MIHOMO_CFG = '/etc/mihomo/config.yaml'
+API = 'http://127.0.0.1:9090'
+LOCAL = {}                       # команды, которые выполняет сама утилита (заполняется ниже)
+
+
+def plain(text):
+    import html
+    text = re.sub(r'<a [^>]*href="([^"]+)"[^>]*>(.*?)</a>', r'\2 (\1)', text or '')
+    return html.unescape(re.sub(r'<[^>]+>', '', text))
+
+
+def bot_events(req):
+    """Запрос к боту: через сокет запущенного бота, иначе — тот же код напрямую. Отдаёт события по одному."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(SOCK)
+        f = s.makefile('rwb')
+        f.write(json.dumps(req, ensure_ascii=False).encode() + b'\n')
+        f.flush()
+        lines = (ln.decode('utf-8', 'replace') for ln in f)
+    except OSError:
+        p = subprocess.Popen(['python3', BOT, '--cli-direct', json.dumps(req, ensure_ascii=False)],
+                             stdout=subprocess.PIPE, text=True)
+        lines = p.stdout
+    for ln in lines:
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        if ev.get('t') == 'done':
+            return
+        yield ev
+
+
+def show_screen(scr, numbered=True):
+    print(plain(scr.get('text', '')).strip())
+    btns = [b for row in scr.get('kb') or [] for b in row]
+    if numbered and btns:
+        print()
+        for i, b in enumerate(btns, 1):
+            print(f'  {i:>2}. {b["text"]}' + (f'  → {b["url"]}' if b.get('url') else ''))
+    return btns
+
+
+def bot_cmd(req):
+    """vpngw <команда бота>: промежуточные экраны — одной строкой, итоговый — целиком."""
+    last, rc = None, 1
+    for ev in bot_events(req):
+        rc = 0 if rc == 1 and ev['t'] != 'err' else rc
+        if ev['t'] == 'screen':
+            if last:
+                print('⏳ ' + plain(last['text']).strip().split('\n')[0][:150])
+            last = ev
+        elif ev['t'] == 'out':
+            print(ev['text'])
+        elif ev['t'] == 'err':
+            print(ev['text'], file=sys.stderr)
+            rc = 2
+    if last:
+        show_screen(last, numbered=False)
+    return rc
+
+
+def cmd_menu():
+    """Меню бота в консоли: те же экраны и кнопки, выбор цифрой; текст — как сообщение боту."""
+    req = {'press': 'menu'}
+    while True:
+        scr, errs = None, []
+        for ev in bot_events(req):
+            if ev['t'] == 'screen':
+                scr = ev
+                if sys.stdout.isatty():
+                    print('\033[2J\033[H', end='')
+                print('⏳ ' + plain(ev['text']).strip().split('\n')[0][:150], flush=True)
+            elif ev['t'] in ('out', 'err'):
+                errs.append(ev['text'])
+        if sys.stdout.isatty():
+            print('\033[2J\033[H', end='')
+        print(f'━━ VPN-шлюз · меню консоли ━━ (q — выход, цифра — кнопка, текст — ответ боту)\n')
+        btns = show_screen(scr) if scr else []
+        for e in errs:
+            print('\n' + e)
+        try:
+            ans = input('\n> ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans.lower() in ('q', 'й', 'exit', 'выход'):
+            return
+        if ans.isdigit() and 1 <= int(ans) <= len(btns):
+            b = btns[int(ans) - 1]
+            if b.get('data'):
+                req = {'press': b['data']}
+            else:
+                print(f'Ссылка: {b.get("url")}')
+                input('Enter — назад к меню ')
+                req = {'press': 'menu'}
+        elif ans:
+            req = {'text': ans}
+        else:
+            req = {'press': 'menu'}
+
+
+def mihomo_secret():
+    try:
+        return re.search(r'^secret:\s*(\S+)', open(MIHOMO_CFG, encoding='utf-8').read(), re.M).group(1)
+    except Exception:
+        return ''
+
+
+def mapi(path, timeout=3):
+    import urllib.request
+    req = urllib.request.Request(API + path, headers={'Authorization': 'Bearer ' + mihomo_secret()})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+SPARK = '▁▂▃▄▅▆▇█'
+
+
+def spark(vals, top=None):
+    if not vals:
+        return ''
+    top = top or max(vals) or 1
+    return ''.join(SPARK[min(int(v / top * (len(SPARK) - 1) + 0.5), len(SPARK) - 1)] for v in vals)
+
+
+def cpu_times():
+    f = open('/proc/stat').readline().split()[1:]
+    vals = list(map(int, f))
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return sum(vals), idle
+
+
+def default_iface():
+    r = sh(['ip', 'route', 'show', 'default'])
+    m = re.search(r'\bdev (\S+)', r.stdout)
+    return m.group(1) if m else None
+
+
+def iface_bytes(name):
+    for ln in open('/proc/net/dev'):
+        if ln.strip().startswith(name + ':'):
+            f = ln.split(':', 1)[1].split()
+            return int(f[0]), int(f[8])
+    return 0, 0
+
+
+def cmd_top():
+    """Живая панель: процессор, память, сеть, соединения, сервер — каждую секунду, Ctrl+C — выход."""
+    iface = default_iface() or 'eth0'
+    hist = {'cpu': [], 'rx': [], 'tx': []}
+    t0, i0 = cpu_times()
+    rx0, tx0 = iface_bytes(iface)
+    w0 = iface_bytes('wg0')
+    ts0 = time.time()
+    try:
+        while True:
+            time.sleep(1)
+            t1, i1 = cpu_times()
+            cpu = 100 * (1 - (i1 - i0) / max(t1 - t0, 1))
+            t0, i0 = t1, i1
+            now = time.time()
+            dt = max(now - ts0, 0.001)
+            ts0 = now
+            rx1, tx1 = iface_bytes(iface)
+            rx, tx = (rx1 - rx0) * 8 / dt / 1e6, (tx1 - tx0) * 8 / dt / 1e6
+            rx0, tx0 = rx1, tx1
+            w1 = iface_bytes('wg0')
+            wrx, wtx = (w1[0] - w0[0]) * 8 / dt / 1e6, (w1[1] - w0[1]) * 8 / dt / 1e6
+            w0 = w1
+            for k, v in (('cpu', cpu), ('rx', rx), ('tx', tx)):
+                hist[k] = (hist[k] + [v])[-40:]
+            mem = {}
+            for ln in open('/proc/meminfo'):
+                k, v = ln.split(':', 1)
+                mem[k] = int(v.split()[0]) // 1024
+            used = mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)
+            try:
+                conns = len(mapi('/connections').get('connections') or [])
+                cur = mapi('/proxies/PROXY').get('now', '?')
+                if cur in ('AUTO', 'PRIO'):
+                    cur = cur + ' → ' + mapi(f'/proxies/{urllib.parse.quote(cur)}').get('now', '?')
+                mh = 'работает'
+            except Exception:
+                conns, cur, mh = 0, '—', '❌ не отвечает'
+            peers = 0
+            for ln in sh(['wg', 'show', 'wg0', 'latest-handshakes']).stdout.splitlines():
+                f = ln.split()
+                if len(f) == 2 and f[1] != '0' and time.time() - int(f[1]) < 180:
+                    peers += 1
+            load = open('/proc/loadavg').read().split()[:3]
+            print('\033[2J\033[H', end='')
+            print(f'VPN-шлюз · {time.strftime("%H:%M:%S")} · Ctrl+C — выход\n')
+            print(f'Процессор  {spark(hist["cpu"], 100):<40} {cpu:5.1f}%   нагрузка {" ".join(load)}')
+            print(f'Память     {used} / {mem.get("MemTotal", 0)} МБ ({100 * used // max(mem.get("MemTotal", 1), 1)}%)')
+            top_net = max(hist['rx'] + hist['tx'] + [1])
+            print(f'Сеть ↓     {spark(hist["rx"], top_net):<40} {rx:6.1f} Мбит/с  ({iface})')
+            print(f'Сеть ↑     {spark(hist["tx"], top_net):<40} {tx:6.1f} Мбит/с')
+            print(f'WireGuard  ↓ {wrx:.1f} ↑ {wtx:.1f} Мбит/с · на связи клиентов: {peers}')
+            print(f'mihomo     {mh} · соединений: {conns}')
+            print(f'Сервер     {cur}')
+    except KeyboardInterrupt:
+        print()
+
+
+def cmd_del(key):
+    with BotPaused():
+        st = load_state()
+        w = wg_state(st)
+        pub = find_peer(w, key)
+        name = w['peers'][pub]['name']
+        w['peers'].pop(pub)
+        save_state(st)
+        write_wg(w)
+    for ext in ('.conf', '.rsc'):     # .rsc — от прежних версий
+        p = os.path.join(OUT, translit(name) + ext)
+        if os.path.exists(p):
+            os.remove(p)
+    print(f'Клиент «{name}» удалён.')
+
+
+def cmd_restart(what):
+    units = {'mihomo': ['mihomo'], 'bot': ['vpnbot'], 'wg': ['wg-quick@wg0'],
+             'all': ['mihomo', 'wg-quick@wg0', 'vpnbot']}.get(what)
+    if not units:
+        sys.exit('vpngw restart <mihomo|bot|wg|all>')
+    for u in units:
+        r = sh(['systemctl', 'restart', u])
+        print(f'{u}: {"перезапущен" if r.returncode == 0 else "ошибка: " + r.stderr.strip()}')
+
+
+def cmd_logs(what, n='60'):
+    files = {'install': '/var/log/vpngw-install.log', 'os': '/var/log/vpngw-os-upgrade.log'}
+    units = {'bot': 'vpnbot', 'mihomo': 'mihomo', 'wg': 'wg-quick@wg0', 'zapret': 'vpngw-zapret'}
+    if what in files:
+        subprocess.run(['tail', '-n', str(n), files[what]])
+    elif what in units:
+        subprocess.run(['journalctl', '-u', units[what], '-n', str(n), '--no-pager'])
+    else:
+        sys.exit('vpngw logs <bot|mihomo|wg|zapret|install|os> [строк]')
+
+
+def cmd_rollback():
+    if sys.stdin.isatty() and input('Вернуть версию до последнего обновления? [y/N] ').strip().lower() not in ('y', 'д', 'да', 'yes'):
+        return
+    subprocess.run(['bash', '/usr/local/lib/vpngw/install.sh', '--rollback', 'вручную из консоли'])
+
+
+LOCAL.update({
+    'menu': (cmd_menu, (0, 0)), 'top': (cmd_top, (0, 0)), 'del': (cmd_del, (1, 1)),
+    'restart': (cmd_restart, (1, 1)), 'logs': (cmd_logs, (1, 2)),
+    'rollback': (cmd_rollback, (0, 0)),
+})
+
+
+HELP_LOCAL = """Управление VPN-шлюзом из консоли (нужен sudo). Без команды — меню.
+  vpngw menu | status | top | peers | add "Имя" phone|pc | qr "Имя" | del "Имя"
+  vpngw restart <служба> | logs <служба> [N] | rollback
+Полная справка — vpngw help (её даёт бот; если он не отвечает, работают команды выше)."""
+
+
 def main():
     a = sys.argv[1:]
-    cmds = {
-        'analyze': (cmd_analyze, 1), 'links2yaml': (cmd_links2yaml, 2), 'gen-base': (cmd_gen_base, 2),
-        'add': (cmd_add, 2), 'peers': (cmd_peers, 0), 'qr': (cmd_qr, 1),
-        'status': (cmd_status, 0),
-    }
-    if not a or a[0] not in cmds or len(a) - 1 != cmds[a[0]][1]:
-        print('Использование:\n  vpngw status            — состояние шлюза\n  vpngw peers             — клиенты WireGuard\n'
-              '  vpngw add "Имя" phone   — новый клиент (phone или pc)\n  vpngw qr "Имя"|номер    — QR-код и файл клиента')
-        sys.exit(1)
-    cmds[a[0]][0](*a[1:])
+    service = {'analyze': (cmd_analyze, (1, 1)), 'links2yaml': (cmd_links2yaml, (2, 2)),
+               'gen-base': (cmd_gen_base, (2, 2))}
+    local = dict(LOCAL, add=(cmd_add, (2, 2)), peers=(cmd_peers, (0, 0)), qr=(cmd_qr, (1, 1)),
+                 status=(cmd_status, (0, 0)))
+    if a and a[0] in service:
+        fn, (lo, hi) = service[a[0]]
+        if not lo <= len(a) - 1 <= hi:
+            sys.exit('неверные аргументы')
+        return fn(*a[1:])
+    if os.geteuid() != 0:
+        sys.exit('Нужны права root: sudo vpngw ' + ' '.join(a))
+    if not a:
+        if sys.stdin.isatty():
+            return cmd_menu()
+        a = ['help']
+    if a[0] in ('-h', '--help'):
+        a = ['help']
+    if a[0] in local:
+        fn, (lo, hi) = local[a[0]]
+        if not lo <= len(a) - 1 <= hi:
+            print(HELP_LOCAL)
+            sys.exit(1)
+        return fn(*a[1:])
+    if a[0] == 'help':
+        if bot_cmd({'argv': a}) == 1:          # бот не ответил вовсе
+            print(HELP_LOCAL)
+        return
+    req = {'argv': a}
+    if a[:2] == ['backup', 'check'] and sys.stdin.isatty():
+        import getpass
+        req['pw'] = getpass.getpass('Пароль копии (Enter — пароль автокопий этого шлюза): ')
+    rc = bot_cmd(req)
+    if rc == 1:
+        sys.exit('Бот не ответил (ни через сокет, ни напрямую). Посмотрите: vpngw logs bot')
+    sys.exit(rc and 1)
 
 
 if __name__ == '__main__':

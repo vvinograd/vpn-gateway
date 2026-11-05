@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.5'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.6'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 
@@ -288,6 +288,13 @@ def add_event(text):
 
 # ---------------- Telegram ----------------
 def tg(method, _timeout=20, **params):
+    if params.get('chat_id') == CLI_CHAT or params.get('callback_query_id') == 'cli':
+        return cli_tg(method, params)     # консоль на сервере: экран — в терминал
+    if CLI_NO_TG:
+        return None                       # консоль без бота: Telegram может быть недоступен — не ждём
+    if getattr(CTX, 'cli_bg', False) and method in TG_RETRY:
+        threading.Thread(target=tg, args=(method, _timeout), kwargs=params, daemon=True).start()
+        return None                       # уведомления из консоли — в фоне, чтобы консоль не ждала Telegram
     if LINK_MODE:                         # ведомый шлюз: в Telegram ходит главный бот
         if method in ('getUpdates', 'setMyCommands', 'getMe'):
             return None
@@ -309,19 +316,84 @@ def tg(method, _timeout=20, **params):
                 if not re.search(r'message is not modified|message to (delete|edit) not found|'
                                  r"message can't be (deleted|edited)", body):
                     log('Telegram', method, e.code, body[:200])
+                if method == 'getUpdates':
+                    tg_rt['err'] = f'HTTP {e.code} {body[:120]}'
                 return None
             except Exception as e:
                 last = e
         if pause:
             time.sleep(pause)
     log('Telegram недоступен:', method, last)
+    if method == 'getUpdates':
+        tg_rt['err'] = str(last)[:160]
     return None
 
 
 TG_RETRY = {'sendMessage', 'sendDocument', 'sendPhoto'}
+TG_DOWN_MAIL = 600                  # столько Telegram молчит — письмо на почту админам
+tg_rt = {'down': None, 'mailed': False, 'err': ''}
+
+
+def tg_down_text(since):
+    lines = [f'Бот «{GW_NAME}» не может связаться с Telegram с {time.strftime("%H:%M", time.localtime(since))} '
+             f'({fmt_dur(time.time() - since)}). Ошибка: {tg_rt.get("err") or "нет ответа"}.', '']
+    try:
+        now = api(f'/proxies/{SELECT_GROUP}', timeout=4)['now']
+        if now == AUTO_GROUP:
+            now = 'автовыбор → ' + api(f'/proxies/{AUTO_GROUP}', timeout=4)['now']
+        lines.append(f'mihomo работает, сервер: {now}.')
+    except Exception:
+        lines.append('mihomo не отвечает — VPN, скорее всего, не работает.')
+    lines += ['', 'Управление без Telegram — по SSH на сервер шлюза:',
+              '  sudo vpngw            — меню бота прямо в консоли',
+              '  sudo vpngw tg test    — проверить связь с Telegram (через VPN и напрямую)',
+              '  sudo vpngw diag       — самодиагностика',
+              '  sudo vpngw direct on  — аварийно: клиенты WireGuard напрямую, без VPN',
+              '', 'Когда связь вернётся, бот напишет в Telegram.']
+    return '\n'.join(lines)
+
+
+def tg_watch(ok):
+    """Вызывается после каждого getUpdates: долго нет связи с Telegram — письмо, связь вернулась — отбой."""
+    now = time.time()
+    if not ok:
+        tg_rt['down'] = tg_rt['down'] or now
+        if not tg_rt['mailed'] and now - tg_rt['down'] >= TG_DOWN_MAIL:
+            tg_rt['mailed'] = True
+            add_event('Telegram недоступен больше 10 минут')
+            e = email_cfg()
+            if e['enabled'] and e['to'] and e['smtp'].get('host'):
+                body = tg_down_text(tg_rt['down'])
+                threading.Thread(target=mail_safe, args=(f'{GW_NAME}: нет связи с Telegram', body),
+                                 daemon=True).start()
+        return
+    if tg_rt['down']:
+        since, mailed = tg_rt['down'], tg_rt['mailed']
+        tg_rt.update(down=None, mailed=False, err='')
+        if now - since >= TG_DOWN_MAIL:
+            dur = fmt_dur(now - since)
+            add_event(f'Связь с Telegram восстановлена (не было {dur})')
+            notify('dead', f'🟢 <b>Связь с Telegram восстановлена</b>\nНе было {dur}, '
+                           f'с {time.strftime("%H:%M", time.localtime(since))}.' +
+                   ('\nВо время сбоя отправлено письмо на почту.' if mailed else ''))
+
+
+def mail_safe(subject, body):
+    try:
+        send_mail(subject, body + f'\n\nВремя: {time.strftime("%d.%m.%Y %H:%M:%S")}')
+    except Exception as ex:
+        log('ошибка почты:', ex)
+        e = email_cfg()
+        with lock:
+            e['last_error'] = f'{time.strftime("%d.%m %H:%M")} {ex}'
+            save_state()
 
 
 def tg_file(method, chat, field, filename, content, caption=None, kb=None, ttl_kind='files'):
+    if chat == CLI_CHAT:
+        return cli_file(filename, content, caption, kb)
+    if CLI_NO_TG:
+        return None
     if LINK_MODE:
         res = link_call({'t': 'file', 'm': method, 'chat': chat, 'field': field, 'filename': filename,
                          'b64': base64.b64encode(content).decode(), 'caption': caption, 'kb': kb}, 150)
@@ -422,6 +494,8 @@ def clean_ttl(chat, kind):
 
 def track(chat, mid, ttl=None):
     """Запомнить сообщение бота (для «Очистить чат») и, если нужно, когда его удалить."""
+    if chat == CLI_CHAT:
+        return
     now = time.time()
     with ui_lock:
         msgs = ui['msgs'].setdefault(str(chat), {})
@@ -3347,7 +3421,9 @@ def scr_email(uid, note=''):
         lines.append('⚠️ Письма не уходят: ' + ('настройте отправителя' if not cfg.get('host') else 'добавьте получателя'))
     if e.get('last_error'):
         lines.append(f'⚠️ Последняя ошибка: <code>{h(e["last_error"][:200])}</code>')
-    lines += ['', 'Ниже — какие события отправлять на почту.']
+    lines += ['', 'Ниже — какие события отправлять на почту.',
+              '<i>Если Telegram недоступен больше 10 минут, письмо придёт в любом случае — '
+              'с подсказкой, как управлять шлюзом из консоли.</i>']
     if note:
         lines += ['', note]
     kb = [[btn('⛔ Выключить почту' if e['enabled'] else '✅ Включить почту', 'em:on')],
@@ -3541,11 +3617,119 @@ def scr_srv(uid, note=''):
     if note:
         lines += ['', note]
     lines.append(f'<i>Обновлено {time.strftime("%H:%M:%S")}</i>')
-    kb = [[btn('🔄 Обновить', 'srv'), btn('🧹 Освободить место', 'srvclean')]]
+    kb = [[btn('📊 Монитор', 'mon'), btn('🔄 Обновить', 'srv')], [btn('🧹 Освободить место', 'srvclean')]]
     if is_owner(uid):
         kb.append([btn('🚨 Пороги уведомлений', 'srvthr')])
     kb.append([btn('🏠 Меню', 'menu')])
     return '\n'.join(lines), kb
+
+
+# ---------------- живой монитор: процессор, память, сеть раз в 5 секунд ----------------
+MON_PERIOD = 5
+MON_LEN = 180                      # потом «▶️ Ещё»: не дёргать Telegram, если экран забыли открытым
+SPARK = '▁▂▃▄▅▆▇█'
+mon_rt = {}                        # chat → {'tok', 'mid'}
+
+
+def spark(vals, top=None):
+    top = top or max(vals or [0]) or 1
+    return ''.join(SPARK[min(int(v / top * (len(SPARK) - 1) + 0.5), len(SPARK) - 1)] for v in vals)
+
+
+def mon_sample():
+    t, i = cpu_times()
+    return {'ts': time.time(), 'cpu': (t, i), 'net': net_bytes()}
+
+
+def mon_iface():
+    try:
+        return run(['ip', 'route', 'show', 'default'], 5).stdout.split('dev ')[1].split()[0]
+    except Exception:
+        return None
+
+
+def mon_frame(m, left):
+    """Один кадр монитора. m — {'prev', 'hist', 'iface'}; копит историю для графиков."""
+    cur = mon_sample()
+    prev = m['prev']
+    dt = max(cur['ts'] - prev['ts'], 0.5)
+    cpu = 100.0 * (1 - (cur['cpu'][1] - prev['cpu'][1]) / max(cur['cpu'][0] - prev['cpu'][0], 1))
+
+    def rate(dev):
+        a, b = prev['net'].get(dev), cur['net'].get(dev)
+        if not a or not b:
+            return 0.0, 0.0
+        return (b[0] - a[0]) * 8 / dt / 1e6, (b[1] - a[1]) * 8 / dt / 1e6
+    rx, tx = rate(m['iface'])
+    wrx, wtx = rate(WG_IF)
+    m['prev'] = cur
+    hs = m['hist']
+    for k, v in (('cpu', cpu), ('rx', rx), ('tx', tx)):
+        hs[k] = (hs.get(k, []) + [v])[-12:]
+    mem = mem_info()
+    mp = 100 * mem['used'] / max(mem['total'], 1)
+    top = max(hs['rx'] + hs['tx'] + [1])
+    try:
+        conns = len(api('/connections').get('connections') or [])
+        now = api(f'/proxies/{SELECT_GROUP}')['now']
+        if now == AUTO_GROUP:
+            now = f'автовыбор → {api(f"/proxies/{AUTO_GROUP}")["now"]}'
+        mh = f'соединений: {conns} · сервер: {h(now)}'
+    except Exception:
+        mh = '🔴 mihomo не отвечает'
+    peers = 0
+    for ln in run(['wg', 'show', WG_IF, 'latest-handshakes'], 5).stdout.splitlines():
+        f = ln.split()
+        if len(f) == 2 and f[1].isdigit() and f[1] != '0' and time.time() - int(f[1]) < 180:
+            peers += 1
+    la = open('/proc/loadavg').read().split()[0]
+    gb = lambda b: f'{b / GB:.1f}'
+    lines = [f'📊 <b>Монитор · {h(platform.node())}</b>', '', '<code>',
+             f'ЦП  {spark(hs["cpu"], 100):<12} {cpu:4.0f}%',
+             f'ОЗУ {bar(mp / 100, 12)} {mp:4.0f}%  {gb(mem["used"])}/{gb(mem["total"])} ГБ',
+             f'↓   {spark(hs["rx"], top):<12} {rx:6.1f} Мбит/с',
+             f'↑   {spark(hs["tx"], top):<12} {tx:6.1f} Мбит/с',
+             '</code>', f'🔐 WireGuard ↓ {wrx:.1f} ↑ {wtx:.1f} Мбит/с · на связи: {peers}',
+             f'🧠 Нагрузка {la} · ядер {os.cpu_count() or 1} · сеть {h(m["iface"] or "?")}',
+             f'🛡 {mh}', '']
+    lines.append(f'<i>{time.strftime("%H:%M:%S")} · обновляется раз в {MON_PERIOD} с'
+                 + (f', ещё {int(left) // 60}:{int(left) % 60:02d}</i>' if left > 0 else ' — остановлено</i>'))
+    return '\n'.join(lines)
+
+
+def mon_kb(live):
+    return [[btn('⏹ Стоп', 'mon:stop') if live else btn('▶️ Ещё 3 минуты', 'mon'), btn('⬅️ Сервер', 'srv')],
+            [btn('🏠 Меню', 'menu')]]
+
+
+def mon_start(chat, mid):
+    """Первый кадр сразу (замер за 1 с), дальше — фоновый поток правит то же сообщение."""
+    m = {'prev': mon_sample(), 'hist': {}, 'iface': mon_iface()}
+    time.sleep(1)
+    if chat == CLI_CHAT:                          # в консоли для живой панели есть «vpngw top»
+        return mon_frame(m, 0), mon_kb(False)
+    tok = os.urandom(4).hex()
+    end = time.time() + MON_LEN
+    mon_rt[chat] = {'tok': tok, 'mid': mid}
+
+    def loop():
+        while True:
+            time.sleep(MON_PERIOD)
+            if (mon_rt.get(chat) or {}).get('tok') != tok:
+                return                            # нажали другую кнопку или открыли монитор заново
+            left = end - time.time()
+            try:
+                if left <= 0:
+                    mon_rt.pop(chat, None)
+                    edit(chat, mid, mon_frame(m, 0), mon_kb(False))
+                    return
+                edit(chat, mid, mon_frame(m, left), mon_kb(True))
+            except Exception as e:
+                log('монитор:', e)
+                mon_rt.pop(chat, None)
+                return
+    threading.Thread(target=loop, daemon=True).start()
+    return mon_frame(m, MON_LEN), mon_kb(True)
 
 
 def scr_srv_thr(uid, note=''):
@@ -5003,6 +5187,11 @@ def vs_deploy(uid, chat, mid, ctx):
             x['last'] = dict(chk, ts=time.time(), xray='active')
             save_state()
         pr.set('vless', '✅', f'{chk["ms"]} мс, ' + gl_text(chk.get('gl')))
+        if ctx.get('no_attach'):              # установщик шлюза: ссылку он сам впишет в подписку
+            ctx['link'] = link
+            pr.set('add', '✅', 'ссылку подключит установщик')
+            add_event(f'Установщик развернул VLESS на {host}')
+            return pr.text('🎉 <b>Сервер готов.</b>'), []
         # 8. подписка
         pr.set('add', '⏳')
         try:
@@ -5033,6 +5222,44 @@ def vs_deploy(uid, chat, mid, ctx):
         if auth.get('key') and os.path.exists(auth['key']):
             os.remove(auth['key'])
         auth.clear()
+
+
+def vs_deploy_cli():
+    """Установщик шлюза: развернуть свой VLESS-сервер, пока VPN ещё нет. Параметры — JSON в stdin
+    {host, port, user, pw}. Ход — в терминал (stderr), итог — «@@LINK ссылка» или «@@ERROR текст» в stdout."""
+    global CLI_NO_TG
+    CLI_NO_TG = True
+    load_state()
+    req = json.loads(sys.stdin.readline() or '{}')
+    host, port, user = req.get('host', '').strip(), int(req.get('port') or 22), (req.get('user') or 'root').strip()
+    last = ['']
+    tty = sys.stderr.isatty()
+
+    def writer(ev):
+        if ev.get('t') != 'screen':
+            return
+        txt = plain(ev.get('text', '')).strip()
+        if txt and txt != last[0]:
+            last[0] = txt
+            sys.stderr.write(('\033[2J\033[H' if tty else '\n') + txt + '\n')
+            sys.stderr.flush()
+    cli_sink['w'] = writer
+    try:
+        hk = ssh_scan(host, port)
+    except Exception as e:
+        print('@@ERROR', f'сервер {host}:{port} не отвечает по SSH: {plain(str(e))}')
+        return 1
+    sys.stderr.write('Ключ сервера ' + ', '.join(' '.join(ssh_fp(x)) for x in hk) + '\n')
+    ctx = {'host': host, 'port': port, 'user': user, 'hk': hk, 'no_attach': True,
+           'auth': {'pw': req['pw']} if req.get('pw') else None}
+    text, _ = vs_deploy(OWNER, CLI_CHAT, 1, ctx)
+    sys.stderr.write(('\033[2J\033[H' if tty else '\n') + plain(text).strip() + '\n')
+    if ctx.get('link'):
+        print('@@LINK', ctx['link'])
+        return 0
+    err = [ln for ln in plain(text).splitlines() if ln.strip()]
+    print('@@ERROR', ' '.join(err[-2:])[:400] if err else 'не удалось')
+    return 1
 
 
 def fmt_ago(ts):
@@ -5740,7 +5967,9 @@ def bk_manifest():
             'ep_ip': e.get('ip', ''), 'wg_port': wg_port(), 'wg_net': WG_NET,
             'peers': len(w['peers']), 'subs': len(state.get('subs') or []),
             'vps': len(state.get('vps') or []), 'admins': len(state['admins']),
-            'email': bool(email_cfg()['to']), 'owner': OWNER}
+            'email': bool(email_cfg()['to']), 'owner': OWNER,
+            'vps_list': [x.get('name') or x.get('host') for x in (state.get('vps') or {}).values()],
+            'nodes': [n.get('name') for n in (state.get('nodes') or {}).values()]}
 
 
 def bk_make(pw, why='вручную'):
@@ -6378,7 +6607,9 @@ def scr_clean(uid, note=''):
 # ---------------- MikroTik: проверка роутера, порт, что пускать в VPN ----------------
 
 MT_CHECK_CMD = ('/ip address print terse proplist=address,interface; '
-                '/interface wireguard print terse proplist=name,listen-port')
+                '/interface wireguard print terse proplist=name,listen-port; '
+                '/ip route print terse proplist=dst-address,routing-table,immediate-gw where dst-address=0.0.0.0/0')
+MT_PROBE = '1.0.0.1'                 # netwatch проверяет туннель настоящим соединением к этому адресу
 MT_PORT = 13240
 MT_IFACE = 'wg-vpn-gw'
 PRIVATE = [ipaddress.ip_network(x) for x in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
@@ -6388,8 +6619,15 @@ NET_CANDIDATES = ['10.10.10', '10.10.20', '10.20.30', '10.66.66', '10.99.10', '1
 
 def mt_parse(text):
     """Разбор вывода MT_CHECK_CMD (терс или обычный вид). Ключей и паролей там нет."""
-    addrs, ports = [], {}
+    addrs, ports, wan = [], {}, None
     for line in (text or '').splitlines():
+        g = re.search(r'immediate-gw=("([^"]*)"|\S+)', line)
+        if 'dst-address=0.0.0.0/0' in line and g and not re.search(r'routing-table=(?!main\b)', line):
+            v = g.group(2) or g.group(1)
+            iface = v.split('%', 1)[1] if '%' in v else (v if not re.match(r'^[\d.]+$', v) else None)
+            if iface and not wan and not iface.startswith(MT_IFACE):
+                wan = iface
+            continue
         m = re.search(r'(?<![\w-])address=(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})', line)
         if m:
             i = re.search(r'(?<![\w-])interface=("([^"]*)"|\S+)', line)
@@ -6405,10 +6643,11 @@ def mt_parse(text):
     if not addrs:      # вставили обычную таблицу (print без terse): берём все адреса вида x.x.x.x/nn
         for m in re.finditer(r'(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})(?![\d.])', text or ''):
             try:
-                addrs.append((ipaddress.ip_interface(m.group(1)), ''))
+                if m.group(1) != '0.0.0.0/0':
+                    addrs.append((ipaddress.ip_interface(m.group(1)), ''))
             except ValueError:
                 pass
-    return {'addrs': addrs, 'ports': ports}
+    return {'addrs': addrs, 'ports': ports, 'wan': wan}
 
 
 def gw_ext_port():
@@ -6445,7 +6684,7 @@ def mt_analyze(text, wg_net=None, gw_ip=None):
         iface = f'{MT_IFACE}{k}'
         k += 1
     return {'addrs': [(str(a), i) for a, i in info['addrs']], 'ports': info['ports'], 'conflicts': conflicts,
-            'local': local, 'lans': lans, 'iface': iface, 'had_iface': MT_IFACE in names}
+            'local': local, 'lans': lans, 'iface': iface, 'had_iface': MT_IFACE in names, 'wan': info['wan']}
 
 
 def resolve4(host):
@@ -6479,10 +6718,11 @@ def mt_defaults(name, pub=None):
         mt = dict(p.get('mt') or {})
         ctx = {'name': p['name'], 'pub': pub, 'port': mt.get('port', MT_PORT), 'route': mt.get('route', 'none'),
                'nets': list(mt.get('nets', [])), 'dst': list(mt.get('dst', [])), 'local': mt.get('local', False),
-               'via': mt.get('via'), 'iface': mt.get('iface', MT_IFACE), 'gw_ip': mt.get('gw_ip') or lan_ip()}
+               'via': mt.get('via'), 'iface': mt.get('iface', MT_IFACE), 'gw_ip': mt.get('gw_ip') or lan_ip(),
+               'wan': mt.get('wan')}
     else:
         ctx = {'name': name, 'pub': None, 'port': MT_PORT, 'route': 'none', 'nets': [], 'dst': [], 'local': False,
-               'via': None, 'iface': MT_IFACE, 'gw_ip': lan_ip()}
+               'via': None, 'iface': MT_IFACE, 'gw_ip': lan_ip(), 'wan': None}
     ctx.update(raw='', info=None, step='paste')
     return ctx
 
@@ -6491,6 +6731,8 @@ def mt_apply_info(ctx):
     """Применить результаты проверки: порт, имя интерфейса, «в той же сети», подсеть по умолчанию."""
     a = mt_analyze(ctx['raw'], gw_ip=ctx['gw_ip'])
     ctx['info'] = a
+    if a.get('wan'):
+        ctx['wan'] = a['wan']
     if not ctx.get('pub'):
         ctx['iface'] = a['iface']
     used = {pt for pt, n in a['ports'].items() if n != ctx['iface']}   # свой же интерфейс (при правке) не считаем
@@ -6529,8 +6771,15 @@ def mt_warnings(ctx):
             w.append(f'🔴 Сеть {n} пересекается с туннелем {tunnel}.')
     if ctx['route'] == 'lan' and ctx['local']:
         w.append(f'⚠️ Весь интернет сети {", ".join(ctx["nets"]) or "?"} пойдёт через шлюз Ubuntu. Сам шлюз '
-                 f'(<code>{h(ctx["gw_ip"])}</code>) и локальные адреса в правилах исключены — петли не будет. '
-                 'Если туннель упадёт, трафик автоматически пойдёт напрямую.')
+                 f'(<code>{h(ctx["gw_ip"])}</code>) и локальные адреса в правилах исключены — петли не будет.')
+    if ctx['route'] in ('lan', 'dst'):
+        w.append('🛟 Если шлюз или VPN перестанут пропускать трафик, роутер сам переключит сеть напрямую '
+                 '(проверка соединением раз в 10 с), а когда всё оживёт — обратно.')
+    if ctx['route'] == 'lan':
+        w.append(('🚪 Проброшенные снаружи порты отвечают как раньше, через провайдера (внешний интерфейс '
+                  f'<b>{h(ctx["wan"])}</b>).') if ctx.get('wan') else
+                 '⚠️ Внешний интерфейс роутера не определён — для проброшенных портов используется список '
+                 'интерфейсов <b>WAN</b>. Если его на роутере нет, проверьте роутер (вывод команды покажет интерфейс).')
     if ctx['route'] == 'lan' and not ctx['nets']:
         w.append('🔴 Не выбрана сеть, которую пускать в VPN.')
     if ctx['route'] == 'dst' and not ctx['dst']:
@@ -6619,7 +6868,7 @@ def scr_mt(uid, ctx, note=''):
 
 def mt_save(uid, ctx):
     """Создать пир MikroTik (или сохранить изменения) → pub"""
-    mt = {k: ctx[k] for k in ('port', 'route', 'nets', 'dst', 'local', 'via', 'iface', 'gw_ip')}
+    mt = {k: ctx.get(k) for k in ('port', 'route', 'nets', 'dst', 'local', 'via', 'iface', 'gw_ip', 'wan')}
     if ctx.get('pub'):
         with lock:
             wg_state()['peers'][ctx['pub']]['mt'] = mt
@@ -6745,7 +6994,9 @@ def handle_mt_input(uid, chat, ctx, text, m):
 
 
 def mt_conf(p, via=None):
-    """Команды RouterOS для MikroTik-клиента: интерфейс, пир, адрес, NAT, MSS и маршрутизация по выбору."""
+    """Команды RouterOS для MikroTik-клиента. Сеть или адреса — через туннель, а если шлюз или VPN не пропускают
+    трафик (netwatch: настоящее соединение через туннель), маршрут выключается и всё идёт напрямую, потом обратно.
+    Проброшенные снаружи порты отвечают через провайдера. Скрипт можно выполнять повторно: сначала убирает своё."""
     mt = p.get('mt') or {}
     iface = mt.get('iface') or MT_IFACE
     table = 'via-vpn-gw' if iface == MT_IFACE else f'via-{iface}'
@@ -6754,8 +7005,18 @@ def mt_conf(p, via=None):
     route = mt.get('route', 'none')
     tagc = f'vpn-gateway:{iface}'          # своя метка у каждого интерфейса: удаление не заденет чужие правила
     c = f'comment="{tagc}"'
-    out = ['# Команды для MikroTik (RouterOS 7). Вставьте в New Terminal целиком, лучше в Safe Mode (Ctrl+X).',
+    srv = f'{WG_NET}.1'
+    cmark = f'{iface}-vpn'
+    lst = f'{iface}-local'
+    find = f'[find comment~"{tagc}"]'
+    out = ['# Команды для MikroTik (RouterOS 7.4+). Вставьте в New Terminal целиком, лучше в Safe Mode (Ctrl+X).',
            f'# Подключение «{p["name"]}» к VPN-шлюзу, адрес в туннеле {p["ip"]}, шлюз {host}:{port}',
+           '# Сначала убираем то, что добавляли эти команды раньше (на чистом роутере ничего не произойдёт)',
+           f'/tool netwatch remove {find}', f'/ip firewall filter remove {find}', f'/ip firewall mangle remove {find}',
+           f'/ip firewall nat remove {find}', f'/ip firewall address-list remove {find}', f'/routing rule remove {find}',
+           f'/ip route remove {find}', f'/routing table remove [find name={table}]', f'/ip address remove {find}',
+           f'/interface wireguard peers remove {find}', f'/interface wireguard remove {find}',
+           '# Туннель',
            f'/interface wireguard add name="{iface}" listen-port={lport} mtu=1420 private-key="{p["priv"]}" {c}',
            f'/interface wireguard peers add interface="{iface}" public-key="{wg_server_pub()}" '
            f'preshared-key="{p["psk"]}" endpoint-address={host} endpoint-port={port} '
@@ -6764,35 +7025,46 @@ def mt_conf(p, via=None):
            f'/ip firewall nat add chain=srcnat out-interface="{iface}" action=masquerade {c}',
            f'/ip firewall mangle add chain=forward protocol=tcp tcp-flags=syn out-interface="{iface}" '
            f'action=change-mss new-mss=clamp-to-pmtu passthrough=yes {c}',
-           f'/routing table add name={table} fib',
-           f'/ip route add dst-address=0.0.0.0/0 gateway="{iface}" routing-table={table} {c}']
+           f'/routing table add name={table} fib {c}',
+           f'/ip route add dst-address=0.0.0.0/0 gateway={srv}%{iface} routing-table={table} check-gateway=ping {c}',
+           f'/routing rule add routing-mark={table} action=lookup table={table} {c}']
     if route in ('lan', 'dst'):
-        out.append('# Мимо туннеля: сам шлюз, адрес подключения и локальные сети (защита от петли)')
+        out.append('# Мимо туннеля: локальные сети' + (' и сам шлюз' if mt.get('local') else ''))
+        out += [f'/ip firewall address-list add list={lst} address={n} {c}' for n in PRIVATE + ['100.64.0.0/10']]
+        if route == 'dst':
+            out += [f'/ip firewall address-list add list={iface}-dst address={n} {c}' for n in mt.get('dst', [])]
+        if route == 'lan':
+            wan = mt.get('wan')
+            out.append('# Соединения, пришедшие снаружи (проброшенные порты), отвечают как раньше — через провайдера')
+            out.append(f'/ip firewall mangle add chain=prerouting {f"in-interface={wan}" if wan else "in-interface-list=WAN"} '
+                       f'connection-state=new action=mark-connection new-connection-mark={iface}-wan passthrough=yes {c}')
         if mt.get('local') and mt_gw_ip(mt):
-            out.append(f'/routing rule add src-address={mt_gw_ip(mt)}/32 action=lookup-only-in-table table=main '
-                       f'comment="{tagc} сам шлюз мимо туннеля"')
-        for ip in ([host] if IP_RE.match(host) else resolve4(host)):
-            if not any(ipaddress.ip_address(ip) in n for n in PRIVATE):
-                out.append(f'/routing rule add dst-address={ip}/32 action=lookup-only-in-table table=main {c}')
-        for n in PRIVATE:
-            out.append(f'/routing rule add dst-address={n} action=lookup-only-in-table table=main {c}')
-    if route == 'lan':
-        out.append('# Через VPN: весь интернет этих сетей (если туннель упадёт — пойдёт напрямую)')
-        out += [f'/routing rule add src-address={n} action=lookup table={table} {c}' for n in mt.get('nets', [])]
-    elif route == 'dst':
-        out.append('# Через VPN: только эти адреса')
-        out += [f'/routing rule add dst-address={n} action=lookup table={table} {c}' for n in mt.get('dst', [])]
+            out.append(f'/ip firewall mangle add chain=prerouting src-address={mt_gw_ip(mt)} action=accept '
+                       f'comment="{tagc} сам шлюз напрямую"')
+        if route == 'lan':
+            out.append('# Через VPN: весь интернет этих сетей')
+            sel = [f'src-address={n} dst-address-list=!{lst} dst-address-type=!local' for n in mt.get('nets', [])]
+        else:
+            out.append('# Через VPN: только эти адреса')
+            sel = [f'dst-address-list={iface}-dst']
+        out += [f'/ip firewall mangle add chain=prerouting {x} in-interface=!{iface} connection-state=new '
+                f'connection-mark=no-mark action=mark-connection new-connection-mark={cmark} passthrough=yes {c}'
+                for x in sel]
+        out += [f'/ip firewall mangle add chain=prerouting connection-mark={cmark} in-interface=!{iface} '
+                f'action=mark-routing new-routing-mark={table} passthrough=no {c}',
+                '# fasttrack обходит mangle — соединения через туннель пропускаем до него',
+                f':do {{ /ip firewall filter add chain=forward connection-mark={cmark} action=accept {c} '
+                f'place-before=([/ip firewall filter find action=fasttrack-connection]->0) }} on-error={{}}',
+                '# Шлюз жив, но VPN завис: ping проходит, а трафик нет — проверяем настоящим соединением через туннель',
+                f'/ip route add dst-address={MT_PROBE}/32 gateway={srv}%{iface} comment="{tagc} проверка"',
+                f'/tool netwatch add host={MT_PROBE} type=tcp-conn port=443 interval=10s timeout=3s {c} '
+                f'down-script="/ip route disable [find comment=\\"{tagc}\\" and dst-address=0.0.0.0/0]" '
+                f'up-script="/ip route enable [find comment=\\"{tagc}\\" and dst-address=0.0.0.0/0]"']
     else:
-        out += ['# Трафик сам в VPN не идёт. Чтобы направить, например, всю сеть:',
-                f'# /routing rule add src-address=192.168.88.0/24 action=lookup table={table} {c}',
-                '# (в боте это делается кнопкой «⚙️ Настройки MikroTik» → «Локальная сеть»)']
-    out += [f'# Проверка: /ping {WG_NET}.1',
-            '# Убрать всё, что добавили эти команды:',
-            f'# /routing rule remove [find comment~"{tagc}"]; /ip route remove [find comment="{tagc}"]',
-            f'# /routing table remove [find name={table}]; /ip firewall mangle remove [find comment="{tagc}"]',
-            f'# /ip firewall nat remove [find comment="{tagc}"]; /ip address remove [find comment="{tagc}"]',
-            f'# /interface wireguard remove [find name="{iface}"]',
-            '']
+        out += ['# Трафик сам в VPN не идёт. Направить сеть или адреса: в боте «⚙️ Настройки MikroTik» →',
+                '# «Локальная сеть» или «Выбранные адреса», и выполнить новые команды (старые уберутся сами).']
+    out += [f'# Проверка: /ping {srv}' + (f' и /tool netwatch print where comment~"{tagc}"' if route != 'none' else ''),
+            '# Убрать всё, что добавили эти команды: первые строки этого файла (до «Туннель»).', '']
     return '\n'.join(out)
 
 
@@ -8052,11 +8324,19 @@ def handle_callback(cq):
             ('wgadd:', 'wgr:', 'swea:', 'wgxd:', 'wglc:', 'em:pv:', 'sub:', 'vsw:', 'mtw:')):
         awaiting.pop(uid, None)
     who = h(admin_name(uid))
+    if data != 'mon':
+        mon_rt.pop(chat, None)            # любая другая кнопка останавливает монитор
     try:
         if data.startswith(OWNER_ONLY) and not is_owner(uid):
             text, kb = scr_menu(uid)
         elif data in SCREENS:
             text, kb = SCREENS[data](uid)
+        elif data == 'mon':
+            text, kb = mon_start(chat, mid)
+        elif data == 'mon:stop':
+            m = {'prev': mon_sample(), 'hist': {}, 'iface': mon_iface()}
+            time.sleep(0.5)
+            text, kb = mon_frame(m, 0), mon_kb(False)
         elif data.startswith('srv:'):
             want = data.split(':')[-1]
             match = [p['name'] for p in servers() if tag(p['name']) == want]
@@ -8793,6 +9073,9 @@ def vs_xray_update(vid, tag=None, say=None):
             time.sleep(10)                # разовый сбой сети не повод записывать версию в неудачные
             chk = vless_check(link, geo=False)
         if not chk.get('ok'):
+            fixed = vs_after_update_fix(vid, vs, link, new, say)
+            if fixed:
+                return True, f'Xray {old} → {new}; {fixed}'
             xray_mark_bad(new, f'{x["host"]}: {chk.get("err") or "нет ответа из России"}')
             try:
                 rb = vs_call(vs, 'xray-rollback', timeout=300)
@@ -8808,6 +9091,40 @@ def vs_xray_update(vid, tag=None, say=None):
             except VsError as e:
                 return False, f'Xray {new} не работает из России, а откатить не удалось: {e}'
     return True, f'Xray {old} → {new}'
+
+
+def vs_after_update_fix(vid, vs, link, new, say):
+    """Новый Xray не пускает шлюз: возможно, нужны новые параметры. Сначала совместимость (minClientVer),
+    потом новые ключи на пробу (сервер сам вернёт прежние через 10 минут, если что-то пойдёт не так).
+    Удалось — ссылка в шлюзе обновлена, → текст; нет — '' (дальше откат версии)."""
+    x = vps_all()[vid]
+    say(f'Xray {new} не пускает шлюз — проверяю совместимость…')
+    try:
+        vs_call(vs, 'harden', timeout=300)
+        if vless_check(link, geo=False).get('ok'):
+            return 'понадобилась настройка совместимости — добавлена'
+    except VsError as e:
+        log('после обновления: совместимость', e)
+    say('Пробую новые ключи…')
+    c = vs_keys_cand(x)
+    if vs_trial(x, c, [], 0, (x.get('vless') or {}).get('sni')):
+        try:
+            vs_call(vs, 'sni-confirm', timeout=60)
+            vs_attach(vid, x['snip']['cur']['link'])
+            with lock:
+                x.pop('snip', None)
+                save_state()
+            return 'со старыми ключами новая версия не работала — выданы новые, ссылка в шлюзе обновлена'
+        except VsError as e:
+            log('после обновления: ключи', e)
+    try:
+        vs_call(vs, 'sni-revert', timeout=120)
+    except VsError:
+        pass
+    with lock:
+        x.pop('snip', None)
+        save_state()
+    return ''
 
 
 def vs_wait_back(x, since, timeout=VS_BACK_WAIT, say=None):
@@ -8906,6 +9223,11 @@ def vs_sni_screen(vid):
     pd = x['snip']
     c = pd['cur']
     left = max(int(SNI_TTL - (time.time() - pd['ts'])), 0)
+    if c.get('keys'):
+        text = ('🔑 <b>Заработало с новыми ключами</b>\n\nМаска и порт прежние, на сервере новые UUID и ключи '
+                f'REALITY. Из России ответ за {c.get("ms_ru") or "?"} мс.\n\nПрименить и обновить ссылку в шлюзе? '
+                f'Без ответа примерно через {max(left // 60, 1)} мин сервер сам вернёт прежние ключи.')
+        return text, [[btn('✅ Применить', f'vs:snok:{vid}')], [btn('✖️ Вернуть прежние', f'vs:snno:{vid}')]]
     text = (f'🎭 <b>Нашлась рабочая маскировка</b>\n\n<b>{h(c["dom"])}</b> — {sni_kind(c)}'
             + (f', адрес {h(c["dest"])}' if c['dest'] != c['dom'] else '')
             + (f'\n<b>Порт {c["port"]}</b> вместо прежнего' if c.get('port') else '')
@@ -8981,9 +9303,11 @@ def vs_sni_scan(x):
 
 def vs_trial(x, c, cands, tried, orig):
     """Поставить маску (и, возможно, порт) на пробу и проверить из России. True — работает, ждёт подтверждения."""
-    env = {'DOMAIN': c['dom'], 'DEST': c['dest']}
+    env = {k: v for k, v in (('DOMAIN', c.get('dom')), ('DEST', c.get('dest'))) if v}
     if c.get('port'):
         env['NEWPORT'] = c['port']
+    if c.get('keys'):
+        env['NEWKEYS'] = '1'
     try:
         d = vs_call(vs_conn(x), 'sni-try', env, timeout=180)
     except VsError as e:
@@ -8998,6 +9322,11 @@ def vs_trial(x, c, cands, tried, orig):
                      'cur': dict(c, link=link, ms_ru=chk.get('ms'))}
         save_state()
     return True
+
+
+def vs_keys_cand(x):
+    """Проба «только новые ключи»: маску, адрес сайта и порт сервер оставит свои."""
+    return {'dom': '', 'dest': '', 'ms': 0, 'same': False, 'kind': 'o', 'keys': True}
 
 
 def vs_fix(uid, vid, chat, mid):
@@ -9071,7 +9400,12 @@ def vs_fix(uid, vid, chat, mid):
             vs_call(vs, 'update', {'XRAY_VERSION': cur if cur.startswith('v') else 'v' + cur}, timeout=600)
         except VsError as e:
             log('починка: возврат версии', e)
-    # 2) маски, 3) порты
+    # 2) новые ключи при прежних маске и порте: старые могли попасть в фильтры или не подходить новой версии
+    say('Пробую новые ключи REALITY при прежней маске и порте…')
+    if vs_trial(x, vs_keys_cand(x), [], 0, (x.get('vless') or {}).get('sni')):
+        return vs_sni_screen(vid)
+    note('❌ Новые ключи: не помогли')
+    # 3) маски, 4) порты
     say('Ищу маски: соседи по сети и запасной список…')
     try:
         orig, cands, ports = vs_sni_scan(x)
@@ -9119,12 +9453,18 @@ def vs_sni_apply(uid, vid):
     vs_call(vs_conn(x), 'sni-confirm', timeout=60)
     vs_attach(vid, c['link'])
     with lock:
-        x['vless'] = dict(x.get('vless') or {}, sni=c['dom'], ts=time.time())
+        x['vless'] = dict(x.get('vless') or {}, ts=time.time())
+        if c.get('dom'):
+            x['vless']['sni'] = c['dom']
         if c.get('port'):
             x['vless']['port'] = int(c['port'])
         x.pop('snip', None)
         x['last'] = dict(x.get('last') or {}, ok=True, ms=c.get('ms_ru'), ts=time.time(), stale=False)
         save_state()
+    if c.get('keys'):
+        add_event(f'{admin_name(uid)}: {x["host"]} — новые ключи REALITY')
+        return scr_vs_one(uid, vid, '✅ На сервере новые ключи, ссылка в шлюзе обновлена — VPN мог прерваться на '
+                                    '5–10 секунд.')
     add_event(f'{admin_name(uid)}: {x["host"]} — маскировка {pd.get("orig")} → {c["dom"]}')
     return scr_vs_one(uid, vid, f'✅ Маскировка: <b>{h(c["dom"])}</b> ({sni_kind(c)})'
                                 + (f', порт {c["port"]}' if c.get('port') else '') + '. Ссылка в шлюзе обновлена — '
@@ -9269,6 +9609,10 @@ def maint_loop():
     time.sleep(90)
     while True:
         try:
+            mh_tick()
+        except Exception:
+            log('mh_tick:', traceback.format_exc())
+        try:
             os_tick()
         except Exception:
             log('os_tick:', traceback.format_exc())
@@ -9277,6 +9621,423 @@ def maint_loop():
         except Exception:
             log('vs_tick:', traceback.format_exc())
         time.sleep(30)
+
+
+# ---------------- консоль: vpngw <команда> и меню без Telegram ----------------
+# Если Telegram недоступен, шлюзом управляют с самого сервера. Консоль ходит в запущенного бота через
+# локальный сокет (только root), поэтому всё, что умеет меню бота, умеет и консоль, а состояние не
+# расходится. Если бот не запущен, vpngw выполняет то же самое сам (vpnbot.py --cli-direct).
+CLI_CHAT = 0                       # «чат» консоли: Telegram таких не выдаёт
+CLI_SOCK = '/run/vpngw/cli.sock'
+CLI_FILES = '/root/vpngw-files'    # сюда консоль кладёт файлы, которые бот отправил бы в чат (копии, конфиги)
+cli_sink = {'w': None}
+cli_lock = threading.Lock()
+cli_mid = [1000]
+
+
+def cli_emit(kind, **kw):
+    w = cli_sink['w']
+    if w:
+        try:
+            w(dict(kw, t=kind))
+        except Exception:
+            pass
+
+
+def cli_kb(kb):
+    return [[{'text': b.get('text', ''), 'data': b.get('callback_data'), 'url': b.get('url')} for b in row]
+            for row in (kb or [])]
+
+
+def cli_tg(method, params):
+    """Ответ «Telegram» для консоли: экраны уходят в терминал, остальное — молча «успешно»."""
+    if method in ('sendMessage', 'editMessageText'):
+        cli_emit('screen', text=params.get('text') or '',
+                 kb=cli_kb((params.get('reply_markup') or {}).get('inline_keyboard')))
+        if method == 'sendMessage':
+            cli_mid[0] += 1
+            return {'message_id': cli_mid[0]}
+        return {'message_id': params.get('message_id') or cli_mid[0]}
+    return True
+
+
+def cli_file(filename, content, caption=None, kb=None):
+    os.makedirs(CLI_FILES, mode=0o700, exist_ok=True)
+    path = os.path.join(CLI_FILES, os.path.basename(filename) or 'file')
+    with open(path, 'wb') as f:
+        f.write(content if isinstance(content, bytes) else content.encode())
+    os.chmod(path, 0o600)
+    cli_emit('screen', text=(caption or '') + f'\n\n📎 Файл сохранён: {path}', kb=cli_kb(kb))
+    cli_mid[0] += 1
+    return {'message_id': cli_mid[0]}
+
+
+def cli_from():
+    return {'id': OWNER, 'first_name': (state['admins'].get(str(OWNER)) or {}).get('name') or 'console'}
+
+
+def cli_press(data):
+    dispatch({'update_id': 0, 'callback_query': {
+        'id': 'cli', 'from': cli_from(), 'data': data,
+        'message': {'message_id': cli_mid[0], 'chat': {'id': CLI_CHAT, 'type': 'private'}}}})
+
+
+def cli_text(text):
+    cli_mid[0] += 1
+    dispatch({'update_id': 0, 'message': {'message_id': cli_mid[0], 'from': cli_from(), 'text': text,
+                                          'chat': {'id': CLI_CHAT, 'type': 'private'}}})
+
+
+def cli_out(text):
+    cli_emit('out', text=text)
+
+
+def cli_find_server(q):
+    names = [p['name'] for p in servers()]
+    exact = [n for n in names if n.lower() == q.lower()]
+    part = [n for n in names if q.lower() in n.lower()]
+    if exact:
+        return exact[0]
+    if len(part) == 1:
+        return part[0]
+    raise SystemExit('Нет такого сервера' if not part else 'Подходит несколько: ' + '; '.join(part))
+
+
+def cli_direct(on):
+    """Аварийно: трафик клиентов WireGuard напрямую, мимо mihomo (если VPN лёг совсем)."""
+    rules = run(['ip', 'rule', 'show'], 5).stdout
+    net = f'{WG_NET}.0/24'
+    if on:
+        if not re.search(rf'iif {re.escape(WG_IF)} lookup main', rules):
+            run(['ip', 'rule', 'add', 'iif', WG_IF, 'lookup', 'main', 'priority', '99'], 5)
+        run(['nft', 'add', 'table', 'ip', 'vpngw_direct'], 5)
+        run(['nft', 'add', 'chain', 'ip', 'vpngw_direct', 'post',
+             '{ type nat hook postrouting priority 100 ; }'], 5)
+        run(['nft', 'flush', 'chain', 'ip', 'vpngw_direct', 'post'], 5)
+        run(['nft', 'add', 'rule', 'ip', 'vpngw_direct', 'post', 'ip', 'saddr', net, 'oifname', '!=', WG_IF,
+             'masquerade'], 5)
+        with lock:
+            state['direct_mode'] = time.time()
+            save_state()
+        add_event('Консоль: аварийный режим — клиенты WireGuard напрямую, без VPN')
+        return 'Аварийный режим включён: клиенты WireGuard идут в интернет напрямую, без VPN.\n' \
+               'Выключить: vpngw direct off. Режим сбросится и при перезагрузке сервера.'
+    while re.search(rf'iif {re.escape(WG_IF)} lookup main', run(['ip', 'rule', 'show'], 5).stdout):
+        if run(['ip', 'rule', 'del', 'iif', WG_IF, 'lookup', 'main', 'priority', '99'], 5).returncode != 0:
+            break
+    run(['nft', 'delete', 'table', 'ip', 'vpngw_direct'], 5)
+    with lock:
+        state.pop('direct_mode', None)
+        save_state()
+    add_event('Консоль: аварийный режим выключен, клиенты снова через VPN')
+    return 'Аварийный режим выключен: клиенты WireGuard снова идут через VPN.'
+
+
+def cli_tg_test():
+    lines = []
+    for name, opener in (('через VPN', proxy_opener), ('напрямую', direct_opener)):
+        t0 = time.time()
+        try:
+            with opener.open(f'https://api.telegram.org/bot{TOKEN}/getMe', timeout=10) as r:
+                me = json.load(r).get('result') or {}
+            lines.append(f'✅ Telegram {name}: отвечает за {int((time.time() - t0) * 1000)} мс, бот @{me.get("username")}')
+        except urllib.error.HTTPError as e:
+            lines.append(f'⚠️ Telegram {name}: отвечает, но токен не принят (HTTP {e.code})')
+        except Exception as e:
+            lines.append(f'❌ Telegram {name}: {str(e)[:120]}')
+    return '\n'.join(lines)
+
+
+def cli_set_owner(uid):
+    """Сменить владельца бота (если прежний недоступен). Меняет ADMIN_ID в /etc/vpnbot.env."""
+    try:
+        txt = open(ENV_FILE, encoding='utf-8').read()
+    except OSError as e:
+        raise SystemExit(f'не прочитать {ENV_FILE}: {e}')
+    txt = re.sub(r'^ADMIN_ID=.*$', f'ADMIN_ID={uid}', txt, flags=re.M) if re.search(r'^ADMIN_ID=', txt, re.M) \
+        else txt.rstrip('\n') + f'\nADMIN_ID={uid}\n'
+    with open(ENV_FILE + '.tmp', 'w', encoding='utf-8') as f:
+        f.write(txt)
+    os.chmod(ENV_FILE + '.tmp', 0o600)
+    os.replace(ENV_FILE + '.tmp', ENV_FILE)
+    return (f'Владелец бота теперь {uid}. Бот перезапустится; новому владельцу нужно написать боту /start.\n'
+            'Прежний владелец остаётся админом — убрать: 👥 Админы.')
+
+
+def cli_backup_check(path, pw=''):
+    import io
+    import tarfile
+    pw = pw or bk_auto_pw()
+    try:
+        dec = openssl_enc(open(path, 'rb').read(), pw, decrypt=True)
+        with tarfile.open(fileobj=io.BytesIO(dec), mode='r:gz') as tar:
+            names = tar.getnames()
+            man = json.load(tar.extractfile('manifest.json'))
+    except Exception as e:
+        raise SystemExit(f'❌ Копию не прочитать: {e}')
+    files = [n[len('files'):] for n in names if n.startswith('files/')]
+    groups = {}
+    for p in files:
+        key = next((b for b in BK_PATHS if p == b or p.startswith(b.rstrip('/') + '/')), 'прочее')
+        groups[key] = groups.get(key, 0) + 1
+    out = [f'✅ Копия читается: {path}',
+           f'Сделана {man.get("created_text")} на {man.get("host")} («{man.get("gw_name")}»), версия {man.get("version")}',
+           f'Клиентов WireGuard: {man.get("peers")}, подписок: {man.get("subs")}, своих VPS: {man.get("vps")}, '
+           f'админов: {man.get("admins")}']
+    if man.get('vps_list'):
+        out.append('Свои серверы: ' + ', '.join(map(str, man['vps_list'])))
+    if man.get('nodes'):
+        out.append('Подключённые шлюзы: ' + ', '.join(map(str, man['nodes'])))
+    out += ['', 'Внутри:']
+    out += [f'  {k}: {n} файл(ов)' for k, n in sorted(groups.items())]
+    missing = [b for b in ('/etc/vpnbot.env', '/etc/wireguard', '/etc/mihomo/config.yaml', STATE_FILE) if b not in groups]
+    if missing:
+        out += ['', '⚠️ Нет в копии: ' + ', '.join(missing)]
+    return '\n'.join(out)
+
+
+CLI_HELP = {
+    'menu': ('', 'меню бота прямо в консоли: те же экраны и кнопки, выбор цифрой'),
+    'status': ('', 'службы и IP через VPN'),
+    'top': ('', 'живая панель: процессор, память, сеть, соединения, сервер (обновляется каждую секунду)'),
+    'diag': ('', 'самодиагностика: сервер, устойчивость, Telegram/YouTube, очередь mihomo, страховка обновления'),
+    'servers': ('', 'серверы VPN и их пинг'),
+    'use': ('<сервер|auto>', 'выбрать сервер вручную (можно часть названия) или вернуть автовыбор'),
+    'mode': ('<fast|stable|priority>', 'режим переключения серверов'),
+    'route': ('[smart|list|blocked|all]', 'показать или сменить маршрутизацию'),
+    'site': ('<адрес>', 'куда идёт сайт: правило, сервер, открывается ли'),
+    'direct': ('<on|off>', 'АВАРИЙНО: клиенты WireGuard напрямую, мимо VPN'),
+    'restart': ('<mihomo|bot|wg|all>', 'перезапустить службу'),
+    'logs': ('<bot|mihomo|wg|install|os> [строк]', 'журнал службы'),
+    'peers': ('', 'клиенты WireGuard'),
+    'add': ('"Имя" <phone|pc>', 'новый клиент WireGuard'),
+    'qr': ('"Имя"|номер', 'QR-код и файл клиента'),
+    'del': ('"Имя"|номер', 'удалить клиента WireGuard'),
+    'mikrotik': ('"Имя" <сеть_офиса> [внешний_интерфейс]',
+                 'MikroTik: ключ и готовые команды (офис через шлюз, при сбое — напрямую, проброс портов не ломается)'),
+    'vps': ('[list|check N|fix N|xray N|reboot N]', 'свои серверы VLESS'),
+    'tg': ('<test|owner ID>', 'проверить связь с Telegram; сменить владельца бота'),
+    'backup': ('<now|list|check файл>', 'резервные копии'),
+    'update': ('[check|mihomo]', 'обновить шлюз или mihomo (со страховкой и автооткатом)'),
+    'rollback': ('', 'вернуть версию до последнего обновления'),
+    'os': ('<check|upgrade|reboot>', 'обновления Ubuntu, перезагрузка'),
+    'help': ('[команда]', 'эта справка'),
+}
+
+
+def cli_help(cmd=None):
+    if cmd and cmd in CLI_HELP:
+        a, d = CLI_HELP[cmd]
+        return f'vpngw {cmd} {a}\n  {d}'
+    w = max(len(f'{k} {a}') for k, (a, _) in CLI_HELP.items())
+    lines = ['Управление VPN-шлюзом из консоли (нужен sudo). Без команды — меню.', '']
+    lines += [f'  vpngw {(k + " " + a).ljust(w)}  {d}' for k, (a, d) in CLI_HELP.items()]
+    lines += ['', 'Если Telegram недоступен, всё, что есть в боте, есть в «vpngw menu».']
+    return '\n'.join(lines)
+
+
+def cli_cmd(argv):
+    """Команды консоли, которые выполняются внутри бота. Экраны — через cli_press."""
+    c, a = (argv[0] if argv else 'help'), argv[1:]
+    if c == 'help':
+        return cli_out(cli_help(a[0] if a else None))
+    if c == 'diag':
+        return cli_press('diag')
+    if c == 'servers':
+        return cli_press('servers')
+    if c == 'use':
+        if not a:
+            raise SystemExit('vpngw use <сервер|auto>')
+        if a[0].lower() == 'auto':
+            v = state.get('vpn')
+            if v:
+                back_to_auto(v, 'Консоль: автовыбор сервера')
+            return cli_out('Автовыбор включён.')
+        return cli_press(f'srv:0:{tag(cli_find_server(" ".join(a)))}')
+    if c == 'mode':
+        if not a or a[0] not in MODES:
+            raise SystemExit('vpngw mode <' + '|'.join(MODES) + '>')
+        cli_press(f'swm:{a[0]}')
+        if vpn_dirty(vpn()):
+            cli_press('swapply')
+        return
+    if c == 'route':
+        if not a:
+            return cli_press('swr')
+        if a[0] not in ROUTING:
+            raise SystemExit('vpngw route <' + '|'.join(ROUTING) + '>')
+        cli_press(f'swr:{a[0]}')
+        if vpn_dirty(vpn()):
+            cli_press('swapply:r')
+        return
+    if c == 'site':
+        if not a:
+            raise SystemExit('vpngw site <адрес>')
+        return cli_text('/site ' + a[0])
+    if c == 'direct':
+        if not a or a[0] not in ('on', 'off'):
+            raise SystemExit('vpngw direct <on|off>')
+        return cli_out(cli_direct(a[0] == 'on'))
+    if c == 'tg':
+        if a[:1] == ['test']:
+            return cli_out(cli_tg_test())
+        if a[:1] == ['owner'] and len(a) == 2 and a[1].isdigit():
+            out = cli_set_owner(int(a[1]))
+            threading.Timer(1.5, lambda: run(['systemctl', 'restart', 'vpnbot'], 30)).start()
+            return cli_out(out)
+        raise SystemExit('vpngw tg test | vpngw tg owner <Telegram ID>')
+    if c == 'backup':
+        if a[:1] == ['now']:
+            path, man = bk_make(bk_auto_pw(), why='из консоли')
+            return cli_out(f'✅ Копия: {path} ({man["size"] // 1024} КБ, файлов {man["files"]}). '
+                           'Пароль — как у автокопий (Резервные копии в боте).')
+        if a[:1] == ['list']:
+            lst = bk_list()
+            return cli_out('\n'.join(f'{x["name"]}  {x.get("size", 0) // 1024} КБ' for x in lst) or 'Копий нет.')
+        if a[:1] == ['check'] and len(a) == 2:
+            return cli_out(cli_backup_check(a[1], cli_sink.get('pw') or ''))
+        raise SystemExit('vpngw backup now | list | check <файл>')
+    if c == 'update':
+        if a[:1] == ['mihomo']:
+            ok, txt = mihomo_update(say=lambda t: cli_out('⏳ ' + t))
+            return cli_out(('✅ ' if ok else '↩️ ') + txt)
+        if a[:1] == ['check']:
+            u = check_update()
+            return cli_out(f'Сейчас {BOT_VERSION}, на GitHub {u.get("latest")}.'
+                           + (' Обновить: vpngw update' if update_available() else ' Обновлять нечего.'))
+        cli_press('upd:check')
+        if not update_available():
+            return cli_out('Уже последняя версия.')
+        start_self_update(CLI_CHAT)
+        return cli_out('Обновление запущено. Бот перезапустится через минуту; 15 минут новая версия под страховкой — '
+                       'если станет хуже, вернётся прежняя. Итог: vpngw logs install')
+    if c == 'os':
+        sub = a[0] if a else 'check'
+        if sub == 'check':
+            os_check(True)
+            return cli_press('os')
+        if sub == 'upgrade':
+            err = os_start_upgrade(OWNER)
+            return cli_out(f'🔴 {err}' if err else 'Обновление Ubuntu запущено в фоне. Ход: vpngw logs os')
+        if sub == 'reboot':
+            cli_out('Перезагружаю сервер. VPN пропадёт примерно на минуту.')
+            threading.Thread(target=os_reboot, args=('manual', OWNER), daemon=True).start()
+            return
+        raise SystemExit('vpngw os check | upgrade | reboot')
+    if c == 'vps':
+        lst = sorted(vps_all().items())
+        if not a or a[0] == 'list':
+            return cli_press('vs')
+        if len(a) == 2 and a[1].isdigit() and 1 <= int(a[1]) <= len(lst):
+            vid = lst[int(a[1]) - 1][0]
+            act = {'check': 'chk', 'fix': 'fix!', 'xray': 'upd!', 'reboot': 'rb!'}.get(a[0])
+            if act:
+                return cli_press(f'vs:{act}:{vid}')
+        raise SystemExit('vpngw vps list | check N | fix N | xray N | reboot N  (N — номер в списке)')
+    if c == 'mikrotik':
+        if len(a) not in (2, 3):
+            raise SystemExit('vpngw mikrotik "Имя" <сеть_офиса> [внешний_интерфейс]')
+        try:
+            net = str(ipaddress.ip_network(a[1], strict=False))
+        except ValueError:
+            raise SystemExit(f'Не понял сеть: {a[1]} (пример: 192.168.88.0/24)')
+        if any(p['name'].lower() == a[0].lower() for p in wg_state()['peers'].values()):
+            raise SystemExit(f'Клиент «{a[0]}» уже есть. Изменить его — в «vpngw menu» → WireGuard.')
+        ctx = mt_defaults(a[0])
+        ctx.update(step=None, route='lan', nets=[net], wan=a[2] if len(a) == 3 else None,
+                   local=bool(lan_ip()) and ipaddress.ip_address(lan_ip()) in ipaddress.ip_network(net))
+        if ctx['local'] and int(ctx['port']) == gw_ext_port():
+            ctx['port'] = mt_free_port(set(), {gw_ext_port()})
+        bad = [x for x in mt_warnings(ctx) if x.startswith('🔴')]
+        if bad:
+            raise SystemExit(re.sub(r'<[^>]+>', '', '\n'.join(bad)))
+        pub = mt_save(OWNER, ctx)
+        wg_send_conf(CLI_CHAT, pub)
+        return cli_out('Офис пойдёт в интернет через шлюз; если шлюз или VPN перестанут пропускать трафик — напрямую, '
+                       'и обратно сам. Проброшенные снаружи порты работают как раньше.\n'
+                       'На MikroTik: Safe Mode (Ctrl+X), затем вставьте содержимое файла в New Terminal '
+                       '(или загрузите файл в Files и выполните /import file-name=ИМЯ.rsc).')
+    if c == 'press':                   # служебное: нажать кнопку меню (для меню консоли)
+        return cli_press(a[0] if a else 'menu')
+    raise SystemExit(f'Неизвестная команда: {c}. Справка: vpngw help')
+
+
+def cli_handle(req, writer):
+    with cli_lock:
+        cli_sink['w'] = writer
+        cli_sink['pw'] = req.get('pw')
+        CTX.cli_bg = True
+        try:
+            if 'press' in req:
+                cli_press(req['press'])
+            elif 'text' in req:
+                cli_text(req['text'])
+            else:
+                cli_cmd(req.get('argv') or [])
+        except SystemExit as e:
+            writer({'t': 'err', 'text': str(e)})
+        except Exception as e:
+            log('консоль:', traceback.format_exc())
+            writer({'t': 'err', 'text': f'ошибка: {e}'})
+        finally:
+            CTX.cli_bg = False
+            cli_sink['w'] = None
+            cli_sink['pw'] = None
+
+
+def cli_server():
+    import socket
+    os.makedirs(os.path.dirname(CLI_SOCK), mode=0o700, exist_ok=True)
+    os.chmod(os.path.dirname(CLI_SOCK), 0o700)
+    try:
+        os.unlink(CLI_SOCK)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(CLI_SOCK)
+    os.chmod(CLI_SOCK, 0o600)
+    srv.listen(4)
+
+    def serve(conn):
+        f = conn.makefile('rwb')
+        try:
+            req = json.loads(f.readline() or b'{}')
+
+            def writer(ev):
+                f.write(json.dumps(ev, ensure_ascii=False).encode() + b'\n')
+                f.flush()
+            cli_handle(req, writer)
+            writer({'t': 'done'})
+        except Exception:
+            pass
+        finally:
+            try:
+                f.close()
+                conn.close()
+            except Exception:
+                pass
+    while True:
+        try:
+            conn, _ = srv.accept()
+            threading.Thread(target=serve, args=(conn,), daemon=True).start()
+        except Exception:
+            time.sleep(1)
+
+
+def cli_direct_run(req):
+    """Бот не запущен: выполнить запрос консоли прямо здесь. Telegram не трогаем — он может быть недоступен."""
+    global CLI_NO_TG
+    CLI_NO_TG = True
+    load_state()
+
+    def writer(ev):
+        sys.stdout.write(json.dumps(ev, ensure_ascii=False) + '\n')
+        sys.stdout.flush()
+    cli_handle(req, writer)
+    writer({'t': 'done'})
+
+
+CLI_NO_TG = False
 
 
 # ---------------- обновления ----------------
@@ -9325,40 +10086,180 @@ def update_available():
     return bool(u.get('latest')) and vtuple(u['latest']) > vtuple(BOT_VERSION)
 
 
-def mihomo_versions():
-    cur = run([shutil.which('mihomo') or 'mihomo', '-v'], 10).stdout
-    cur = (re.search(r'v\d+\.\d+\.\d+', cur) or [None])[0]
-    latest = None
+MH_PREV = '/var/lib/vpngw/backup/mihomo.prev'     # прежний бинарник: к нему откатываемся
+MH_SETTLE = 3 * 86400                               # сам ставлю только релиз, которому уже 3 дня
+MH_CHECK_EVERY = 12 * 3600
+MH_GUARD = (20, 30, 40, 60, 60)                     # проверки после обновления, с; две плохие подряд — откат
+
+
+def mh_cfg():
+    with lock:
+        c = state.setdefault('mh', {})
+        c.setdefault('auto', True)
+        c.setdefault('bad', {})
+        return c
+
+
+def mihomo_bin():
+    return shutil.which('mihomo') or '/usr/bin/mihomo'
+
+
+def mihomo_cur():
+    out = run([mihomo_bin(), '-v'], 10).stdout
+    m = re.search(r'v\d+\.\d+\.\d+', out)
+    return m.group(0) if m else None
+
+
+def mihomo_release(force=False):
+    """Последний релиз mihomo (кэш на 12 ч) → {'tag', 'ts', 'url'}."""
+    c = mh_cfg()
+    r = c.get('rel') or {}
+    if not force and r.get('checked', 0) > time.time() - MH_CHECK_EVERY:
+        return r
+    rel = json.loads(fetch('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest', 20))
+    arch = {'x86_64': 'amd64-v1', 'aarch64': 'arm64'}.get(platform.machine())
+    tagname = rel['tag_name']
+    url = next((x['browser_download_url'] for x in rel.get('assets', [])
+                if arch and x['name'] == f'mihomo-linux-{arch}-{tagname}.deb'), None)
     try:
-        latest = json.loads(fetch('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest', 20))['tag_name']
+        ts = datetime.strptime(rel.get('published_at', ''), '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=timezone.utc).timestamp()
+    except Exception:
+        ts = time.time()
+    r = {'tag': tagname, 'ts': ts, 'url': url, 'checked': time.time()}
+    with lock:
+        c['rel'] = r
+        save_state()
+    return r
+
+
+def mihomo_versions():
+    cur, latest = mihomo_cur(), None
+    try:
+        latest = mihomo_release(force=True)['tag']
     except Exception as e:
         log('mihomo latest:', e)
     return cur, latest
 
 
-def mihomo_update():
-    arch = {'x86_64': 'amd64-v1', 'aarch64': 'arm64'}.get(platform.machine())
-    if not arch:
-        raise RuntimeError('неизвестная архитектура ' + platform.machine())
-    rel = json.loads(fetch('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest', 20))
-    tagname = rel['tag_name']
-    url = next((a['browser_download_url'] for a in rel.get('assets', [])
-                if a['name'] == f'mihomo-linux-{arch}-{tagname}.deb'), None)
-    if not url:
-        raise RuntimeError('в релизе нет пакета для этой архитектуры')
-    data = fetch(url, 300, binary=True)
+def mihomo_put_prev():
+    """Вернуть прежний бинарник: копия рядом и атомарная замена (поверх работающего файла cp не пишет)."""
+    dst = mihomo_bin()
+    tmp = dst + '.vpngw-rb'
+    shutil.copy2(MH_PREV, tmp)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dst)
+
+
+def mihomo_update(say=None, auto=False):
+    """Обновить mihomo; если стало хуже (mihomo молчит, VPN перестал проходить) — вернуть прежний.
+    → (ok, текст). Неудачная версия запоминается и сама больше не ставится."""
+    say = say or (lambda t: None)
+    c = mh_cfg()
+    rel = mihomo_release(force=True)
+    cur, tagname = mihomo_cur(), rel['tag']
+    if cur and vtuple(cur) >= vtuple(tagname):
+        return True, f'уже стоит {cur}'
+    if not rel.get('url'):
+        raise RuntimeError('в релизе нет пакета для этой архитектуры: ' + platform.machine())
+    say(f'Скачиваю mihomo {tagname}…')
+    data = fetch(rel['url'], 300, binary=True)
     os.makedirs(UPDATE_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(MH_PREV), exist_ok=True)
     deb = os.path.join(UPDATE_DIR, 'mihomo.deb')
     with open(deb, 'wb') as f:
         f.write(data)
-    r = run(['apt-get', 'install', '-y', '-qq', deb], 300)
+    say('Проверяю, как работает сейчас…')
+    base = health_snapshot()
+    shutil.copy2(mihomo_bin(), MH_PREV)
+    with lock:
+        c['prev'] = cur
+        c['busy'] = {'to': tagname, 'ts': time.time()}
+        save_state()
+
+    def back(why, restart=True):
+        mihomo_put_prev()
+        if restart:
+            run(['systemctl', 'restart', 'mihomo'], 60)
+        with lock:
+            c['bad'][tagname] = {'ts': time.time(), 'why': why}
+            c.pop('busy', None)
+            save_state()
+        add_event(f'mihomo {tagname}: {why} — возвращён {cur}')
+        alive = False
+        for _ in range(10):
+            time.sleep(3)
+            try:
+                alive = bool(api('/version', timeout=5))
+                break
+            except Exception:
+                pass
+        return False, (f'mihomo {tagname}: {why} — возвращён {cur}' +
+                       ('' if alive else '. ⚠️ Но и прежний mihomo не отвечает — проверьте: vpngw logs mihomo'))
+    say(f'Ставлю mihomo {tagname}…')
+    r = run(['apt-get', 'install', '-y', '-qq', '--allow-downgrades', deb], 300)
     if r.returncode != 0:
-        raise RuntimeError('apt-get: ' + (r.stderr or r.stdout)[-300:])
-    t = run(['mihomo', '-d', GEO_DIR, '-t'], 120)
+        return back('не установился: ' + (r.stderr or r.stdout)[-200:].strip(), restart=False)
+    t = run([mihomo_bin(), '-d', GEO_DIR, '-t'], 120)
     if t.returncode != 0:
-        raise RuntimeError('новая версия mihomo не принимает конфиг: ' + (t.stdout + t.stderr)[-200:])
+        return back('не принимает конфиг: ' + (t.stdout + t.stderr)[-200:].strip(), restart=False)
+    say(f'Перезапускаю mihomo {tagname}, VPN прервётся на 10–20 секунд…')
     run(['systemctl', 'restart', 'mihomo'], 60)
-    return tagname
+    streak, why = 0, ''
+    for i, pause in enumerate(MH_GUARD, 1):
+        time.sleep(pause)
+        say(f'Проверяю mihomo {tagname} после обновления: {i} из {len(MH_GUARD)}…')
+        why = guard_worse(base, health_snapshot())
+        streak = streak + 1 if why else 0
+        if streak >= 2:
+            return back(why)
+    with lock:
+        c.pop('busy', None)
+        c['last'] = {'ts': time.time(), 'from': cur, 'to': tagname, 'auto': auto}
+        save_state()
+    add_event(f'mihomo обновлён {cur} → {tagname}' + (' (ночью)' if auto else ''))
+    return True, f'mihomo {cur} → {tagname}'
+
+
+def mh_tick():
+    """Раз в 12 ч узнаёт о новом mihomo; если «ставить сам» — ночью, после 3 дней от выхода, со страховкой."""
+    c = mh_cfg()
+    if c.get('busy') and time.time() - c['busy'].get('ts', 0) > 1800:
+        with lock:
+            c.pop('busy', None)                 # бот перезапустился посреди обновления
+            save_state()
+    try:
+        rel = mihomo_release()
+    except Exception as e:
+        log('mihomo: релиз', e)
+        return
+    cur = mihomo_cur()
+    tagname = rel.get('tag')
+    if not cur or not tagname or vtuple(tagname) <= vtuple(cur) or tagname in c['bad']:
+        return
+    if c.get('told') != tagname:
+        with lock:
+            c['told'] = tagname
+            save_state()
+        notify('os', f'🧱 Вышел mihomo <b>{h(tagname)}</b> (у вас {h(cur)}). ' + (
+            f'Поставлю сам ночью ({os_slot_text(os_slot())}), когда релизу будет 3 дня; если станет хуже — '
+            'верну прежний.' if c['auto'] else 'Обновить: 🔧 Управление → 🆕 Обновления → 🧱 mihomo.'))
+    today = time.strftime('%Y-%m-%d')
+    if not c['auto'] or time.time() - rel.get('ts', 0) < MH_SETTLE or c.get('night_day') == today:
+        return
+    if not in_window(os_slot()) or state.get('upd_guard') or (state.get('os') or {}).get('job'):
+        return
+    if run(['pgrep', '-x', 'dpkg|apt-get|apt|unattended-upgr'], 5).returncode == 0:
+        return
+    with lock:
+        c['night_day'] = today
+        save_state()
+    try:
+        ok, txt = mihomo_update(auto=True)
+    except Exception as e:
+        ok, txt = False, f'mihomo {tagname} не обновлён: {e}'
+    notify('os', ('🧱 ' if ok else '⚠️ ') + h(txt) + ('' if ok else
+                  '\nПрежняя версия работает; эту версию сам больше ставить не буду.'), keep=not ok)
 
 
 def start_self_update(chat):
@@ -9592,24 +10493,41 @@ def handle_upd(uid, data, chat, mid):
                     [[btn('🏠 Меню', 'menu')]])
         except Exception as e:
             return scr_upd(uid, f'🔴 {h(str(e))[:400]}')
+    if act == 'mhauto':
+        c = mh_cfg()
+        with lock:
+            c['auto'] = not c['auto']
+            save_state()
+        act = 'mh'
     if act == 'mh':
         edit(chat, mid, '🔍 Проверяю версию mihomo…')
         cur, latest = mihomo_versions()
+        c = mh_cfg()
         text = f'🧱 <b>mihomo</b>\n\nУстановлена: {h(cur or "?")}\nПоследняя: {h(latest or "не удалось узнать")}'
         kb = []
+        if latest and latest in c['bad']:
+            text += (f'\n\n↩️ {h(latest)} уже ставилась и была откатана: {h(c["bad"][latest].get("why", ""))}. '
+                     'Сам ставить не буду; вручную — можно.')
         if cur and latest and vtuple(latest) > vtuple(cur):
-            text += '\n\nПри обновлении VPN прервётся на 10–20 секунд.'
+            text += ('\n\nПри обновлении VPN прервётся на 10–20 секунд. Потом 3–4 минуты проверяю, что VPN работает '
+                     'не хуже прежнего; если хуже — верну прежнюю версию сам.')
             kb.append([btn(f'⬆️ Обновить до {latest}', 'upd:mhgo')])
         elif latest:
             text += '\n\n✅ Последняя версия.'
+        if c.get('last'):
+            l_ = c['last']
+            text += f'\n\nПоследнее обновление: {h(l_["from"])} → {h(l_["to"])}, {fmt_date(l_["ts"])}' + (
+                ' (ночью, само)' if l_.get('auto') else '')
+        text += ('\n\n🌙 Ставить само: ' + ('<b>да</b> — ночью, когда релизу 3 дня, со страховкой и откатом.'
+                                           if c['auto'] else '<b>нет</b> — только сообщу о новой версии.'))
+        kb.append([btn('🌙 Ставить само: ' + ('да' if c['auto'] else 'нет'), 'upd:mhauto')])
         kb.append([btn('⬅️ Обновления', 'upd')])
         return text, kb
     if act == 'mhgo':
-        edit(chat, mid, '⏳ Обновляю mihomo, VPN ненадолго прервётся…')
         try:
-            v = mihomo_update()
-            add_event(f'{admin_name(uid)} обновил mihomo до {v}')
-            return scr_upd(uid, f'✅ mihomo обновлён до {h(v)}')
+            ok, txt = mihomo_update(say=lambda t: edit(chat, mid, f'⏳ <b>Обновление mihomo</b>\n\n{h(t)}'))
+            add_event(f'{admin_name(uid)}: {txt}')
+            return scr_upd(uid, ('✅ ' if ok else '↩️ ') + h(txt))
         except Exception as e:
             return scr_upd(uid, f'🔴 {h(str(e))[:400]}')
     return scr_upd(uid)
@@ -11014,6 +11932,30 @@ def gw_join(uid, chat, text):
 RESTORED_FILE = '/var/lib/vpngw/restored.json'
 
 
+def restore_cleanup():
+    """После переезда из копии: временные отметки старого сервера здесь не значат ничего, а помешать могут
+    (ожидание перезагрузки, задание apt, страховка обновления, пробная маска, аварийный режим)."""
+    gone = []
+    with lock:
+        for k in ('upd_guard', 'upd_pending', 'direct_mode'):
+            if state.pop(k, None) is not None:
+                gone.append(k)
+        o = state.get('os') or {}
+        for k in ('boot', 'job', 'auto_day'):
+            if o.pop(k, None) is not None:
+                gone.append('os.' + k)
+        m = state.get('vpsm') or {}
+        if m.pop('night_day', None) is not None:
+            gone.append('vpsm.night_day')
+        for x in (state.get('vps') or {}).values():
+            if isinstance(x, dict) and x.pop('snip', None) is not None:
+                gone.append('vps.snip')
+        save_state()
+    if gone:
+        log('после восстановления сброшены отметки:', ', '.join(gone))
+    return gone
+
+
 def report_restored():
     """Первый запуск после восстановления из копии: установщик оставил отметку."""
     try:
@@ -11084,6 +12026,8 @@ def startup_reports():
 def main():
     global LINK_MODE, OWNER, GW_NAME
     load_state()
+    if os.path.exists(RESTORED_FILE):
+        restore_cleanup()
     cfg = gw_startup_migrate()
     if cfg:
         LINK_MODE = True
@@ -11123,6 +12067,7 @@ def main():
     threading.Thread(target=queue_upgrade, daemon=True).start()
     threading.Thread(target=zt_startup, daemon=True).start()
     threading.Thread(target=maint_loop, daemon=True).start()
+    threading.Thread(target=cli_server, daemon=True).start()
     try:
         upd_guard_start()
     except Exception:
@@ -11160,6 +12105,7 @@ def main():
         if offset:
             params['offset'] = offset
         res = tg('getUpdates', _timeout=35, **params)
+        tg_watch(res is not None)
         if res is None:
             time.sleep(3)
             continue
@@ -11207,6 +12153,8 @@ def cli():
         v['applied'] = dict(snapshot(v), mode=v['mode'])
         state['vpn'] = v
         save_state()
+    elif a[0] == '--vps-deploy':                  # развернуть свой VLESS-сервер из установщика (JSON в stdin)
+        sys.exit(vs_deploy_cli())
     elif a[0] == '--subs':                        # текущие подписки (для установщика)
         load_state()
         print(json.dumps(subs(), ensure_ascii=False))
@@ -11244,6 +12192,8 @@ def cli():
             ensure_ascii=False))
     elif a[0] == '--version':
         print(BOT_VERSION)
+    elif a[0] == '--cli-direct' and len(a) == 2:  # консоль, когда бот не запущен (vpngw)
+        cli_direct_run(json.loads(a[1]))
     else:
         sys.exit('неизвестная команда: ' + ' '.join(a))
 

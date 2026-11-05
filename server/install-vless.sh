@@ -366,12 +366,16 @@ sni_restore() {
     return 0
 }
 
-# DOMAIN — маска, DEST — адрес сайта (по умолчанию домен), NEWPORT — другой порт (по умолчанию прежний)
+# DOMAIN — маска, DEST — адрес сайта (по умолчанию домен), NEWPORT — другой порт (по умолчанию прежний),
+# NEWKEYS=1 — заодно новые UUID, ключи x25519 и shortId (если старые не принимаются или попали в фильтры)
 do_sni_try() {
-    [ -n "${DOMAIN:-}" ] || die "не задан DOMAIN"
-    local want_dest=${DEST:-$DOMAIN} want_port=${NEWPORT:-}   # load_conf перепишет DEST и PORT из конфига
+    [ -n "${DOMAIN:-}" ] || [ -n "${NEWKEYS:-}" ] || die "не задан DOMAIN"
+    local want_dest=${DEST:-} want_port=${NEWPORT:-}   # load_conf перепишет DEST и PORT из конфига
     load_conf
+    if [ -z "${DOMAIN:-}" ]; then DOMAIN=$SNI; want_dest=${want_dest:-${DEST:-$SNI}}; fi   # только ключи: маска та же
+    want_dest=${want_dest:-$DOMAIN}
     want_port=${want_port:-$PORT}
+    if [ -n "${NEWKEYS:-}" ]; then new_keys; fi
     if [ "$want_port" != "$PORT" ] && busy "$want_port" && ! [ -f "$CONF.sni-orig" ]; then
         die "порт $want_port занят другой программой"
     fi

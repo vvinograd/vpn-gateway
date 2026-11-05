@@ -112,7 +112,9 @@ preflight() {
 main_menu() {
     load_conf
     local c
-    c=$(menu "VPN-шлюз уже установлен" "Что сделать?" 21 \
+    c=$(menu "VPN-шлюз уже установлен" "Что сделать?" 24 \
+        m "Меню бота в консоли (всё, что есть в Telegram)" \
+        t "Живая панель: процессор, память, сеть" \
         1 "Добавить клиента WireGuard (телефон / ПК)" \
         2 "Показать QR-код и файл клиента" \
         3 "Список клиентов" \
@@ -121,9 +123,15 @@ main_menu() {
         6 "Обновить mihomo" \
         7 "Переустановить / изменить настройки" \
         r "Восстановить из резервной копии" \
+        b "Откатить последнее обновление" \
+        h "Справка по командам vpngw" \
         8 "Удалить VPN-шлюз" \
         9 "Выход") || exit 0
     case $c in
+        m) clear; vpngw menu ;;
+        t) vpngw top ;;
+        b) clear; vpngw rollback; read -rp $'\nEnter — назад ' _ ;;
+        h) clear; vpngw help | less -R ;;
         1) add_clients_loop; show_new_clients ;;
         2) pick_and_show_qr ;;
         3) clear; vpngw peers; read -rp $'\nEnter — назад ' _ ;;
@@ -262,9 +270,26 @@ step_subscription() {
             SUB_URL=""
         fi
     fi
+    if [ -z "${SUB_URL:-}" ]; then
+        while :; do
+            c=$(need menu "Подписка VPN" "Откуда брать серверы VPN?\n\nБез VPN не заработает и бот в Telegram: из России он ходит через VPN." 17 \
+                sub "Ссылка на подписку (https://…)" \
+                vless "Ссылки vless:// вручную" \
+                vps "Развернуть свой сервер VLESS на VPS за границей")
+            case $c in
+                vless) manual_links && return ;;
+                vps) deploy_vps && return ;;
+                *) break ;;
+            esac
+        done
+    fi
     while :; do
-        SUB_URL=$(need inp "Подписка VPN" "Вставьте ссылку на подписку (https://…).\n\nСсылка — это ключ доступа к VPN, никому её не показывайте.\nВставка в терминале: правая кнопка мыши или Shift+Insert.\n\nЕсли подписки нет, оставьте поле пустым — можно будет вставить ссылки vless:// вручную." "${SUB_URL:-}" 17)
-        if [ -z "$SUB_URL" ]; then manual_links && return; continue; fi
+        SUB_URL=$(need inp "Подписка VPN" "Вставьте ссылку на подписку (https://…).\n\nСсылка — это ключ доступа к VPN, никому её не показывайте.\nВставка в терминале: правая кнопка мыши или Shift+Insert.\n\nЕсли подписки нет, оставьте поле пустым — можно будет вставить ссылки vless:// вручную или развернуть свой сервер." "${SUB_URL:-}" 17)
+        if [ -z "$SUB_URL" ]; then
+            c=$(need menu "Подписка VPN" "Ссылка не введена. Что сделать?" 12 vless "Ссылки vless:// вручную" vps "Развернуть свой сервер VLESS" back "Ввести ссылку заново")
+            case $c in vless) manual_links && return ;; vps) deploy_vps && return ;; esac
+            continue
+        fi
         local ua code result tries
         for ua in "FlClashX/0.8.80" "clash-verge/v2.2.3" "mihomo/1.19.12"; do
             for tries in 1 2 3; do
@@ -288,6 +313,49 @@ step_subscription() {
             *) ask "Подписка не ответила" "Не удалось получить серверы (HTTP ${code:-нет ответа}).\n\nПроверьте ссылку. Ввести ссылки vless:// вручную вместо подписки?" 12 1 && manual_links && return ;;
         esac
     done
+}
+
+# свой сервер VLESS: бот (тот же код, что «🛰 Свои серверы») входит по SSH, ставит Xray, подбирает маскировку,
+# проверяет из России и отдаёт ссылку; дальше бот управляет сервером сам (обновления, маски, откаты)
+deploy_vps() {
+    local host port user pw res link err
+    msg "Свой сервер VLESS" "Понадобится VPS за границей с Ubuntu или Debian и доступ по SSH (IP, пользователь, пароль) — их присылает хостинг после оплаты.
+
+Установщик один раз войдёт по паролю, добавит на сервер ключ бота и дальше будет входить по ключу. Пароль нигде не сохраняется.
+
+На сервере: Xray (VLESS Reality), подбор маскировки, проверка из России. 2–5 минут. Другие VPN на сервере (SSTP, AmneziaWG) не трогаются." 18
+    host=$(inp "Свой сервер VLESS" "IP-адрес сервера (или его имя):" "" 10) || return 1
+    [ -n "$host" ] || return 1
+    port=$(inp "Свой сервер VLESS" "Порт SSH:" "22" 10) || return 1
+    user=$(inp "Свой сервер VLESS" "Пользователь (обычно root):" "root" 10) || return 1
+    pw=$(pwd_ "Свой сервер VLESS" "Пароль пользователя $user на $host:") || return 1
+    command -v mihomo >/dev/null 2>&1 || install_mihomo || return 1    # нужен для проверки VLESS из России
+    clear
+    echo "Разворачиваю свой сервер VLESS на $host… (2–5 минут)"
+    res=$(jq -nc --arg h "$host" --arg p "${port:-22}" --arg u "${user:-root}" --arg w "$pw" \
+          '{host:$h, port:$p, user:$u, pw:$w}' | python3 /usr/local/bin/vpnbot.py --vps-deploy 2>/dev/tty)
+    pw=""
+    link=$(grep -oP '^@@LINK \K.*' <<<"$res" | head -1)
+    if [ -z "$link" ]; then
+        err=$(grep -oP '^@@ERROR \K.*' <<<"$res" | head -1)
+        log "свой сервер: ${err:-нет ответа}"
+        sleep 2
+        msg "Не получилось" "Сервер не развёрнут: ${err:-неизвестная ошибка}.
+
+Можно исправить и попробовать снова или выбрать другой вариант. Если Xray на сервере уже поставлен, повторный запуск продолжит с того же места." 14
+        return 1
+    fi
+    log "свой сервер $host: развёрнут"
+    printf '%s\n' "$link" >"$TMP/links.txt"
+    mkdir -p /etc/mihomo/providers
+    SERVERS=$(python3 /usr/local/lib/vpngw/vpngw.py links2yaml "$TMP/links.txt" "/etc/mihomo/providers/$MAIN_ID.yaml" 2>>"$LOG") \
+        || { msg "Ошибка" "Сервер развёрнут, но ссылка не разобралась. Вставьте её вручную в следующем окне." 9; return 1; }
+    PROVIDER="file"; SUB_URL=""; SUB_UA=""
+    save_conf PROVIDER file; save_conf SUB_URL ""
+    msg "Свой сервер готов" "Сервер $host работает и проверен из России.
+
+Дальше бот следит за ним сам: обновления Xray и Ubuntu ночью (с откатом при сбое), подбор маскировки и новые ключи по кнопке «🛠 Починить» (🔧 Управление → 🛰 Свои серверы)." 13
+    return 0
 }
 
 manual_links() {
