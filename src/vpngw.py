@@ -234,10 +234,43 @@ def client_conf(w, pub):
                       f'Endpoint = {endpoint(w)}', f'AllowedIPs = {allowed}', 'PersistentKeepalive = 25', ''])
 
 
+def client_path(w, pub, ext='.conf'):
+    """Файл клиента в OUT. Имя — латиницей до 15 символов (столько допускает имя туннеля WireGuard), поэтому
+    «John Doe» и «John_Doe» дают одно имя: занятое другим клиентом получает суффикс -2, -3… Свой файл узнаём
+    по ключу клиента внутри."""
+    base = translit(w['peers'][pub]['name'])
+    key = f'PrivateKey = {w["peers"][pub]["priv"]}'
+    for i in range(1, 100):
+        name = base if i == 1 else f'{base[:15 - len(str(i)) - 1]}-{i}'
+        path = os.path.join(OUT, name + ext)
+        try:
+            if key in open(path, encoding='utf-8').read():
+                return path                       # этот клиент
+        except FileNotFoundError:
+            return path                           # свободно
+        except OSError:
+            pass
+    raise SystemExit('не нашёл свободного имени файла')
+
+
+def client_files(w, pub):
+    """Все файлы этого клиента в OUT (по ключу внутри)."""
+    key = f'PrivateKey = {w["peers"][pub]["priv"]}'
+    out = []
+    for fn in os.listdir(OUT) if os.path.isdir(OUT) else []:
+        p = os.path.join(OUT, fn)
+        try:
+            if fn.endswith(('.conf', '.rsc')) and key in open(p, encoding='utf-8').read():
+                out.append(p)
+        except OSError:
+            pass
+    return out
+
+
 def save_client_file(w, pub):
     os.makedirs(OUT, exist_ok=True)
     os.chmod(OUT, 0o700)
-    path = os.path.join(OUT, translit(w['peers'][pub]['name']) + '.conf')
+    path = client_path(w, pub)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(client_conf(w, pub))
     os.chmod(path, 0o600)
@@ -536,13 +569,12 @@ def cmd_del(key):
         w = wg_state(st)
         pub = find_peer(w, key)
         name = w['peers'][pub]['name']
+        files = client_files(w, pub)
         w['peers'].pop(pub)
         save_state(st)
         write_wg(w)
-    for ext in ('.conf', '.rsc'):     # .rsc — от прежних версий
-        p = os.path.join(OUT, translit(name) + ext)
-        if os.path.exists(p):
-            os.remove(p)
+    for p in files:
+        os.remove(p)
     print(f'Клиент «{name}» удалён.')
 
 

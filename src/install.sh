@@ -959,9 +959,36 @@ BK_FORMAT=1
 RESTORE=0
 RST=""            # распакованная копия
 
+# С 2.6.1 в конце файла подпись HMAC-SHA256 от зашифрованного: изменённую копию не восстанавливаем.
+# Копии без подписи (до 2.6.1) читаются как раньше.
+BK_SIGNED=0
+bk_unseal() {     # $1 файл, $2 куда шифротекст; пароль в VPNGW_BK_PW → 0 подписана, 10 без подписи, 3 не сошлась
+    python3 - "$1" "$2" <<'PY'
+import hashlib, hmac, os, sys
+data = open(sys.argv[1], 'rb').read()
+tag = b'\nVPNGW-MAC1:'
+i = data.rfind(tag)
+if i >= 0 and len(data) - i == len(tag) + 65:
+    ct, mac = data[:i], data[i + len(tag):-1]
+    key = hashlib.pbkdf2_hmac('sha256', os.environ['VPNGW_BK_PW'].encode(), ct[8:16] + b'vpngw-mac', 200000)
+    if not hmac.compare_digest(mac, hmac.new(key, ct, hashlib.sha256).hexdigest().encode()):
+        sys.exit(3)
+    open(sys.argv[2], 'wb').write(ct)
+    sys.exit(0)
+open(sys.argv[2], 'wb').write(data)
+sys.exit(10)                        # без подписи: копия до 2.6.1
+PY
+}
+
 bk_decrypt() {    # $1 файл, $2 пароль, $3 куда
+    local ct=$TMP/backup.ct rc
+    VPNGW_BK_PW=$2 bk_unseal "$1" "$ct" 2>>"$LOG"; rc=$?
+    case $rc in 0) BK_SIGNED=1 ;; 10) BK_SIGNED=0; rc=0 ;; esac
+    if [ "$rc" -ne 0 ]; then rm -f "$ct"; log "копия: подпись не сходится (неверный пароль или файл изменён)"; return 1; fi
     VPNGW_BK_PW=$2 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:VPNGW_BK_PW \
-        -in "$1" -out "$3" 2>>"$LOG"
+        -in "$ct" -out "$3" 2>>"$LOG"; rc=$?
+    rm -f "$ct"
+    return $rc
 }
 
 ver_newer() {     # $1 новее $2 (по major.minor)?
@@ -1063,6 +1090,10 @@ mf() { jq -r "$1 // empty" "$RST/manifest.json" 2>/dev/null; }
 restore_summary() {
     local fmt ver; fmt=$(mf .format); ver=$(mf .version)
     [ "${fmt:-0}" -le "$BK_FORMAT" ] 2>/dev/null || die "Копия сделана в новом формате ($fmt). Скачайте свежий установщик с GitHub."
+    # копии с 2.6.1 подписаны; без подписи — значит, её срезали (и могли изменить содержимое)
+    if [ "$BK_SIGNED" = 0 ] && [ "$(printf '%s\n%s\n' "${ver:-0}" 2.6.1 | sort -V | head -1)" = 2.6.1 ]; then
+        die "У копии версии $ver нет подписи — файл изменён. Восстанавливать его нельзя."
+    fi
     if ver_newer "$ver" "$GW_VERSION"; then
         ask "Версия копии" "Копия сделана ботом версии $ver, а этот установщик — версии $GW_VERSION.\n\nЛучше скачать свежий установщик с GitHub. Продолжить с этим на свой риск?" 12 1 || { clear; exit 1; }
     fi

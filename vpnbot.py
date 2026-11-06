@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.6'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.6.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -220,6 +220,10 @@ def default_notify():
     return {k: True for k, _ in NOTIFY_KINDS}
 
 
+STATE_BAK = STATE_FILE + '.bak'           # последняя удачная копия, не старше часа
+state_rt = {'bak': 0.0, 'broken': None}
+
+
 def save_state():
     with lock:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -227,17 +231,47 @@ def save_state():
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False)
         os.chmod(tmp, 0o600)
+        if time.time() - state_rt['bak'] > 3600 and os.path.exists(STATE_FILE):
+            try:                                      # раз в час: прежний файл — в запасную копию
+                shutil.copy2(STATE_FILE, STATE_BAK)
+                os.chmod(STATE_BAK, 0o600)
+                state_rt['bak'] = time.time()
+            except OSError as e:
+                log('запасная копия состояния:', e)
         os.replace(tmp, STATE_FILE)
 
 
+def read_state_file(path):
+    with open(path, encoding='utf-8') as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError('не словарь')
+    return d
+
+
 def load_state():
+    """Испорченный файл состояния не затирается настройками по умолчанию: он откладывается в сторону, берётся
+    запасная копия (не старше часа), а если и её нет — бот не запускается (клиенты, админы, подписки целы)."""
     try:
-        with open(STATE_FILE, encoding='utf-8') as f:
-            state.update(json.load(f))
+        state.update(read_state_file(STATE_FILE))
     except FileNotFoundError:
         pass
     except Exception as e:
-        log('ошибка чтения состояния:', e)
+        bad = f'{STATE_FILE}.broken-{time.strftime("%Y%m%d-%H%M%S")}'
+        try:
+            shutil.copy2(STATE_FILE, bad)
+        except OSError:
+            bad = STATE_FILE
+        log(f'ошибка чтения состояния: {e}; файл сохранён как {bad}')
+        try:
+            state.update(read_state_file(STATE_BAK))
+            state_rt['broken'] = {'err': str(e)[:200], 'file': bad,
+                                  'bak_ts': os.path.getmtime(STATE_BAK)}
+            log('состояние взято из запасной копии', STATE_BAK)
+        except Exception as e2:
+            sys.exit(f'Файл состояния {STATE_FILE} повреждён ({e}), запасной копии нет ({e2}). Бот не запускается, '
+                     f'чтобы не затереть данные. Копия испорченного файла: {bad}. Восстановите его или резервную '
+                     'копию (sudo vpngw-setup → Восстановить из резервной копии).')
     state.setdefault('rejected', {})
     adm = state['admins']
     if OWNER and str(OWNER) not in adm:
@@ -5957,6 +5991,31 @@ def openssl_enc(data, pw, decrypt=False):
     return r.stdout
 
 
+BK_MAC_TAG = b'\nVPNGW-MAC1:'           # хвост файла: HMAC-SHA256 от зашифрованного (encrypt-then-MAC)
+
+
+def bk_mac(ct, pw):
+    import hmac
+    key = hashlib.pbkdf2_hmac('sha256', pw.encode(), ct[8:16] + b'vpngw-mac', 200000)
+    return hmac.new(key, ct, hashlib.sha256).hexdigest().encode()
+
+
+def bk_seal(ct, pw):
+    return ct + BK_MAC_TAG + bk_mac(ct, pw) + b'\n'
+
+
+def bk_open(data, pw):
+    """Файл копии → (шифротекст, есть ли подпись). Подпись не сошлась — копию изменили или пароль не тот."""
+    import hmac
+    i = data.rfind(BK_MAC_TAG)
+    if i < 0 or len(data) - i != len(BK_MAC_TAG) + 65:
+        return data, False                  # копия до 2.6.1 — без подписи
+    ct, mac = data[:i], data[i + len(BK_MAC_TAG):-1]
+    if not hmac.compare_digest(mac, bk_mac(ct, pw)):
+        raise RuntimeError('неверный пароль или копия изменена (подпись не сходится)')
+    return ct, True
+
+
 def bk_manifest():
     w = wg_state()
     hw, model = hwid_info()
@@ -5990,9 +6049,9 @@ def bk_make(pw, why='вручную'):
         tar.addfile(ti, io.BytesIO(body))
         for p in files:
             tar.add(p, arcname='files' + p, recursive=False)
-    enc = openssl_enc(buf.getvalue(), pw)
-    # проверка: расшифровываем тем же паролем и читаем архив
-    dec = openssl_enc(enc, pw, decrypt=True)
+    enc = bk_seal(openssl_enc(buf.getvalue(), pw), pw)
+    # проверка: подпись, расшифровка тем же паролем и чтение архива
+    dec = openssl_enc(bk_open(enc, pw)[0], pw, decrypt=True)
     with tarfile.open(fileobj=io.BytesIO(dec), mode='r:gz') as tar:
         names = tar.getnames()
         m2 = json.load(tar.extractfile('manifest.json'))
@@ -9663,9 +9722,16 @@ def cli_tg(method, params):
 
 def cli_file(filename, content, caption=None, kb=None):
     os.makedirs(CLI_FILES, mode=0o700, exist_ok=True)
+    data = content if isinstance(content, bytes) else content.encode()
     path = os.path.join(CLI_FILES, os.path.basename(filename) or 'file')
+    try:
+        if open(path, 'rb').read() != data:              # другой файл с тем же именем не затираем
+            stem, ext = os.path.splitext(path)
+            path = f'{stem}-{time.strftime("%Y%m%d-%H%M%S")}{ext}'
+    except OSError:
+        pass
     with open(path, 'wb') as f:
-        f.write(content if isinstance(content, bytes) else content.encode())
+        f.write(data)
     os.chmod(path, 0o600)
     cli_emit('screen', text=(caption or '') + f'\n\n📎 Файл сохранён: {path}', kb=cli_kb(kb))
     cli_mid[0] += 1
@@ -9769,18 +9835,23 @@ def cli_backup_check(path, pw=''):
     import tarfile
     pw = pw or bk_auto_pw()
     try:
-        dec = openssl_enc(open(path, 'rb').read(), pw, decrypt=True)
+        ct, signed = bk_open(open(path, 'rb').read(), pw)
+        dec = openssl_enc(ct, pw, decrypt=True)
         with tarfile.open(fileobj=io.BytesIO(dec), mode='r:gz') as tar:
             names = tar.getnames()
             man = json.load(tar.extractfile('manifest.json'))
     except Exception as e:
         raise SystemExit(f'❌ Копию не прочитать: {e}')
+    if not signed and vtuple(str(man.get('version') or '0')) >= (2, 6, 1):
+        raise SystemExit(f'❌ У копии версии {man.get("version")} нет подписи — файл изменён, восстанавливать нельзя.')
     files = [n[len('files'):] for n in names if n.startswith('files/')]
     groups = {}
     for p in files:
         key = next((b for b in BK_PATHS if p == b or p.startswith(b.rstrip('/') + '/')), 'прочее')
         groups[key] = groups.get(key, 0) + 1
     out = [f'✅ Копия читается: {path}',
+           '🔏 Подпись сходится — копию не меняли.' if signed else
+           'ℹ️ Копия без подписи (сделана до версии 2.6.1): прочитать можно, но проверить, что её не меняли, нельзя.',
            f'Сделана {man.get("created_text")} на {man.get("host")} («{man.get("gw_name")}»), версия {man.get("version")}',
            f'Клиентов WireGuard: {man.get("peers")}, подписок: {man.get("subs")}, своих VPS: {man.get("vps")}, '
            f'админов: {man.get("admins")}']
@@ -10789,7 +10860,45 @@ def watcher():
         time.sleep(WATCH_EVERY)
 
 
-def dispatch(u):
+# Нажатия и сообщения одного человека обрабатываются по порядку: быстрые ответы и ввод не обгоняют друг друга
+# и не попадают не в тот шаг диалога. Если предыдущее действие долгое (развёртывание, «Починить»), следующее
+# ждёт не дольше UPD_WAIT и выполняется параллельно — иначе меню «зависало» бы на минуты.
+UPD_WAIT = 5
+upd_cv = threading.Condition()
+upd_next, upd_turn = {}, {}
+
+
+def upd_user(u):
+    x = u.get('callback_query') or u.get('message') or {}
+    return (x.get('from') or {}).get('id')
+
+
+def upd_ticket(u):
+    k = upd_user(u)
+    if k is None:
+        return None
+    with upd_cv:
+        n = upd_next.get(k, 0)
+        upd_next[k] = n + 1
+        upd_turn.setdefault(k, n)
+        return k, n
+
+
+def dispatch(u, ticket=None):
+    if ticket:
+        k, n = ticket
+        with upd_cv:
+            upd_cv.wait_for(lambda: upd_turn.get(k, 0) >= n, timeout=UPD_WAIT)
+    try:
+        dispatch1(u)
+    finally:
+        if ticket:
+            with upd_cv:
+                upd_turn[k] = max(upd_turn.get(k, 0), n + 1)     # по записи на админа — словари не растут
+                upd_cv.notify_all()
+
+
+def dispatch1(u):
     try:
         if not LINK_MODE and gw_nodes() and gw_route(u):
             return
@@ -12013,6 +12122,13 @@ def startup_reports():
             if link_cli['up']:
                 break
             time.sleep(1)
+    b = state_rt.get('broken')
+    if b:
+        notify('dead', '⚠️ <b>Файл состояния бота был повреждён</b>\n'
+                       f'Ошибка: <code>{h(b["err"])}</code>\nВзята запасная копия от '
+                       f'{time.strftime("%d.%m %H:%M", time.localtime(b["bak_ts"]))} — изменения после неё '
+                       f'(новые клиенты, настройки) могли пропасть. Испорченный файл: <code>{h(b["file"])}</code>.',
+               keep=True)
     if os.path.exists(RESTORED_FILE):
         report_restored()
     elif os.path.exists(UPDATE_RESULT):
@@ -12117,7 +12233,7 @@ def main():
             pass
         for u in res:
             offset = u['update_id'] + 1
-            threading.Thread(target=dispatch, args=(u,), daemon=True).start()
+            threading.Thread(target=dispatch, args=(u, upd_ticket(u)), daemon=True).start()
 
 
 def cli():

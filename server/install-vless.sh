@@ -51,6 +51,20 @@ touch "$LOG"; chmod 600 "$LOG"
 echo "===== $(date '+%F %T') $MODE" >>"$LOG"
 
 xray_bin() { command -v xray 2>/dev/null || echo /usr/local/bin/xray; }
+
+# В конфиге приватный ключ REALITY: читать его должны только root и служба xray (обычно User=nobody),
+# а не все пользователи сервера. То же для копий конфига (.bak-*, .sni-*) — в них тот же ключ.
+conf_perms() {
+    local u g f
+    if systemctl cat xray >/dev/null 2>&1; then u=$(systemctl show -p User --value xray 2>/dev/null); u=${u:-root}
+    else u=nobody; fi                                   # служба ещё не поставлена: официальная — от nobody
+    for f in "$CONF" "$CONF".*; do
+        [ -f "$f" ] || continue
+        if [ "$u" = root ] || ! g=$(id -gn "$u" 2>/dev/null); then chown root:root "$f"; chmod 600 "$f"
+        else chown "root:$g" "$f"; chmod 640 "$f"; fi
+    done
+}
+[ -f "$CONF" ] && conf_perms     # серверы, установленные до 2.6.1, — сразу при любом обращении бота
 xver()     { "$(xray_bin)" version 2>/dev/null | awk 'NR==1{print $2}'; }
 busy()     { ss -Htln "sport = :$1" 2>/dev/null | grep -q .; }
 conf_str() { grep -oP "\"$1\": *\\[?\"\\K[^\"]+" "$CONF" 2>/dev/null | head -1; }
@@ -108,7 +122,7 @@ write_conf() {   # порт маска [dest — по умолчанию сам 
     "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10", "::1/128"] } ] }
 }
 EOF
-    chmod 644 "$CONF"
+    conf_perms
     run "$(xray_bin)" run -test -c "$CONF"
 }
 
