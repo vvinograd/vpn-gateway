@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.7.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.7.2'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -351,6 +351,9 @@ def tg(method, _timeout=20, **params):
                 if not re.search(r'message is not modified|message to (delete|edit) not found|'
                                  r"message can't be (deleted|edited)", body):
                     log('Telegram', method, e.code, body[:200])
+                if e.code == 429:             # Telegram просит притормозить — фоновые обновления экранов ждут
+                    m = re.search(r'"retry_after"\s*:\s*(\d+)', body)
+                    tg_rt['flood_until'] = time.time() + (int(m.group(1)) if m else 30) + 5
                 if method == 'getUpdates':
                     tg_rt['err'] = f'HTTP {e.code} {body[:120]}'
                 return None
@@ -3733,30 +3736,35 @@ _live_guard = threading.Lock()
 
 
 def live_lock(chat):
-    """Замок чата: фоновое обновление экрана и нажатие кнопки не правят сообщение одновременно
-    (иначе фоновый кадр может лечь поверх только что открытого экрана)."""
+    """Замок чата — только для фоновых потоков одного чата. Нажатие кнопки его НЕ ждёт: иначе медленный
+    Telegram (правка через прокси до 10+ с) задерживает ответ на кнопку и все следующие нажатия."""
     with _live_guard:
         return _live_locks.setdefault(chat, threading.Lock())
 
 
 def live_stop(chat, keep_mon=False):
-    with live_lock(chat):
-        live_rt.pop(chat, None)
-        if not keep_mon:
-            mon_rt.pop(chat, None)
+    live_rt.pop(chat, None)               # без замка: кнопка не ждёт фоновую правку
+    if not keep_mon:
+        mon_rt.pop(chat, None)
+
+
+def live_paused():
+    return time.time() < (tg_rt.get('flood_until') or 0)
 
 
 def live_edit(chat, mid, tok, rt, text, kb):
     """Правка из фонового обновления — только если экран всё ещё открыт (тот же токен).
-    None — экран уже сменили; иначе ответ Telegram (пусто — правка не прошла)."""
+    None — экран уже сменили или Telegram просит притормозить; иначе ответ Telegram (пусто — не прошла)."""
+    if (rt.get(chat) or {}).get('tok') != tok or live_paused():
+        return None
+    p = {'chat_id': chat, 'message_id': mid, 'text': text, 'parse_mode': 'HTML',
+         'disable_web_page_preview': True}
+    if kb:
+        p['reply_markup'] = {'inline_keyboard': kb}
     with live_lock(chat):
         if (rt.get(chat) or {}).get('tok') != tok:
             return None
-        p = {'chat_id': chat, 'message_id': mid, 'text': text, 'parse_mode': 'HTML',
-             'disable_web_page_preview': True}
-        if kb:
-            p['reply_markup'] = {'inline_keyboard': kb}
-        return tg('editMessageText', 8, **p) or False
+        return tg('editMessageText', 5, **p) or False
 
 
 def spark(vals, top=None):
@@ -3838,8 +3846,7 @@ def mon_start(chat, mid):
         return mon_frame(m, 0), mon_kb(False)
     tok = os.urandom(4).hex()
     end = time.time() + MON_LEN
-    with live_lock(chat):
-        mon_rt[chat] = {'tok': tok, 'mid': mid}
+    mon_rt[chat] = {'tok': tok, 'mid': mid}
 
     def loop():
         while True:
@@ -3850,9 +3857,8 @@ def mon_start(chat, mid):
             try:
                 if left <= 0:
                     live_edit(chat, mid, tok, mon_rt, mon_frame(m, 0), mon_kb(False))
-                    with live_lock(chat):
-                        if (mon_rt.get(chat) or {}).get('tok') == tok:
-                            mon_rt.pop(chat, None)
+                    if (mon_rt.get(chat) or {}).get('tok') == tok:
+                        mon_rt.pop(chat, None)
                     return
                 if live_edit(chat, mid, tok, mon_rt, mon_frame(m, left), mon_kb(True)) is None:
                     return
@@ -7591,17 +7597,20 @@ def live_start(chat, mid, uid, data, shown):
     if not view:
         return
     tok = os.urandom(4).hex()
-    with live_lock(chat):
-        live_rt[chat] = {'tok': tok, 'mid': mid, 'data': data}
+    live_rt[chat] = {'tok': tok, 'mid': mid, 'data': data}
     end = time.time() + LIVE_LEN
 
+    def same(a, b):                       # часы «обновлено 16:05:33» сами по себе — не повод править сообщение
+        return re.sub(r'\b\d{1,2}:\d\d:\d\d\b', '', a[0]) == re.sub(r'\b\d{1,2}:\d\d:\d\d\b', '', b[0]) \
+            and a[1] == b[1]
+
     def loop():
-        last, errs, fails = tuple(shown), 0, 0
+        last, errs = tuple(shown), 0
         while time.time() < end:
             time.sleep(LIVE_PERIOD)
             if (live_rt.get(chat) or {}).get('tok') != tok:
                 return                    # нажали другую кнопку
-            if not is_admin(uid):
+            if not is_admin(uid) or live_paused():
                 break
             try:
                 res = view()
@@ -7615,20 +7624,16 @@ def live_start(chat, mid, uid, data, shown):
             if not res:
                 break                     # показывать больше нечего
             res = tuple(res)
-            if res == last:
+            if same(res, last):
                 continue
             r = live_edit(chat, mid, tok, live_rt, *res)
             if r is None:
                 return
             if not r:
-                fails += 1                # сообщение удалили или Telegram недоступен
-                if fails >= 2:
-                    break
-                continue
-            fails, last = 0, res
-        with live_lock(chat):
-            if (live_rt.get(chat) or {}).get('tok') == tok:
-                live_rt.pop(chat, None)
+                break                     # сообщение удалили или Telegram не принял — больше не пробуем
+            last = res
+        if (live_rt.get(chat) or {}).get('tok') == tok:
+            live_rt.pop(chat, None)
     threading.Thread(target=loop, daemon=True).start()
 
 
