@@ -62,6 +62,13 @@ Notifications arrive by themselves: "⚠️ Server X blocks Telegram — switche
   bypass strategy for its ISP, monitors it and moves a service to VPN on the fly if the bypass stops working.
 
 **Reliability**
+- **incidents with a cause**: within 20–30 seconds the bot checks the ISP link, DNS, clock, mihomo, routing, the
+  current server, the other servers, your own VPS, the subscription and Telegram, says what broke and why, fixes
+  what it can (bad mihomo config → last good one, clock sync, Xray restart over SSH) and reports how it recovered;
+- **"why did it go down"**: one hour of load history (CPU, RAM, temperature) on the gateway and own VPSes, reports
+  after unclean shutdowns, out-of-memory kills and mihomo/Xray crash loops;
+- **hang watchdog** for the bot (systemd) and a **notification queue** for when Telegram was unreachable;
+- **screen styles** per admin: plain, "📰 Herald" (a newspaper front page as a Telegram widget) and "🧾 Receipt";
 - **self-diagnostics**: stability of the current server, access to Telegram and YouTube, mihomo stalls;
 - **self-healing**: switching to a working server without ping-pong, restarting a stalled mihomo,
   manual server choice with an expiry;

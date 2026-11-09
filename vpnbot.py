@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.7.2'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.8'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import smtplib
 import socket
 import ssl
@@ -134,7 +135,8 @@ MODE_HELP = {
 PRESETS = {'fast': (120, 50), 'stable': (300, 300)}
 INTERVALS = [30, 60, 120, 300, 600, 1800]
 TOLERANCES = [30, 50, 100, 200, 300, 500, 1000]
-CFG_FORMAT = 5            # 4: замеры пинга и скорости всегда через выбранный сервер; 5: MAX и проверки IP — напрямую
+CFG_FORMAT = 6            # 4: замеры пинга и скорости всегда через выбранный сервер; 5: MAX и проверки IP — напрямую;
+#                           6: вход PROBE для диагностики сбоев (проверка «доступен ли сервер из-за границы»)
 # Российские приложения (MAX и т.п.) узнают внешний IP через несколько сервисов и сравнивают ответы.
 # Если часть проверок уходит через VPN, адреса расходятся, и приложение жалуется на VPN.
 # Поэтому сами приложения и эти сервисы всегда идут напрямую, в любом режиме маршрутизации.
@@ -339,7 +341,10 @@ def tg(method, _timeout=20, **params):
     last = None
     # Отправку сообщений повторяем: пока mihomo перезапускается (применение настроек, обновление),
     # Telegram недоступен несколько секунд, а напрямую из России может не открываться совсем.
-    for pause in ((3, 7, 15) if method in TG_RETRY else ()) + (None,):
+    # Связи уже нет (недавняя неудача) — без повторов: сообщение встанет в очередь, а циклы бота не будут
+    # минутами ждать Telegram (иначе сторож зависания счёл бы их зависшими).
+    retry = method in TG_RETRY and time.time() - tg_rt.get('net_err', 0) > 120
+    for pause in ((3, 7, 15) if retry else ()) + (None,):
         # сначала через VPN, если mihomo лежит — напрямую
         for opener in (proxy_opener, direct_opener):
             req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
@@ -362,6 +367,7 @@ def tg(method, _timeout=20, **params):
         if pause:
             time.sleep(pause)
     log('Telegram недоступен:', method, last)
+    tg_rt['net_err'] = time.time()        # сеть или Telegram недоступны — уведомления встанут в очередь
     if method == 'getUpdates':
         tg_rt['err'] = str(last)[:160]
     return None
@@ -405,6 +411,8 @@ def tg_watch(ok):
                 threading.Thread(target=mail_safe, args=(f'{GW_NAME}: нет связи с Telegram', body),
                                  daemon=True).start()
         return
+    if state.get('outbox'):
+        threading.Thread(target=outbox_flush, daemon=True).start()
     if tg_rt['down']:
         since, mailed = tg_rt['down'], tg_rt['mailed']
         tg_rt.update(down=None, mailed=False, err='')
@@ -482,7 +490,7 @@ def btn(text, data):
 # В чате всегда одно «живое» меню. Ответы на ввод и новые экраны заменяют его (старое удаляется),
 # сообщения админа удаляются после обработки, файлы и уведомления — по таймеру.
 CTX = threading.local()          # чат, для которого сейчас обрабатывается нажатие или сообщение
-ui = {'menu': {}, 'msgs': {}, 'del': []}
+ui = {'menu': {}, 'msgs': {}, 'del': [], 'wid': {}, 'issue': 0}   # wid: сообщения-виджеты «Вестника»
 ui_lock = threading.Lock()
 
 
@@ -579,6 +587,16 @@ def set_menu(chat, mid):
 
 
 def raw_send(chat, text, kb=None, ttl_kind=None):
+    doc = getattr(text, 'doc', None)
+    if doc and chat != CLI_CHAT:
+        st = admin_style(chat)
+        if st == 'vestnik':
+            r = send_widget(chat, doc, kb)
+            if r:
+                track(chat, r['message_id'], clean_ttl(chat, ttl_kind))
+                return r
+        elif st == 'check':
+            text = render_check(doc)
     p = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
     if kb:
         p['reply_markup'] = {'inline_keyboard': kb}
@@ -601,11 +619,7 @@ def send(chat, text, kb=None):
 
 
 def edit(chat, mid, text, kb=None):
-    p = {'chat_id': chat, 'message_id': mid, 'text': text, 'parse_mode': 'HTML',
-         'disable_web_page_preview': True}
-    if kb:
-        p['reply_markup'] = {'inline_keyboard': kb}
-    return tg('editMessageText', **p)
+    return put_screen(chat, mid, text, kb)[0]
 
 
 IMPORTANT = ('dead', 'tunnel', 'server', 'billing')
@@ -615,7 +629,7 @@ def notify(kind, text, exclude=None, keep=None):
     """keep=True — важное: висит, пока не нажмут «✔️ Понятно». Иначе удаляется по таймеру админа."""
     if keep is None:
         keep = kind in IMPORTANT and not text.startswith('🟢')
-    text = gw_prefix(text)
+    text = keep_doc(gw_prefix(text), text)
     with lock:
         targets = [int(uid) for uid, a in state['admins'].items()
                    if a['notify'].get(kind, True) and int(uid) != exclude
@@ -625,6 +639,8 @@ def notify(kind, text, exclude=None, keep=None):
         if raw_send(uid, text, [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]],
                     ttl_kind='keep' if keep else 'notif'):
             sent += 1
+        else:
+            outbox_add(uid, kind, text)
     mail_async(kind, text)
     return sent
 
@@ -1692,6 +1708,9 @@ def degrade(v, mode, cur, why, svc=None):
         save_state()
     stab_win.pop(target, None)
     add_event(f'Сервер {cur} {why} — переключился на {target}')
+    if inc():
+        inc_ev(f'{cur} {why} — переключился на {target}')
+        return target
     notify('switch', f'⚠️ <b>Сервер {h(cur)} {h(why)}</b>\n\nПереключился на <b>{h(target)}</b> — через него всё '
                      'работает.' + (' Ручной выбор снят, потому что сервер перестал нормально работать.'
                                      if was_manual else '')
@@ -2036,6 +2055,7 @@ def scr_diag(uid, note=''):
            btn(('✅' if v.get('tun_auto', True) else '⛔') + ' Автопереход', 'diag:auto')]]
     if bad:
         kb.append([btn('🧹 Забыть плохие серверы', 'diag:forget')])
+    kb.append([btn('🩺 Что случалось', 'inc'), btn('🧪 Проверить всё', 'inc:now')])
     kb.append([btn('🔄 Обновить', 'diag'), btn('⬅️ Управление', 'manage')])
     return '\n'.join(lines), kb
 
@@ -2119,6 +2139,9 @@ def fallback_to_auto(dead):
         now = '?'
     how = 'по приоритету' if v['mode'] == 'priority' else 'автовыбор'
     add_event(f'Сервер {dead} не отвечает — включён {how} ({now})')
+    if inc():
+        inc_ev(f'выбранный вручную {dead} не отвечает — включён {how}: {now}')
+        return
     notify('switch', f'⚠️ <b>Выбранный сервер не отвечает</b>\n\n{h(dead)} → <b>{h(now)}</b>\n'
                      f'Включён {how}. Вернуть сервер можно в «🌍 Серверы».')
 
@@ -2299,6 +2322,9 @@ def build_managed(v):
                 f'    interval: {v["interval"]}', f'    tolerance: {v["tolerance"]}', '    lazy: false',
                 f'  - name: VIA-{pid}', '    type: fallback', f'    proxies: [SUB-{pid}, {SELECT_GROUP}]',
                 '    url: https://www.gstatic.com/generate_204', '    interval: 120', '    lazy: false']
+    if probe_on(v):
+        # для диагностики: «доступен ли сервер из-за границы» — соединение через другой сервер (см. reach_abroad)
+        out += [f'  - name: {PROBE_GROUP}', '    type: select', f'    use: {use}']
     out += zt_groups
     out += ['', 'rules:']
     rules = ['IP-CIDR,10.0.0.0/8,DIRECT,no-resolve', 'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
@@ -2319,7 +2345,7 @@ def build_managed(v):
                 rules += [via_rule(x, SELECT_GROUP) for x in LIST_CATALOG[key][1]]
         rules.append('MATCH,DIRECT')
         out += [f'  - {x}' for x in rules]
-        return '\n'.join(out) + '\n'
+        return '\n'.join(out + probe_listener(v)) + '\n'
     if r != 'all':
         rules += [f'GEOSITE,ru-blocked,{SELECT_GROUP}', f'GEOIP,ru-blocked,{SELECT_GROUP},no-resolve',
                   'GEOSITE,category-ai-ru,DIRECT', f'GEOSITE,category-ai-!cn,{SELECT_GROUP}']
@@ -2332,21 +2358,45 @@ def build_managed(v):
     else:
         rules.append(f'MATCH,{SELECT_GROUP}')
     out += [f'  - {x}' for x in rules]
-    return '\n'.join(out) + '\n'
+    return '\n'.join(out + probe_listener(v)) + '\n'
+
+
+def probe_on(v):
+    return not v.get('probe_off') and not render_rt['user_listeners']
+
+
+def probe_listener(v):
+    if not probe_on(v):
+        return []
+    return ['', 'listeners:', f'  - name: {PROBE_NAME}', '    type: socks', f'    port: {PROBE_PORT}',
+            '    listen: 127.0.0.1', '    udp: false', f'    proxy: {PROBE_GROUP}']
 
 
 MANAGED_KEYS = {'geodata-mode', 'geodata-loader', 'geox-url', 'geo-auto-update', 'geo-update-interval',
                 'dns', 'sniffer', 'proxies', 'proxy-providers', 'proxy-groups', 'rules', 'rule-providers'}
 
 
+render_rt = {'user_listeners': False}
+
+
 def render_config(txt, v):
-    kept, skip = [], False
+    blocks, cur = [], None
     for line in txt.split('\n'):
         m = re.match(r'^([A-Za-z][\w-]*):', line)
-        if m:
-            skip = m.group(1) in MANAGED_KEYS
-        if not skip:
-            kept.append(line)
+        if m or cur is None:
+            cur = [m.group(1) if m else '', []]
+            blocks.append(cur)
+        cur[1].append(line)
+    kept = []
+    render_rt['user_listeners'] = False
+    for key, lines in blocks:
+        if key in MANAGED_KEYS:
+            continue
+        if key == 'listeners':
+            if any(PROBE_NAME in x for x in lines):
+                continue                  # наш вход для диагностики — пересобирается
+            render_rt['user_listeners'] = True   # свои listeners пользователя не трогаем — тогда без нашего
+        kept += lines
     head = '\n'.join(kept).rstrip('\n')
     return head + '\n\n' + build_managed(v)
 
@@ -2395,6 +2445,14 @@ def apply_vpn_config(v):
     os.chmod(MIHOMO_TEST_CFG, 0o600)
     binary = shutil.which('mihomo') or '/usr/bin/mihomo'
     r = run([binary, '-d', GEO_DIR, '-f', MIHOMO_TEST_CFG, '-t'], 180)
+    if r.returncode != 0 and PROBE_NAME in new:
+        # старый mihomo не понимает вход для диагностики — работаем без него, остальное важнее
+        log('mihomo отклонил вход диагностики, работаю без него:', (r.stdout + r.stderr)[-200:])
+        with lock:
+            v['probe_off'] = True
+        with open(MIHOMO_TEST_CFG, 'w', encoding='utf-8') as f:
+            f.write(render_config(txt, v))
+        r = run([binary, '-d', GEO_DIR, '-f', MIHOMO_TEST_CFG, '-t'], 180)
     if r.returncode != 0:
         os.remove(MIHOMO_TEST_CFG)
         raise RuntimeError('mihomo отклонил конфиг: ' + (r.stdout + r.stderr)[-300:])
@@ -2486,7 +2544,7 @@ def fmt_autoapply():
         time.sleep(5)
         if v['mode'] == 'priority' and not v['manual']:
             prio_tick(force=True)
-        add_event('Конфиг VPN обновлён до нового формата: MAX и сервисы проверки IP идут напрямую')
+        add_event(f'Конфиг VPN обновлён до формата {CFG_FORMAT}')
         log('конфиг mihomo переведён на формат', CFG_FORMAT)
     except Exception as e:
         log('не удалось обновить формат конфига mihomo:', e)
@@ -3070,34 +3128,65 @@ def scr_menu(uid):
     return text, kb
 
 
+def gw_load_line():
+    """«🖥 Шлюз: процессор 12 %, память 41 %, 54 °C» — по последнему замеру истории нагрузки."""
+    x = HIST[-1] if HIST else None
+    if not x or time.time() - x['t'] > 120:
+        return ''
+    parts = []
+    if x.get('c') is not None:
+        parts.append(f'процессор {x["c"]} %')
+    if x.get('m') is not None:
+        parts.append(f'память {x["m"]} %')
+    if x.get('T') is not None:
+        parts.append(f'{x["T"]} °C' + (' ⚠️' if x['T'] >= 85 else ''))
+    return '🖥 Шлюз: ' + ', '.join(parts) if parts else ''
+
+
 def scr_status(uid):
     lines = ['📊 <b>Статус шлюза</b>', '']
+    rows, doc = [], mkdoc('Главное', '', 'ok')
+    i = inc()
+    if i:
+        lines += [f'🚨 <b>Сейчас сбой</b> ({fmt_dur(max(int(time.time() - i["ts"]), 1))}): '
+                  + h(i.get('cause') or INC_TITLE.get(i['kind'], 'выясняю причину')), '']
     try:
         mode, cur = mode_and_current()
         info = server_info(cur)
         alive = info.get('alive', True)
+        ip = exit_ip()
+        doc.update(h=f'VPN работает: {cur}, {fmt_delay(info)}' if alive else f'Сервер {cur} не отвечает',
+                   s='ok' if alive else 'bad', r='Главное' if alive else 'Срочно',
+                   l=f'Шлюз выходит в интернет через {cur} ({MODE_RU[mode].lower()}), внешний адрес {ip}.')
+        rows += [['Сервер', cur, 'ok' if alive else 'bad'], ['Пинг', fmt_delay(info), ''], ['Режим', MODE_RU[mode], ''],
+                 ['Внешний IP', ip, '']]
         lines += [
             '🟢 VPN работает' if alive else '🔴 Текущий сервер не отвечает',
             f'🌍 Сервер: <b>{h(cur)}</b>',
             f'⚙️ Режим: {MODE_RU[mode]}',
             f'📶 Пинг: {fmt_delay(info)}',
-            f'🌐 Внешний IP: <code>{h(exit_ip())}</code>',
+            f'🌐 Внешний IP: <code>{h(ip)}</code>',
         ]
         try:
             down, up = current_speed()
             lines.append(f'⚡ Сейчас: ↓ {fmt_mbit(down)}  ↑ {fmt_mbit(up)}')
+            rows.append(['Скорость', f'↓ {fmt_mbit(down)} ↑ {fmt_mbit(up)}', ''])
         except Exception:
             pass
         days, conns = traffic_view()
         td = days.get(date.today().isoformat(), [0, 0])
         lines.append(f'📈 Сегодня: ↓ {fmt_bytes(td[0])}  ↑ {fmt_bytes(td[1])}')
+        rows.append(['Сегодня', f'↓ {fmt_bytes(td[0])} ↑ {fmt_bytes(td[1])}', ''])
         if conns is not None:
             lines.append(f'🔗 Активных соединений: {conns}')
+            rows.append(['Соединений', str(conns), ''])
         up_s = mihomo_uptime()
         if up_s is not None:
             lines.append(f'⏱ mihomo работает: {fmt_dur(up_s)}')
+            rows.append(['mihomo', f'работает {fmt_dur(up_s)}', 'ok'])
     except Exception as e:
         lines.append(f'🔴 <b>mihomo не отвечает</b>\n<code>{h(str(e))[:200]}</code>')
+        doc.update(h='mihomo не отвечает', s='bad', r='Срочно', l='VPN на шлюзе не работает: служба mihomo не отвечает.')
     lines.append('')
     try:
         live = wg_live()['peers']
@@ -3111,13 +3200,24 @@ def scr_status(uid):
                 lines.append(f'{"📡" if p["kind"] == "mikrotik" else "📱"} {h(p["name"])}: '
                              + (f'🟢 на связи ({fmt_dur(lv["age"])} назад)' if up else '🔴 нет связи'))
         lines.append(f'🔐 WireGuard: на связи {online} из {len([p for p in peers.values() if p["enabled"]])}')
+        rows.append(['WireGuard', f'на связи {online} из {len([p for p in peers.values() if p["enabled"]])}', ''])
     except Exception:
         lines.append('🔐 WireGuard: ⚠️ не запущен')
+        rows.append(['WireGuard', 'не запущен', 'bad'])
     l2s = lan2_status()
     if l2s:
         lines.append(l2s)
+        rows.append(['Второй порт', plain(l2s).split(': ', 1)[-1], 'warn' if '⚠️' in l2s else ''])
+    gl = gw_load_line()
+    if gl:
+        lines.append(gl)
+        rows.append(['Шлюз', gl.split(': ', 1)[-1], 'warn' if '⚠️' in gl else ''])
+    if i:
+        doc.update(r='Срочно', s='bad', h='Сбой: ' + (i.get('cause') or INC_TITLE.get(i['kind'], 'выясняю причину')),
+                   l=i.get('why') or doc['l'])
+    doc['w'] = rows
     lines += ['', f'<i>Обновлено {time.strftime("%H:%M:%S")}</i>']
-    return '\n'.join(lines), kb_back('status')
+    return styled('\n'.join(lines), doc), kb_back('status')
 
 
 def scr_servers(uid, note=''):
@@ -3125,6 +3225,7 @@ def scr_servers(uid, note=''):
     lst = servers()
     members = auto_members()
     lines = ['🌍 <b>Серверы</b>', '']
+    rows = []
     if mode == 'auto':
         lines.append(f'Режим: 🤖 <b>Авто</b>, сейчас {h(cur)}')
     elif mode == 'priority':
@@ -3148,6 +3249,8 @@ def scr_servers(uid, note=''):
         if svc_is_bad(name):
             extra += f' · ⚠️ {svc_bad[name]["why"]}'
         lines.append(f'{icon} {h(name)} — {fmt_delay(p)}{extra}')
+        rows.append([('● ' if name == cur else '') + name, fmt_delay(p) + (' ⚠' if svc_is_bad(name) else ''),
+                     'ok' if icon in ('✅', '🟢') else 'bad' if icon == '🔴' else ''])
         label = ('📍 ' if name == cur and mode == 'manual' else '') + name
         row.append(btn(label[:40], f'srv:{i}:{tag(name)}'))
         if len(row) == 2:
@@ -3162,7 +3265,12 @@ def scr_servers(uid, note=''):
     kb.append([btn(('✅ ' if mode != 'manual' else '') + ('📋 По приоритету' if prio else '🤖 Авто'), 'auto'),
                btn('📶 Замерить пинг', 'ping')])
     kb.append([btn('🏠 Меню', 'menu')])
-    return '\n'.join(lines), kb
+    good = sum(1 for r in rows if r[2] == 'ok')
+    ci = next((p for p in lst if p['name'] == cur), {})
+    doc = mkdoc('Курсы серверов', f'Сейчас {cur}: {fmt_delay(ci)}' if ci else f'Сейчас {cur}',
+                'ok' if good else 'bad', f'{MODE_RU[mode]}. Отвечают {good} из {len(rows)}. Меньше пинг — лучше.',
+                rows, plain(note) if note else '')
+    return styled('\n'.join(lines), doc), kb
 
 
 def scr_traffic(uid):
@@ -3283,6 +3391,8 @@ def scr_settings(uid, note=''):
         kb.append([btn('📧 Почтовые уведомления', 'em')])
         kb.append([btn('💾 Резервные копии', 'bk')])
         kb.append([btn('🏢 Шлюзы: несколько серверов в одном боте', 'gw:set')])
+    kb.append([btn(f'🎨 Вид экранов: {STYLES.get((state["admins"].get(str(uid)) or {}).get("style", "plain"))[0]}',
+                   'sty')])
     kb.append([btn('🧹 Чистый чат', 'cl')])
     kb.append([btn('🏠 Меню', 'menu')])
     return '\n'.join(lines), kb
@@ -3593,17 +3703,183 @@ def disks():
     return out
 
 
-def temperature():
-    vals = []
-    import glob
-    for f in glob.glob('/sys/class/thermal/thermal_zone*/temp') + glob.glob('/sys/class/hwmon/hwmon*/temp*_input'):
+CPU_SENSORS = ('coretemp', 'k10temp', 'zenpower', 'cpu_thermal', 'soc_thermal')
+temp_rt = {'virt': None}
+
+
+def is_virtual():
+    """Виртуальная машина? У неё датчиков нет или они показывают не то — температуру не показываем."""
+    if temp_rt['virt'] is None:
         try:
-            t = int(open(f).read().strip()) / 1000
-            if 0 < t < 150:
-                vals.append(t)
+            r = run(['systemd-detect-virt', '--vm'], 10)
+            temp_rt['virt'] = r.returncode == 0 and r.stdout.strip() not in ('', 'none')
         except Exception:
-            pass
+            temp_rt['virt'] = False
+    return temp_rt['virt']
+
+
+def temperature():
+    """Температура процессора, °C: сначала датчики процессора (Intel coretemp, AMD k10temp), иначе самая горячая
+    тепловая зона. На виртуальной машине — None."""
+    if is_virtual():
+        return None
+    import glob
+    cpu, other = [], []
+    for d in glob.glob('/sys/class/hwmon/hwmon*'):
+        try:
+            name = open(d + '/name').read().strip()
+        except OSError:
+            continue
+        for f in glob.glob(d + '/temp*_input'):
+            try:
+                t = int(open(f).read().strip()) / 1000
+            except Exception:
+                continue
+            if 0 < t < 150:
+                (cpu if name in CPU_SENSORS else other).append(t)
+    for f in glob.glob('/sys/class/thermal/thermal_zone*'):
+        try:
+            kind = open(f + '/type').read().strip()
+            t = int(open(f + '/temp').read().strip()) / 1000
+        except Exception:
+            continue
+        if 0 < t < 150:
+            (cpu if kind in ('x86_pkg_temp', 'cpu-thermal', 'cpu_thermal') else other).append(t)
+    vals = cpu or other
     return max(vals) if vals else None
+
+
+# ---------------- история нагрузки: последний час, раз в 30 с ----------------
+# Нужна, чтобы после сбоя сказать, что было перед ним: «память за 6 минут выросла с 70 до 99 %».
+HIST_FILE = '/var/lib/vpnbot/hist.json'
+HIST_EVERY = 30
+HIST_LEN = 120
+HIST = []
+hist_rt = {'cpu': None, 'oom_ts': None}
+
+
+def cpu_now():
+    try:
+        v = [int(x) for x in open('/proc/stat').readline().split()[1:]]
+    except Exception:
+        return None
+    idle, total = v[3] + (v[4] if len(v) > 4 else 0), sum(v)
+    prev, hist_rt['cpu'] = hist_rt['cpu'], (idle, total)
+    if not prev or total <= prev[1]:
+        return None
+    return round(100 * (1 - (idle - prev[0]) / (total - prev[1])))
+
+
+def mem_pct():
+    try:
+        m = dict(re.findall(r'^(\w+):\s+(\d+)', open('/proc/meminfo').read(), re.M))
+        return round(100 * (1 - int(m['MemAvailable']) / int(m['MemTotal'])))
+    except Exception:
+        return None
+
+
+def hist_load():
+    try:
+        HIST[:] = json.load(open(HIST_FILE))[-HIST_LEN:]
+    except Exception:
+        pass
+
+
+def hist_save():
+    try:
+        tmp = HIST_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(HIST[-HIST_LEN:], f)
+        os.replace(tmp, HIST_FILE)
+    except Exception:
+        pass
+
+
+def hist_tick():
+    cpu, mem, t = cpu_now(), mem_pct(), temperature()
+    try:
+        la = float(open('/proc/loadavg').read().split()[0])
+    except Exception:
+        la = None
+    HIST.append({'t': int(time.time()), 'c': cpu, 'm': mem, 'T': round(t) if t is not None else None, 'l': la})
+    del HIST[:-HIST_LEN]
+
+
+def span(vals, unit):
+    vals = [x for x in vals if x is not None]
+    if not vals:
+        return None
+    lo, hi = min(vals), max(vals)
+    return f'{lo}{unit}' if lo == hi else f'{lo}–{hi}{unit}'
+
+
+def hist_before(ts, minutes=10):
+    """Что было с сервером за minutes минут до ts: «ЦП до 34 %, память 61 % → 98 %, 71 °C»."""
+    pts = [x for x in HIST if ts - minutes * 60 <= x['t'] <= ts + 5]
+    if len(pts) < 2:
+        return ''
+    out = []
+    c = [x['c'] for x in pts if x.get('c') is not None]
+    if c:
+        out.append(f'процессор до {max(c)} %')
+    m = [x['m'] for x in pts if x.get('m') is not None]
+    if m:
+        out.append(f'память {m[0]} % → {m[-1]} %' if abs(m[-1] - m[0]) >= 10 else f'память {m[-1]} %')
+    T = [x['T'] for x in pts if x.get('T') is not None]
+    if T:
+        out.append(f'до {max(T)} °C')
+    return ', '.join(out) + f' (за {minutes} мин до этого)'
+
+
+def hist_summary():
+    """Строка для экрана «Сервер»: как прошёл последний час."""
+    if len(HIST) < 4:
+        return ''
+    c = [x['c'] for x in HIST if x.get('c') is not None]
+    parts = []
+    if c:
+        parts.append(f'процессор не выше {max(c)} %')
+    m = span([x.get('m') for x in HIST], ' %')
+    if m:
+        parts.append('память ' + m)
+    T = span([x.get('T') for x in HIST], ' °C')
+    if T:
+        parts.append('температура ' + T)
+    mins = round((HIST[-1]['t'] - HIST[0]['t']) / 60)
+    return f'За {mins} мин: ' + ', '.join(parts) if parts else ''
+
+
+def oom_tick():
+    """Ядро убило процесс из-за нехватки памяти — сказать, кого, и что было с памятью перед этим."""
+    since = hist_rt['oom_ts'] or time.time() - 120
+    hist_rt['oom_ts'] = time.time()
+    try:
+        out = run(['journalctl', '-k', '--since', '@%d' % int(since), '--no-pager', '-o', 'cat'], 15).stdout
+    except Exception:
+        return
+    for m in re.finditer(r'Out of memory: Killed process (\d+) \(([^)]+)\)', out):
+        name = m.group(2)
+        pre = hist_before(time.time(), 10)
+        text = (f'💥 <b>Нехватка памяти: ядро остановило «{h(name)}»</b>\n'
+                + (f'Перед этим: {h(pre)}.\n' if pre else '')
+                + {'mihomo': 'VPN на шлюзе прерывался. mihomo перезапустится сам — проверю.',
+                   'python3': 'Это бот. systemd поднимет его сам.'}.get(name, 'Проверю, поднялась ли служба.'))
+        add_event(f'Нехватка памяти: остановлен {name}')
+        notify('server', text, keep=True)
+
+
+def hist_loop():
+    n = 0
+    while True:
+        try:
+            hist_tick()
+            n += 1
+            if n % 4 == 0:
+                hist_save()
+                oom_tick()
+        except Exception:
+            log('история нагрузки:', traceback.format_exc())
+        time.sleep(HIST_EVERY)
 
 
 def net_bytes():
@@ -3695,7 +3971,10 @@ def scr_srv(uid, note=''):
         lines.append(f'💿 Диск {h(d["mount"])}: <code>{bar(dp / 100)}</code> {fmt_bytes(d["used"])} из '
                      f'{fmt_bytes(d["total"])} ({dp:.0f}%), свободно {fmt_bytes(d["free"])}' + (' ⚠️' if dp >= c['disk'] else ''))
     if sn['temp'] is not None:
-        lines.append(f'🌡 Температура: {sn["temp"]:.0f}°C' + (' ⚠️' if sn['temp'] >= 85 else ''))
+        lines.append(f'🌡 Температура процессора: {sn["temp"]:.0f}°C' + (' ⚠️' if sn['temp'] >= 85 else ''))
+    hs = hist_summary()
+    if hs:
+        lines.append(f'📈 {h(hs)}')
     if sn['rate']:
         lines.append(f'🌐 Сеть {h(sn["iface"])}: ↓ {fmt_mbit(sn["rate"][0])}  ↑ {fmt_mbit(sn["rate"][1])}')
     lines.append('')
@@ -3722,7 +4001,27 @@ def scr_srv(uid, note=''):
     if is_owner(uid):
         kb.append([btn('🚨 Пороги уведомлений', 'srvthr')])
     kb.append([btn('🏠 Меню', 'menu')])
-    return '\n'.join(lines), kb
+    warn = lambda x: 'warn' if x else ''
+    rows = [['Процессор', f'{sn["cpu"]:.0f} %', ''],
+            ['Нагрузка', f'{sn["load"][0]:.2f} на {sn["cores"]} ядр.', warn(lp >= c['load'])],
+            ['Память', f'{mp:.0f} % · {fmt_bytes(m["used"])}', warn(mp >= c['ram'])]]
+    for d in sn['disks']:
+        dp = 100 * d['used'] / max(d['total'], 1)
+        rows.append([f'Диск {d["mount"]}', f'{dp:.0f} % · свободно {fmt_bytes(d["free"])}', warn(dp >= c['disk'])])
+    if sn['temp'] is not None:
+        rows.append(['Температура', f'{sn["temp"]:.0f} °C', 'bad' if sn['temp'] >= 85 else ''])
+    if sn['rate']:
+        rows.append(['Сеть', f'↓ {fmt_mbit(sn["rate"][0])} ↑ {fmt_mbit(sn["rate"][1])}', ''])
+    for x in svc:
+        rows.append([plain(x)[2:].split(' (')[0], 'работает' if x.startswith('🟢') else 'остановлен',
+                     'ok' if x.startswith('🟢') else 'bad'])
+    bad = [r for r in rows if r[2] in ('warn', 'bad')]
+    hd = ('Сервер в порядке' if not bad else
+          f'{bad[0][0]}: {bad[0][1]}' + ('' if len(bad) == 1 else f' (и ещё {len(bad) - 1})'))
+    doc = mkdoc('Сервер', hd, 'bad' if any(r[2] == 'bad' for r in rows) else 'warn' if bad else 'ok',
+                f'{osname}, работает без перезагрузки {fmt_dur(sn["uptime"])}.' + (f' {hs}.' if hs else ''),
+                rows, plain(note) if note else '')
+    return styled('\n'.join(lines), doc), kb
 
 
 # ---------------- живой монитор: процессор, память, сеть раз в 3 секунды ----------------
@@ -3757,14 +4056,10 @@ def live_edit(chat, mid, tok, rt, text, kb):
     None — экран уже сменили или Telegram просит притормозить; иначе ответ Telegram (пусто — не прошла)."""
     if (rt.get(chat) or {}).get('tok') != tok or live_paused():
         return None
-    p = {'chat_id': chat, 'message_id': mid, 'text': text, 'parse_mode': 'HTML',
-         'disable_web_page_preview': True}
-    if kb:
-        p['reply_markup'] = {'inline_keyboard': kb}
     with live_lock(chat):
         if (rt.get(chat) or {}).get('tok') != tok:
             return None
-        return tg('editMessageText', 5, **p) or False
+        return put_screen(chat, mid, text, kb, 5)[0] or False
 
 
 def spark(vals, top=None):
@@ -3905,6 +4200,16 @@ def srv_cleanup():
     return freed, steps
 
 
+def top_mem(n=3):
+    """Кто занимает память: «\nБольше всех: mihomo 410 МБ, python3 120 МБ»."""
+    try:
+        out = run(['ps', '-eo', 'rss=,comm=', '--sort=-rss'], 10).stdout.split('\n')[:n]
+        items = [f'{x.split(None, 1)[1]} {fmt_bytes(int(x.split()[0]) * 1024)}' for x in out if x.strip()]
+        return '\nБольше всех: ' + h(', '.join(items)) if items else ''
+    except Exception:
+        return ''
+
+
 def srv_tick():
     c = srv_cfg()
     al = c['alerts']
@@ -3933,14 +4238,18 @@ def srv_tick():
     m = sn['mem']
     mp = 100 * m['used'] / max(m['total'], 1)
     flag('ram', mp >= c['ram'], mp < c['ram'] - 5,
-         f'💾 <b>Память занята на {mp:.0f}%</b> ({fmt_bytes(m["used"])} из {fmt_bytes(m["total"])})',
+         f'💾 <b>Память занята на {mp:.0f}%</b> ({fmt_bytes(m["used"])} из {fmt_bytes(m["total"])})'
+         + (f'\nКак росла: {h(hist_before(time.time(), 30))}.' if hist_before(time.time(), 30) else '')
+         + top_mem(),
          f'✅ Память в норме ({mp:.0f}%)')
     lp = sn['load'][1] / sn['cores']
     flag('load', lp >= c['load'], lp < c['load'] * 0.7,
          f'🧠 <b>Высокая нагрузка на процессор</b>: {sn["load"][1]:.2f} при {sn["cores"]} ядрах',
          '✅ Нагрузка на процессор в норме')
     if sn['temp'] is not None:
-        flag('temp', sn['temp'] >= 85, sn['temp'] < 75, f'🌡 <b>Перегрев: {sn["temp"]:.0f}°C</b>',
+        flag('temp', sn['temp'] >= 85, sn['temp'] < 75,
+             f'🌡 <b>Перегрев процессора: {sn["temp"]:.0f}°C</b>\nПри перегреве процессор снижает частоту, а при '
+             '100 °C и выше сервер может выключиться. Проверьте вентиляторы и пыль.',
              f'✅ Температура в норме ({sn["temp"]:.0f}°C)')
     act, _ = unit_info(f'wg-quick@{WG_IF}')
     flag('wg', act != 'active', act == 'active', '🔴 <b>Служба WireGuard остановлена</b>\nКлиенты не могут подключиться. '
@@ -7316,13 +7625,15 @@ def scr_wg(uid, note='', page=0):
              f'Сервер: <code>{WG_NET}.1</code>, порт {live["port"]}',
              f'Адрес для подключения: <code>{h(wg_endpoint())}</code>', '',
              f'<b>Пиры ({len(peers)}):</b>']
-    kb, row = [], []
+    kb, row, rows = [], [], []
+    online = sum(1 for pub, p in peers if peer_status(p, live['peers'].get(pub))[0] == '🟢')
     for pub, p in peers[page * PEERS_PAGE:(page + 1) * PEERS_PAGE]:
         lv = live['peers'].get(pub)
         icon, st = peer_status(p, lv)
         mu = peer_usage(p)['month']
         traffic = f' · за месяц {fmt_bytes(mu[0] + mu[1])}' if mu[0] + mu[1] else ''
         lines.append(f'{icon} {KIND_ICON[p["kind"]]} <b>{h(p["name"])}</b> · {p["ip"]} · {st}{traffic}{peer_badges(p)}')
+        rows.append([p['name'], st.replace('на связи, ', ''), 'ok' if icon == '🟢' else 'bad' if icon == '🔴' else ''])
         row.append(btn(f'{icon} {p["name"]}'[:40], f'wgp:{tag(pub)}'))
         if len(row) == 2:
             kb.append(row)
@@ -7342,7 +7653,11 @@ def scr_wg(uid, note='', page=0):
         kb.append([btn('🌐 Адрес для подключения', 'wgep')])
     kb.append([btn('📊 Статистика клиентов', 'wgstat')])
     kb.append([btn('🔄 Обновить', 'wg'), btn('🏠 Меню', 'menu')])
-    return '\n'.join(lines), kb
+    total = sum(1 for _, p in peers if p['enabled'])
+    doc = mkdoc('WireGuard', f'На связи {online} из {total}', 'ok' if online or not total else 'warn',
+                f'Адрес для подключения {wg_endpoint()}.' + (f' Страница {page + 1} из {pages}.' if pages > 1 else ''),
+                rows, plain(note) if note else '')
+    return styled('\n'.join(lines), doc), kb
 
 
 def scr_wg_peer(uid, pub, note=''):
@@ -8578,6 +8893,9 @@ def handle_callback(cq):
     if data == 'ok':                      # «✔️ Понятно» под уведомлением
         tg_del(chat, mid)
         return
+    if data in ('incre', 'ninc'):         # кнопки под карточкой сбоя
+        card_press(cq, data)
+        return
     if data == 'nmenu':                   # меню из уведомления: само уведомление остаётся
         t, kb = scr_menu(uid)
         send(chat, t, kb)
@@ -8764,6 +9082,12 @@ def handle_callback(cq):
             text, kb = res
         elif data.startswith('diag:'):
             text, kb = handle_diag(uid, data, chat, mid)
+        elif data == 'sty':
+            text, kb = scr_style(uid)
+        elif data.startswith('sty:'):
+            text, kb = handle_style(uid, data)
+        elif data == 'inc' or data.startswith('inc:'):
+            text, kb = handle_inc(uid, data, chat, mid)
         elif data == 'gws':
             text, kb = scr_gws(uid)
         elif data.startswith('gw:'):
@@ -8821,7 +9145,7 @@ def handle_callback(cq):
     except Exception as e:
         log(traceback.format_exc())
         text, kb = f'⚠️ <b>Ошибка</b>\n<code>{h(str(e))[:300]}</code>', kb_back()
-    edit(chat, mid, text, kb)
+    _, mid = put_screen(chat, mid, text, kb)      # mid меняется, если экран переехал (текст ⇄ «Вестник»)
     if shown:
         live_start(chat, mid, uid, data, (text, kb))
 
@@ -9890,6 +10214,10 @@ def maint_loop():
             vs_tick()
         except Exception:
             log('vs_tick:', traceback.format_exc())
+        try:
+            clock_tick()
+        except Exception:
+            log('clock_tick:', traceback.format_exc())
         time.sleep(30)
 
 
@@ -10568,13 +10896,58 @@ def start_self_update(chat):
     except Exception:
         base = None
     with lock:
-        state['upd_pending'] = {'to': u.get('latest'), 'chat': chat, 'from': BOT_VERSION}
+        state['upd_pending'] = {'to': u.get('latest'), 'chat': chat, 'from': BOT_VERSION, 'ts': time.time()}
         state['upd_guard'] = {'from': BOT_VERSION, 'to': u.get('latest'), 'ts': time.time() + 60, 'base': base}
         save_state()
     unit = f'vpngw-update-{int(time.time())}'
     r = run(['systemd-run', f'--unit={unit}', '--collect', '/bin/bash', path, '--self-update'], 30)
     if r.returncode != 0:
         raise RuntimeError('не удалось запустить обновление: ' + r.stderr[-200:])
+
+
+def notify_to(uids, kind, text, keep=False):
+    """Важное сообщение конкретным людям — независимо от их настроек уведомлений (результат обновления и т. п.).
+    Остальные админы получают его как обычно, если у них включена эта категория."""
+    text = keep_doc(gw_prefix(text), text)
+    with lock:
+        admins = state['admins']
+        want = {int(u) for u, a in admins.items() if a['notify'].get(kind, True)}
+        must = {int(u) for u in uids if u and str(int(u)) in admins}
+    sent = 0
+    for uid in sorted(must | want):
+        if raw_send(uid, text, [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]],
+                    ttl_kind='keep' if keep else 'notif'):
+            sent += 1
+        else:
+            outbox_add(uid, kind, text)
+    mail_async(kind, text)
+    return sent
+
+
+def health_brief():
+    """Что проверено после обновления: «бот ✓ · mihomo ✓ · туннель ✓ (Рига 42 мс) · WireGuard ✓ (5)»."""
+    parts = ['бот ✓']
+    try:
+        snap = health_snapshot()
+    except Exception:
+        snap = {}
+    parts.append('mihomo ' + ('✓' if snap.get('api') else '✗'))
+    tun = 'туннель ' + ('✓' if snap.get('vpn') else '✗')
+    try:
+        _, cur = mode_and_current()
+        d = delay_of(server_info(cur))
+        tun += f' ({cur}' + (f' {d} мс)' if d else ')')
+    except Exception:
+        pass
+    parts.append(tun)
+    try:
+        live = wg_live()['peers']
+        on = sum(1 for x in live.values() if x.get('age') is not None and x['age'] < WG_STALE)
+        parts.append('WireGuard ' + ('✓' if snap.get('wg', True) else '✗') + f' ({on} на связи)')
+    except Exception:
+        parts.append('WireGuard ' + ('✓' if snap.get('wg') else '✗'))
+    ok = all(snap.get(k, True) for k in ('api', 'vpn', 'wg'))
+    return ok, ' · '.join(parts)
 
 
 def report_update_result():
@@ -10585,22 +10958,42 @@ def report_update_result():
         os.remove(UPDATE_RESULT)
     except Exception:
         return
-    pend = state.pop('upd_pending', None) or {}
-    save_state()
+    with lock:
+        pend = state.pop('upd_pending', None) or {}
+        save_state()
     status, _, rest = res.partition(' ')
+    who = [OWNER, pend.get('chat')]
+    took = f' за {fmt_dur(time.time() - pend["ts"])}' if pend.get('ts') else ''
     if status == 'ok':
-        text = f'✅ <b>Шлюз обновлён до версии {h(BOT_VERSION)}</b>'
+        was = pend.get('from')
+        head = (f'✅ <b>Шлюз обновлён: {h(was)} → {h(BOT_VERSION)}</b>{took}' if was and was != BOT_VERSION
+                else f'✅ <b>Шлюз обновлён до версии {h(BOT_VERSION)}</b>{took}')
+        ok, brief = health_brief()
+        text = head + f'\nПроверено: {h(brief)}'
+        if not ok:
+            text += '\n⚠️ Не всё в порядке — страховка следит 15 минут и откатит версию, если станет хуже, чем до обновления.'
         ch = (state.get('upd') or {}).get('changes')
         if ch:
-            text += '\n\n' + h(ch[:1500])
-        text += '\n\nЕсли в новой версии изменились настройки VPN, загляните в ⚙️ Настройки — там может быть кнопка «Применить».'
+            text += '\n\n<b>Что нового:</b>\n' + h(ch[:1400])
+        text = styled(text, mkdoc('Обновление', plain(head).lstrip('✅ '), 'ok' if ok else 'warn',
+                                  'Новая версия запущена и проверена.' if ok else
+                                  'Не всё в порядке — страховка 15 минут следит и откатит версию, если станет хуже.',
+                                  [[x.split(' ')[0], x.split(' ', 1)[1] if ' ' in x else '', 'ok' if '✓' in x else 'bad']
+                                   for x in brief.split(' · ')],
+                                  (ch or '').split('\n')[0][:150]))
     else:
-        text = (f'⚠️ <b>Обновление не удалось</b>, возвращена прежняя версия {h(BOT_VERSION)}.\n'
-                f'<code>{h(rest[:400])}</code>')
-    with lock:
-        want = any(a['notify'].get('actions', True) for a in state['admins'].values())
-    if not notify('actions', text) and want and upd_retry[0] < 20:
-        upd_retry[0] += 1                 # Telegram был недоступен — сообщим позже, а не потеряем
+        text = (f'⚠️ <b>Обновление до {h(pend.get("to") or "новой версии")} не удалось</b>{took}\n'
+                f'Причина: <code>{h(rest[:400])}</code>\n'
+                f'Возвращена прежняя версия {h(BOT_VERSION)}, она работает.')
+        ok, brief = health_brief()
+        text += f'\nПроверено: {h(brief)}'
+        text = styled(text, mkdoc('Обновление', f'Не удалось обновиться до {pend.get("to") or "новой версии"}', 'bad',
+                                  f'Причина: {rest[:200]}. Возвращена прежняя версия {BOT_VERSION}, она работает.',
+                                  [[x.split(' ')[0], x.split(' ', 1)[1] if ' ' in x else '', 'ok' if '✓' in x else 'bad']
+                                   for x in brief.split(' · ')]))
+    sent = notify_to(who, 'actions', text, keep=status != 'ok')
+    if not sent and upd_retry[0] < 20 and not tg_reachable():
+        upd_retry[0] += 1                 # Telegram недоступен — сообщим позже, а не потеряем
         with open(UPDATE_RESULT, 'w', encoding='utf-8') as f:
             f.write(res)
         with lock:
@@ -10970,11 +11363,14 @@ def watcher():
     last_srv = 0
     started = time.time()
     while True:
+        beat('watcher')
+        if state.get('outbox'):
+            outbox_flush()
         try:
             mode, cur = mode_and_current()
             if api_alert:
-                notify('dead', '🟢 <b>mihomo снова отвечает</b>')
                 add_event('mihomo снова отвечает')
+                inc_ev('mihomo снова отвечает')
                 api_alert = False
             api_bad = 0
             if mode == 'manual' and time.time() - last_manual[0] > 20 and not probe(cur):
@@ -10983,26 +11379,27 @@ def watcher():
                 prev = cur
                 dead_cnt = 0
             if prev is not None and cur != prev:
+                why = switch_reason(prev, cur)
                 time.sleep(3)
                 info = server_info(cur)
-                add_event(f'Переключение: {prev} → {cur}')
-                if time.time() - last_manual[0] > WATCH_EVERY * 2:
-                        notify('switch', f'🔁 <b>VPN-сервер сменился</b>\n\n{h(prev)} → <b>{h(cur)}</b>\n'
-                                     f'Режим: {MODE_RU[mode]}\n'
-                                     f'Пинг: {fmt_delay(info)}\nВнешний IP: <code>{h(exit_ip())}</code>')
+                add_event(f'Переключение: {prev} → {cur} ({why})')
+                if inc():
+                    inc_ev(f'переключился на {cur}: {why}')
+                elif time.time() - last_manual[0] > WATCH_EVERY * 2:
+                    notify('switch', f'🔁 <b>Переключился на {h(cur)}</b>, потому что {h(why)}.\n\n'
+                                     f'Было: {h(prev)} · режим: {MODE_RU[mode]}\n'
+                                     f'Пинг: {fmt_delay(info)} · внешний IP: <code>{h(exit_ip())}</code>')
             prev = cur
             alive = server_info(cur).get('alive', True)
             dead_cnt = 0 if alive else dead_cnt + 1
             if dead_cnt >= 2 and not dead_alert:
-                why = ('Ни один сервер не отвечает.' if mode != 'manual' else
-                       'Выбранный вручную сервер не отвечает. Включите автовыбор или выберите другой.')
-                notify('dead', f'🔴 <b>VPN не работает</b>\n\n{why}\nСервер: {h(cur)}')
-                add_event(f'VPN недоступен ({cur})')
+                inc_open('vpn', cur, mode)        # проверка всех слоёв, причина и карточка сбоя
                 dead_alert = True
-            elif alive and dead_alert:
-                notify('dead', f'🟢 <b>VPN снова работает</b>\nСервер: {h(cur)}')
-                add_event('VPN восстановлен')
+            elif alive and (dead_alert or (inc() and not inc().get('closing'))):
+                threading.Thread(target=inc_close, daemon=True).start()   # итог: что было, почему, как ожило
                 dead_alert = False
+            good_cfg_tick(alive)
+            inc_tick()
             if time.time() - last_tr >= TRAFFIC_EVERY:
                 sample_traffic()
                 last_tr = time.time()
@@ -11010,11 +11407,15 @@ def watcher():
         except Exception as e:
             api_bad += 1
             log('ошибка наблюдателя:', e)
+            good_cfg_tick(False)
             if api_bad >= 3 and not api_alert:
-                notify('dead', '🔴 <b>mihomo не отвечает</b>\n\nVPN на шлюзе не работает. '
-                               'Попробуйте «🔧 Управление → ♻️ Перезапуск mihomo».')
-                add_event('mihomo не отвечает')
+                inc_open('mihomo')                # причина (ошибка в настройках, нехватка памяти…) и починка
                 api_alert = True
+            inc_tick()
+        try:
+            mh_loop_tick()
+        except Exception:
+            log('mh_loop_tick:', traceback.format_exc())
         try:
             live = wg_live()['peers']
         except Exception:
@@ -11048,8 +11449,13 @@ def watcher():
             report_update_result()
         if state.get('upd_pending') and time.time() - started > 300 and not os.path.exists(UPDATE_RESULT):
             with lock:
-                state.pop('upd_pending', None)
+                pend = state.pop('upd_pending', None) or {}
                 save_state()
+            if pend.get('to') and pend.get('to') != BOT_VERSION:
+                notify_to([OWNER, pend.get('chat')], 'actions',
+                          f'⚠️ <b>Обновление до {h(pend["to"])} не прислало результата</b>\n'
+                          f'Сейчас работает версия {h(BOT_VERSION)}. Журнал установки: '
+                          '<code>sudo tail -n 40 /var/log/vpngw-install.log</code>', keep=True)
         if time.time() - started > 120:
             try:
                 update_tick()
@@ -12340,6 +12746,14 @@ def startup_reports():
             if link_cli['up']:
                 break
             time.sleep(1)
+    cr = crash_report(state_rt.get('crash'))
+    if cr:
+        add_event(plain(cr).split('\n')[0])
+        if 'Сервер выключался' in cr:
+            time.sleep(45)                # дать подняться mihomo и туннелю, чтобы проверить, что всё восстановилось
+            ok, brief = health_brief()
+            cr += f'\nПосле включения проверено: {h(brief)}' + ('' if ok else '\n⚠️ Не всё поднялось — смотрю дальше.')
+        notify('dead', cr, keep=True)
     b = state_rt.get('broken')
     if b:
         notify('dead', '⚠️ <b>Файл состояния бота был повреждён</b>\n'
@@ -12357,9 +12771,1442 @@ def startup_reports():
         notify('actions', f'✅ <b>Бот запущен</b> · версия {h(BOT_VERSION)}\nVPN-шлюз на связи.')
 
 
+# ---------------- вид экранов: «Обычный», «Вестник», «Чек» ----------------
+# Каждый админ выбирает сам (⚙️ Настройки → 🎨 Вид экранов). Экраны статуса, серверов, WireGuard, сервера,
+# карточки сбоя и результата обновления, кроме текста, несут «выпуск» doc — общее описание:
+#   r — рубрика, h — заголовок, s — ok/warn/bad, l — заметка, w — строки [подпись, значение, ok/warn/bad], n — сноска.
+# «Чек» печатает doc моноширинной кассовой лентой в 30 знаков. «Вестник» — первая полоса газеты: виджет Telegram
+# (Bot API 10.4, sendWidget): HTML отправляется один раз, дальше бот меняет только данные (editMessageWidgetData,
+# без звука и пометки «изменено»). Telegram без виджетов покажет подпись — короткий заголовок. Не принял виджет —
+# этот админ получает обычный текст, а бот повторит попытку через 6 часов.
+STYLES = {'plain': ('📄 Обычный', 'текст с эмодзи — как было'),
+          'vestnik': ('📰 Вестник', 'первая полоса газеты: заголовок, заметка и колонки. Живая картинка в сообщении — '
+                                   'нужен свежий Telegram (с виджетами)'),
+          'check': ('🧾 Чек', 'кассовая лента: строки с точками, итог внизу, моноширинный шрифт')}
+CHECK_W = 30
+WIDGET_RETRY = 6 * 3600
+
+
+class Styled(str):
+    """Текст экрана, к которому приложен «выпуск» для видов «Вестник» и «Чек»."""
+    doc = None
+
+
+def styled(text, doc):
+    s = Styled(text)
+    s.doc = doc
+    return s
+
+
+def keep_doc(new, old):
+    d = getattr(old, 'doc', None)
+    return styled(new, d) if d else new
+
+
+def mkdoc(r, hd, st, lede='', rows=(), note=''):
+    return {'r': r, 'h': hd, 's': st, 'l': lede, 'w': [list(x) for x in rows if x and x[1] not in (None, '')],
+            'n': note}
+
+
+def admin_style(uid):
+    try:
+        st = (state['admins'].get(str(uid)) or {}).get('style', 'plain')
+    except Exception:
+        return 'plain'
+    if st == 'vestnik' and time.time() - (tg_rt.get('widget_off') or 0) < WIDGET_RETRY:
+        return 'plain'
+    return st if st in STYLES else 'plain'
+
+
+EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x2300, 0x23FF), (0x25A0, 0x25FF))
+EMOJI_RE = re.compile('[' + ''.join(f'{chr(a)}-{chr(b)}' for a, b in EMOJI_RANGES)
+                      + ''.join(chr(c) for c in (0xFE0F, 0x200D, 0x20E3)) + ']')
+CHECK_ABBR = (('Мбит/с', 'Мб/с'), ('↓ ', '↓'), ('↑ ', '↑'), ('процессор', 'ЦП'), ('память', 'ОЗУ'), ('на связи ', ''), ('свободно', 'своб.'))
+
+
+def deemoji(s):
+    s = str(s).replace('✓', 'да').replace('✗', 'НЕТ').replace('●', '*')
+    for a, b in CHECK_ABBR:
+        s = s.replace(a, b)
+    s = EMOJI_RE.sub('', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def wrap_w(s, w=CHECK_W):
+    out, line = [], ''
+    for word in s.split():
+        while len(word) > w:
+            if line:
+                out.append(line)
+                line = ''
+            out.append(word[:w])
+            word = word[w:]
+        if not line:
+            line = word
+        elif len(line) + 1 + len(word) <= w:
+            line += ' ' + word
+        else:
+            out.append(line)
+            line = word
+    if line:
+        out.append(line)
+    return out
+
+
+def ck_row(label, value):
+    label, value = deemoji(label), deemoji(value)
+    if len(label) + len(value) + 3 <= CHECK_W:
+        return [label + ' ' + '.' * (CHECK_W - len(label) - len(value) - 2) + ' ' + value]
+    out = wrap_w(label)
+    out += [x.rjust(CHECK_W) for x in wrap_w(value, CHECK_W - 2)]
+    return out
+
+
+CHECK_SUM = {'ok': 'ВСЁ В ПОРЯДКЕ', 'warn': 'ЕСТЬ ЗАМЕЧАНИЯ', 'bad': 'СБОЙ'}
+
+
+def render_check(doc):
+    W = CHECK_W
+    with ui_lock:
+        ui['issue'] = ui.get('issue', 0) + 1
+        no = ui['issue']
+    L = ['=' * W, deemoji(GW_NAME).upper()[:W].center(W), deemoji(doc.get('r', '')).upper()[:W].center(W),
+         time.strftime('%d.%m.%Y  %H:%M:%S').center(W), '-' * W]
+    L += [x.center(W) for x in wrap_w(deemoji(doc.get('h', '')).upper())]
+    if doc.get('l'):
+        L.append('')
+        L += wrap_w(deemoji(doc['l']))
+    if doc.get('w'):
+        L.append('-' * W)
+        for row in doc['w']:
+            L += ck_row(row[0], row[1])
+    L.append('-' * W)
+    L += ck_row('ИТОГ', CHECK_SUM.get(doc.get('s'), ''))
+    if doc.get('n'):
+        L.append('')
+        L += wrap_w(deemoji(doc['n']))
+    L += ['=' * W, f'ЧЕК № {no:05d}'.center(W)]
+    return '<pre>' + h('\n'.join(L)) + '</pre>'
+
+
+def widget_data(doc):
+    """chat_data виджета: не больше 1024 байт — лишние строки и хвост заметки отбрасываются."""
+    d = {'r': doc.get('r', ''), 'h': doc.get('h', ''), 's': doc.get('s', 'ok'), 'l': doc.get('l', ''),
+         'w': [[str(a)[:28], str(b)[:44], c] for a, b, c in (x + [''] * (3 - len(x)) for x in doc.get('w') or [])],
+         'n': doc.get('n', '')[:160], 'g': GW_NAME[:30], 'd': time.strftime('%d.%m.%Y %H:%M:%S')}
+    with ui_lock:
+        d['i'] = ui.get('issue', 0)
+
+    def size():
+        return len(json.dumps(d, ensure_ascii=False, separators=(',', ':')).encode())
+    while size() > 1000 and d['w']:
+        d['w'].pop()
+        d['m'] = (d.get('m') or 0) + 1                # «и ещё N» внизу колонок
+    while size() > 1000 and len(d['l']) > 40:
+        d['l'] = d['l'][:max(40, len(d['l']) - 60)].rstrip() + '…'
+    if size() > 1000:
+        d['n'] = ''
+    return json.dumps(d, ensure_ascii=False, separators=(',', ':'))
+
+
+# Первая полоса «Вестника». Только обычные шрифты (serif/sans-serif/monospace): свои Telegram вырезает.
+VESTNIK_HTML = '''<!doctype html><meta charset="utf-8"><style>
+:root{--ink:#1b1814;--red:#a3241a;--ok:#1f6a3a;--warn:#9a6a00;--paper:#f6f1e6}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.4 serif}
+.p{padding:12px 14px 12px}.m{text-align:center;border-bottom:3px double var(--ink);padding-bottom:5px}
+.m h1{margin:0;font:900 28px/1 serif;letter-spacing:.01em}
+.mt{display:flex;justify-content:space-between;gap:6px;border-top:1px solid var(--ink);margin-top:5px;padding-top:3px;
+font:11px/1.2 sans-serif;text-transform:uppercase;letter-spacing:.05em}
+.ld{padding:8px 0 7px;border-bottom:1px solid var(--ink)}
+.k{font:700 11px sans-serif;letter-spacing:.14em;text-transform:uppercase;color:var(--ok)}
+.bad .k{color:var(--red)}.warn .k{color:var(--warn)}
+h2{margin:3px 0 5px;font:900 23px/1.08 serif}p{margin:0}
+ul{list-style:none;margin:6px 0 0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));column-gap:16px}
+li{display:flex;justify-content:space-between;gap:8px;border-bottom:1px dotted #b9b09f;padding:2px 0;font-size:14px}
+li span{color:#3a352d}li b{font:600 14px/1.3 serif;text-align:right}li b.n{font:600 13px monospace}
+li.bad b{color:var(--red)}li.warn b{color:var(--warn)}li.ok b{color:var(--ok)}
+.f{margin-top:8px;border-top:3px double var(--ink);padding-top:4px;font:12px/1.35 serif;color:#3a352d}
+</style><div class="p" id="a"><div class="m"><h1>Вестник шлюза</h1><div class="mt"><span id="g"></span><span id="d"></span>
+<span>№ <b id="i"></b></span></div></div><div class="ld" id="ld"><div class="k" id="r"></div><h2 id="h"></h2><p id="l"></p></div>
+<ul id="w"></ul><div class="f" id="n"></div></div><script>
+var T=window.TelegramWidget;function $(x){return document.getElementById(x)}
+function e(t,c,x){var n=document.createElement(t);if(c)n.className=c;if(x!=null)n.textContent=x;return n}
+function draw(){var d={};try{d=JSON.parse((T&&T.chatData)||"{}")||{}}catch(_){}
+$("g").textContent=d.g||"";$("d").textContent=d.d||"";$("i").textContent=d.i||"1";
+$("ld").className="ld "+(d.s||"ok");$("r").textContent=d.r||"";$("h").textContent=d.h||"";$("l").textContent=d.l||"";
+var w=$("w");while(w.firstChild)w.removeChild(w.firstChild);(d.w||[]).forEach(function(x){var li=e("li",x[2]||"");
+li.appendChild(e("span","",x[0]));li.appendChild(e("b",String(x[1]).length<16?"n":"",x[1]));w.appendChild(li)});
+if(d.m){var li=e("li","");li.appendChild(e("span","","…и ещё "+d.m));w.appendChild(li)}
+var n=$("n");n.textContent=d.n||"";n.style.display=d.n?"":"none"}
+if(T&&T.onEvent)T.onEvent("chatDataChanged",draw);draw();if(T&&T.ready)T.ready();
+</script>'''
+
+
+def widget_caption(doc):
+    return (f'📰 {deemoji(doc.get("r", ""))}: {doc.get("h", "")}')[:200]
+
+
+def is_widget(chat, mid):
+    with ui_lock:
+        return str(mid) in (ui.setdefault('wid', {}).get(str(chat)) or {})
+
+
+def mark_widget(chat, mid, kb=None, on=True):
+    with ui_lock:
+        w = ui.setdefault('wid', {}).setdefault(str(chat), {})
+        if on:
+            w[str(mid)] = json.dumps(kb or [], sort_keys=True)
+            for k in sorted(w, key=int)[:-30]:
+                w.pop(k, None)
+        else:
+            w.pop(str(mid), None)
+    ui_save()
+
+
+def send_widget(chat, doc, kb=None, timeout=20):
+    with ui_lock:
+        ui['issue'] = ui.get('issue', 0) + 1
+    p = {'chat_id': chat, 'html': VESTNIK_HTML, 'chat_data': widget_data(doc), 'caption': widget_caption(doc),
+         'width': 0, 'height': 0}
+    if kb:
+        p['reply_markup'] = {'inline_keyboard': kb}
+    r = tg('sendWidget', timeout, **p)
+    if not r:
+        if tg_reachable():
+            tg_rt['widget_off'] = time.time()   # Telegram не принял виджет — до повторной попытки обычный текст
+            log('виджет не принят — «Вестник» временно показывается текстом')
+        return None
+    mark_widget(chat, r['message_id'], kb)
+    return r
+
+
+redirect = {}                       # (чат, старое сообщение) → новое: экран переехал (текст ⇄ виджет)
+
+
+def put_screen(chat, mid, text, kb=None, timeout=20):
+    """Показать экран в сообщении mid с учётом вида, выбранного админом. Возвращает (ответ Telegram, mid);
+    mid меняется, если пришлось заменить сообщение (виджет нельзя превратить в текст и наоборот)."""
+    mid = redirect.get((chat, mid), mid)
+    doc = getattr(text, 'doc', None)
+    style = admin_style(chat) if chat != CLI_CHAT else 'plain'
+    if doc and style == 'check':
+        text = render_check(doc)
+    wid = is_widget(chat, mid)
+    if doc and style == 'vestnik':
+        if wid:
+            r = tg('editMessageWidgetData', timeout, chat_id=chat, message_id=mid, chat_data=widget_data(doc))
+            kbs = json.dumps(kb or [], sort_keys=True)
+            with ui_lock:
+                old = (ui.get('wid', {}).get(str(chat)) or {}).get(str(mid))
+            if kbs != old:
+                tg('editMessageReplyMarkup', timeout, chat_id=chat, message_id=mid,
+                   reply_markup={'inline_keyboard': kb or []})
+                mark_widget(chat, mid, kb)
+            return (r or True), mid
+        r = send_widget(chat, doc, kb, timeout)
+        if r:
+            return r, replace_msg(chat, mid, r['message_id'])
+    if wid:                                 # был виджет, а этот экран — текст: новое сообщение вместо виджета
+        p = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
+        if kb:
+            p['reply_markup'] = {'inline_keyboard': kb}
+        r = tg('sendMessage', timeout, **p)
+        if r:
+            mark_widget(chat, mid, on=False)
+            return r, replace_msg(chat, mid, r['message_id'])
+        return None, mid
+    p = {'chat_id': chat, 'message_id': mid, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
+    if kb:
+        p['reply_markup'] = {'inline_keyboard': kb}
+    return tg('editMessageText', timeout, **p), mid
+
+
+def replace_msg(chat, old, new):
+    """Сообщение old заменено на new: новое становится меню (если old им было), старое удаляется."""
+    redirect[(chat, old)] = new
+    if len(redirect) > 500:
+        for k in list(redirect)[:250]:
+            redirect.pop(k, None)
+    with ui_lock:
+        was_menu = ui['menu'].get(str(chat)) == old
+        ttl = (ui['msgs'].get(str(chat)) or {}).get(str(old))
+    if was_menu:
+        set_menu(chat, new)               # прежнее меню set_menu удалит сам
+    else:
+        track(chat, new, ttl if isinstance(ttl, (int, float)) and ttl > 1e9 else None)
+        tg_del(chat, old)
+    mark_widget(chat, old, on=False)
+    return new
+
+
+def scr_style(uid, note=''):
+    cur = (state['admins'].get(str(uid)) or {}).get('style', 'plain')
+    lines = ['🎨 <b>Вид экранов</b>', '',
+             'Статус, серверы, WireGuard, сервер, карточки сбоев и сообщения об обновлении можно смотреть по-разному. '
+             'Выбор — только для вас, у других админов свой.', '']
+    for k, (t, d) in STYLES.items():
+        lines.append(f'{"✅" if k == cur else "▫️"} <b>{t}</b> — {d}')
+    if cur == 'vestnik' and admin_style(uid) != 'vestnik':
+        lines += ['', '⚠️ Telegram сейчас не принимает виджеты — «Вестник» временно показывается обычным текстом.']
+    if note:
+        lines += ['', note]
+    kb = [[btn(('✅ ' if k == cur else '') + t, f'sty:{k}') for k, (t, _) in STYLES.items()],
+          [btn('👀 Посмотреть статус', 'status')], [btn('⬅️ Настройки', 'set')]]
+    return '\n'.join(lines), kb
+
+
+def handle_style(uid, data):
+    k = data.split(':', 1)[1]
+    if k in STYLES:
+        with lock:
+            state['admins'][str(uid)]['style'] = k
+            save_state()
+        if k == 'vestnik':
+            tg_rt.pop('widget_off', None)    # выбрали заново — попробовать сразу
+        add_event(f'{admin_name(uid)} выбрал вид экранов «{STYLES[k][0][2:]}»')
+    return scr_style(uid, f'Готово: {STYLES.get(k, ("?",))[0]}')
+
+
+# ---------------- сбои: что сломалось, почему и как восстановилось ----------------
+# Когда VPN или mihomo перестают работать, бот открывает «сбой»: за 20–30 секунд проверяет все слои по порядку
+# (интернет провайдера, DNS, часы, mihomo, маршрутизация, сам сервер, другие серверы, свой VPS, подписка, Telegram),
+# пишет вывод «что сломалось и почему», сам пробует исправить то, что может, и ведёт одну карточку сбоя —
+# её правит без звука. Когда всё заработало — карточка закрывается и приходит итог со звуком: что было, почему,
+# как восстановилось и сколько длилось.
+INC_HIST_MAX = 20
+INC_EDIT_GAP = 5
+MIHOMO_GOOD_CFG = '/etc/mihomo/config.yaml.good'
+PROBE_GROUP = 'PROBE'
+PROBE_PORT = 7894
+PROBE_NAME = 'vpngw-probe'
+inc_lock = threading.RLock()
+inc_rt = {'diag': False, 'healed': {}, 'good_ts': 0, 'clock_ts': 0, 'mh_restarts': []}
+
+LAYER_RU = {'net': 'Интернет провайдера', 'dns': 'DNS провайдера', 'clock': 'Часы шлюза', 'mihomo': 'mihomo',
+            'route': 'Маршрутизация', 'server': 'Сервер', 'others': 'Другие серверы', 'vps': 'Свой VPS',
+            'sub': 'Подписка', 'tg': 'Telegram'}
+
+
+def lay(k, ok, t):
+    return {'k': k, 'ok': ok, 't': t}
+
+
+def svc_show(unit, props=('ActiveState', 'SubState', 'NRestarts', 'Result', 'ExecMainStartTimestampMonotonic')):
+    try:
+        out = run(['systemctl', 'show', unit, '-p', ','.join(props)], 10).stdout
+        return dict(x.split('=', 1) for x in out.splitlines() if '=' in x)
+    except Exception:
+        return {}
+
+
+def default_route():
+    """(шлюз провайдера, интерфейс) из основной таблицы маршрутов."""
+    try:
+        m = re.search(r'default via (\S+) dev (\S+)', run(['ip', '-4', 'route', 'show', 'default'], 5).stdout)
+        return (m.group(1), m.group(2)) if m else (None, None)
+    except Exception:
+        return None, None
+
+
+def d_net():
+    hosts = [('77.88.8.8', 53), ('1.1.1.1', 443), ('8.8.8.8', 443)]
+    ok = [a for a, p in hosts if tcp_open(a, p, 3, 1)]
+    if ok:
+        return lay('net', True, 'есть (' + ', '.join(ok) + ' отвечают)')
+    gw, dev = default_route()
+    carrier = None
+    if dev:
+        try:
+            carrier = open(f'/sys/class/net/{dev}/carrier').read().strip() == '1'
+        except OSError:
+            pass
+    if dev and carrier is False:
+        return lay('net', False, f'нет: на порту {dev} нет линка — кабель провайдера отключён или роутер выключен')
+    if not gw:
+        return lay('net', False, 'нет: в системе нет маршрута в интернет (адрес от провайдера не получен?)')
+    rr = run(['ping', '-c', '2', '-W', '2', gw], 8)
+    if rr.returncode != 0:
+        return lay('net', False, f'нет: роутер/шлюз провайдера {gw} не отвечает')
+    return lay('net', False, f'нет: до шлюза провайдера {gw} связь есть, дальше — нет (сбой у провайдера)')
+
+
+def d_dns():
+    res = {}
+
+    def go():
+        try:
+            socket.getaddrinfo('ya.ru', 443)
+            res['ok'] = True
+        except Exception as e:
+            res['err'] = str(e)
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(6)
+    if res.get('ok'):
+        return lay('dns', True, 'работает')
+    return lay('dns', False, 'не отвечает' if 'err' not in res else 'не находит адреса: ' + res['err'][:80])
+
+
+def clock_offset():
+    """Насколько часы шлюза расходятся с точным временем, с (плюс — спешат). По заголовку Date от двух
+    надёжных сайтов напрямую, без VPN. None — не удалось узнать."""
+    import email.utils
+    for url in ('https://ya.ru/', 'http://1.1.1.1/', 'https://www.google.com/'):
+        try:
+            t0 = time.time()
+            try:
+                r = direct_opener.open(urllib.request.Request(url, method='HEAD',
+                                                              headers={'User-Agent': 'curl/8.5'}), timeout=5)
+                d = r.headers.get('Date')
+                r.close()
+            except urllib.error.HTTPError as e:
+                d = e.headers.get('Date')
+            t1 = time.time()
+            if d:
+                srv = email.utils.parsedate_to_datetime(d).timestamp()
+                return round((t0 + t1) / 2 - srv - 0.5)
+        except Exception:
+            continue
+    return None
+
+
+def ntp_synced():
+    try:
+        return run(['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'], 5).stdout.strip() == 'yes'
+    except Exception:
+        return None
+
+
+def d_clock():
+    off = clock_offset()
+    syn = ntp_synced()
+    if off is None:
+        return lay('clock', None, 'не проверить (нет интернета)' + ('' if syn is None else
+                                                                   ', синхронизация ' + ('есть' if syn else 'нет')))
+    if abs(off) >= 30:
+        return lay('clock', False, f'{"спешат" if off > 0 else "отстают"} на {fmt_dur(abs(off))} — защищённые '
+                                   'соединения (REALITY, TLS) с таким расхождением не устанавливаются')
+    return lay('clock', True, f'точные (расхождение {abs(off)} с)')
+
+
+def d_mihomo():
+    st = svc_show('mihomo')
+    try:
+        api('/version')
+        api_ok = True
+    except Exception:
+        api_ok = False
+    n = int(st.get('NRestarts') or 0)
+    if st.get('ActiveState') == 'active' and api_ok:
+        return lay('mihomo', True, 'работает' + (f' (перезапусков: {n})' if n else ''))
+    if st.get('ActiveState') == 'active':
+        return lay('mihomo', False, 'служба запущена, но не отвечает')
+    why = journal_reason('mihomo')
+    return lay('mihomo', False, f'не запущен ({st.get("ActiveState", "?")}/{st.get("SubState", "?")}'
+                                + (f', перезапусков: {n}' if n else '') + ')' + (f': {why}' if why else ''))
+
+
+def d_route():
+    try:
+        link = run(['ip', 'link', 'show', 'mihomo'], 5)
+        rules = run(['ip', 'rule', 'show'], 5).stdout
+        t100 = run(['ip', 'route', 'show', 'table', '100'], 5).stdout
+    except Exception:
+        return lay('route', None, 'не проверить')
+    if link.returncode != 0:
+        return lay('route', False, 'нет туннеля mihomo — трафик клиентов некуда отправить')
+    if wg_live_ok() and 'lookup 100' not in rules:
+        return lay('route', False, 'нет правила «трафик WireGuard → mihomo» (ip rule)')
+    if 'lookup 100' in rules and 'mihomo' not in t100:
+        return lay('route', False, 'в таблице 100 нет маршрута в туннель mihomo')
+    return lay('route', True, 'трафик клиентов идёт в mihomo')
+
+
+def wg_live_ok():
+    try:
+        return run(['ip', 'link', 'show', WG_IF], 5).returncode == 0
+    except Exception:
+        return False
+
+
+def server_ep(name):
+    """(адрес, порт) сервера подписки — из файла провайдера mihomo."""
+    for sb in subs():
+        nm = name
+        if sb.get('prefix') and nm.startswith(sb['prefix']):
+            nm = nm[len(sb['prefix']):]
+        try:
+            text = open(os.path.join(PROV_DIR, sb['id'] + '.yaml'), encoding='utf-8', errors='ignore').read()
+        except Exception:
+            continue
+        if re.search(r'^proxies:', text, re.M):
+            body = text.split('proxies:', 1)[1]
+            for chunk in re.split(r'\n\s*-\s+(?=\{|name|["\']name)', '\n' + body):
+                m = re.search(r'["\']?name["\']?\s*:\s*["\']?(.+?)["\']?\s*(?:,|\n|$)', chunk)
+                if m and m.group(1).strip() == nm:
+                    s = re.search(r'["\']?server["\']?\s*:\s*["\']?([A-Za-z0-9.:\[\]-]+)', chunk)
+                    p = re.search(r'["\']?port["\']?\s*:\s*["\']?(\d+)', chunk)
+                    if s:
+                        return s.group(1).strip('[]'), int(p.group(1)) if p else 443
+            continue
+        raw = text.strip()
+        if '://' not in raw:
+            try:
+                raw = base64.b64decode(raw + '=' * (-len(raw) % 4)).decode('utf-8', 'ignore')
+            except Exception:
+                continue
+        for line in re.split(r'\s+', raw):
+            r = link_server(line)
+            if r and r[0] == nm and r[1]:
+                try:
+                    port = urllib.parse.urlsplit(line).port or 443
+                except Exception:
+                    port = 443
+                return r[1], port
+    return None, None
+
+
+def vps_of(name):
+    """Свой VPS, на котором стоит этот сервер (по подписке), или None."""
+    pid = SRV_PROV.get(name)
+    host = None
+    for vid, x in vps_all().items():
+        if pid and x.get('sub') == pid:
+            return vid, x
+        if host is None:
+            host = server_ep(name)[0] or ''
+        if host and x['host'] == host:
+            return vid, x
+    return None, None
+
+
+def d_server(cur):
+    host, port = server_ep(cur)
+    tcp = tcp_open(host, port, 4, 1) if host else None
+    ms = probe(cur, 1)
+    tcp_t = '' if tcp is None else (f'порт {port} открыт' if tcp else f'порт {port} не открывается')
+    if ms:
+        return lay('server', True, f'{cur}: отвечает, {ms} мс'), {'tcp': tcp, 'ms': ms, 'host': host, 'port': port}
+    return (lay('server', False, f'{cur}: VPN-соединение не устанавливается' + (f' ({tcp_t})' if tcp_t else '')),
+            {'tcp': tcp, 'ms': 0, 'host': host, 'port': port})
+
+
+def d_others(cur, n=5):
+    import concurrent.futures as cf
+    v = state.get('vpn') or {}
+    try:
+        lst = [p['name'] for p in servers() if p['name'] != cur and p['name'] not in v.get('excluded', [])]
+    except Exception:
+        return lay('others', None, 'список серверов недоступен'), []
+    lst.sort(key=lambda nm: (not server_info(nm).get('alive', True), nm))
+    lst = lst[:n]
+    if not lst:
+        return lay('others', None, 'других серверов нет'), []
+    with cf.ThreadPoolExecutor(len(lst)) as ex:
+        res = dict(zip(lst, ex.map(lambda nm: probe(nm, 1), lst)))
+    ok = [nm for nm, ms in res.items() if ms]
+    if ok:
+        best = min(ok, key=lambda nm: res[nm])
+        return lay('others', True, f'{len(ok)} из {len(lst)} отвечают (лучший {best}, {res[best]} мс)'), ok
+    return lay('others', False, f'ни один из {len(lst)} не отвечает'), []
+
+
+def socks_banner(host, port, timeout=8):
+    """Подключиться к host:port через mihomo (группа PROBE → другой сервер) и прочитать приветствие.
+    SSH здоровается первым, поэтому ответ означает: порт доступен оттуда, где стоит другой сервер."""
+    s = socket.create_connection(('127.0.0.1', PROBE_PORT), 4)
+    try:
+        s.settimeout(timeout)
+        s.sendall(b'\x05\x01\x00')
+        if s.recv(2) != b'\x05\x00':
+            return None
+        try:
+            addr = b'\x01' + socket.inet_aton(host)
+        except OSError:
+            addr = b'\x03' + bytes([len(host)]) + host.encode()
+        s.sendall(b'\x05\x01\x00' + addr + int(port).to_bytes(2, 'big'))
+        rep = s.recv(10)
+        if len(rep) < 2 or rep[1] != 0:
+            return False
+        return s.recv(64).startswith(b'SSH-')
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def reach_abroad(host, port, via):
+    """Доступен ли host:port из-за границы: через другой сервер (группа PROBE в mihomo), а без неё —
+    с другого своего VPS по SSH. True/False, None — проверить нечем."""
+    if via and not (state.get('vpn') or {}).get('probe_off'):
+        try:
+            if PROBE_GROUP in (api('/proxies') or {}).get('proxies', {}):
+                api(f'/proxies/{PROBE_GROUP}', 'PUT', {'name': via[0]})
+                r = socks_banner(host, port)
+                if r is not None:
+                    return r
+        except Exception as e:
+            log('проверка через другой сервер:', e)
+    for vid, x in vps_all().items():
+        if x['host'] == host:
+            continue
+        try:
+            rc, out, _ = ssh_exec(vs_conn(x), f"timeout 8 bash -c 'exec 3<>/dev/tcp/{host}/{int(port)}; "
+                                              "head -c 4 <&3' 2>/dev/null", timeout=20)
+            return out.startswith('SSH-')
+        except Exception:
+            continue
+    return None
+
+
+def d_vps(cur, srv, others):
+    vid, x = vps_of(cur)
+    if not x:
+        return None, {}
+    vs = vs_conn(x)
+    info = {'vid': vid, 'name': vs_name(x)}
+    try:
+        rc, out, err = ssh_exec(vs, as_root(vs, 'systemctl is-active xray; cut -d. -f1 /proc/uptime'), timeout=15)
+    except Exception as e:
+        rc, out, err = 255, '', str(e)
+    if rc == 0:
+        xs, _, up = out.strip().partition('\n')
+        info.update(ssh=True, xray=xs.strip(), up=int(up.strip() or 0) if up.strip().isdigit() else None)
+        upt = f', включён {fmt_dur(info["up"])} назад' if info.get('up') is not None and info['up'] < 3600 else ''
+        if xs.strip() != 'active':
+            return lay('vps', False, f'{vs_name(x)}: сервер работает{upt}, но Xray остановлен ({xs.strip()})'), info
+        if not srv.get('ms'):
+            return lay('vps', False, f'{vs_name(x)}: сервер и Xray работают{upt}, но VPN-соединение из России '
+                                     'не проходит — похоже на блокировку протокола или маски'), info
+        return lay('vps', True, f'{vs_name(x)}: работает, Xray запущен{upt}'), info
+    info['ssh'] = False
+    ab = reach_abroad(x['host'], x['port'], others)
+    info['abroad'] = ab
+    if ab:
+        return lay('vps', False, f'{vs_name(x)}: из России недоступен, а из-за границы отвечает — '
+                                 'IP-адрес сервера заблокирован'), info
+    if ab is False:
+        return lay('vps', False, f'{vs_name(x)}: не отвечает ни из России, ни из-за границы — сервер выключен '
+                                 'или завис (сбой у хостинга)'), info
+    return lay('vps', False, f'{vs_name(x)}: не отвечает по SSH ({ssh_err(err)})'), info
+
+
+def d_sub(cur):
+    pid = SRV_PROV.get(cur)
+    sb = sub_by_id(pid) if pid else None
+    if not sb:
+        return None
+    try:
+        si = (api(f'/providers/proxies/{pid}') or {}).get('subscriptionInfo') or {}
+    except Exception:
+        return lay('sub', None, f'«{sb.get("name") or pid}»: не проверить')
+    nm = sb.get('name') or pid
+    exp = si.get('Expire') or 0
+    if exp and exp < time.time():
+        return lay('sub', False, f'«{nm}»: срок закончился {time.strftime("%d.%m", time.localtime(exp))}')
+    tot, used = si.get('Total') or 0, (si.get('Upload') or 0) + (si.get('Download') or 0)
+    if tot and used >= tot:
+        return lay('sub', False, f'«{nm}»: трафик исчерпан ({fmt_bytes(used)} из {fmt_bytes(tot)})')
+    return lay('sub', True, f'«{nm}»: активна' + (f' до {time.strftime("%d.%m", time.localtime(exp))}' if exp else ''))
+
+
+def d_tg():
+    return lay('tg', bool(tg_reachable()), 'доступен' if tg_reachable() else 'недоступен — сообщения ждут в очереди')
+
+
+def diagnose(cur=None):
+    """Проверка всех слоёв параллельно, не дольше ~25 с. Возвращает (слои, данные о сервере)."""
+    import concurrent.futures as cf
+    if cur is None:
+        try:
+            cur = mode_and_current()[1]
+        except Exception:
+            cur = None
+    with cf.ThreadPoolExecutor(8) as ex:
+        f = {k: ex.submit(fn) for k, fn in (('net', d_net), ('dns', d_dns), ('clock', d_clock),
+                                              ('mihomo', d_mihomo), ('route', d_route), ('tg', d_tg))}
+        mih = f['mihomo'].result(timeout=30)
+        srv, others, fs, fo, fsub = {}, [], None, None, None
+        if cur and mih['ok']:
+            fs = ex.submit(d_server, cur)
+            fo = ex.submit(d_others, cur)
+            fsub = ex.submit(d_sub, cur)
+        L = {}
+        for k, fu in f.items():
+            try:
+                L[k] = fu.result(timeout=30)
+            except Exception as e:
+                L[k] = lay(k, None, f'не проверить: {e}')
+        if fs:
+            try:
+                L['server'], srv = fs.result(timeout=30)
+            except Exception as e:
+                L['server'] = lay('server', None, f'не проверить: {e}')
+            try:
+                L['others'], others = fo.result(timeout=30)
+            except Exception as e:
+                L['others'] = lay('others', None, f'не проверить: {e}')
+            try:
+                s = fsub.result(timeout=30)
+                if s:
+                    L['sub'] = s
+            except Exception:
+                pass
+    vinfo = {}
+    if cur and L.get('net', {}).get('ok') and (not srv.get('ms') or not mih['ok']):
+        try:
+            lv, vinfo = d_vps(cur, srv, others)
+            if lv:
+                L['vps'] = lv
+        except Exception as e:
+            log('проверка VPS:', e)
+    order = ['net', 'dns', 'clock', 'mihomo', 'route', 'server', 'others', 'vps', 'sub', 'tg']
+    return [L[k] for k in order if k in L], {'cur': cur, 'srv': srv, 'others': others, 'vps': vinfo}
+
+
+def verdict(layers, data):
+    """(что сломалось, почему, что делать — ключ действия) по результатам проверки."""
+    L = {x['k']: x for x in layers}
+    bad = lambda k: k in L and L[k]['ok'] is False
+    cur = data.get('cur') or '?'
+    if bad('net'):
+        return 'нет интернета у шлюза', 'Интернет провайдера ' + L['net']['t'] + '.', None
+    if bad('mihomo'):
+        return 'mihomo не работает', 'mihomo ' + L['mihomo']['t'] + '.', 'mihomo'
+    if bad('clock'):
+        return 'часы шлюза сбились', 'Часы ' + L['clock']['t'] + '.', 'clock'
+    if bad('route'):
+        return 'сломана маршрутизация на шлюзе', L['route']['t'].capitalize() + '.', 'route'
+    if bad('dns') and not bad('server'):
+        return 'не работает DNS провайдера', 'Сайты по имени не находятся, хотя интернет есть.', None
+    if bad('sub') and bad('server'):
+        return 'закончилась подписка', 'Подписка ' + L['sub']['t'] + '.', None
+    if bad('server'):
+        if bad('vps'):
+            xr = (data.get('vps') or {}).get('xray')
+            return (f'не работает сервер {cur}', L['vps']['t'] + '.',
+                    'xray' if (data['vps'].get('ssh') and xr and xr != 'active') else 'switch')
+        if L.get('others', {}).get('ok'):
+            return (f'не работает сервер {cur}', L['server']['t'] + '. Другие серверы при этом работают — '
+                    'сбой у этого сервера, а не у шлюза.', 'switch')
+        if bad('others'):
+            tcp = (data.get('srv') or {}).get('tcp')
+            why = ('Порты серверов открываются, а VPN-соединения обрываются — так выглядит блокировка VPN '
+                   'провайдером (DPI).' if tcp else
+                   'До серверов не доходят даже соединения — провайдер блокирует их адреса или сбой '
+                   'маршрутизации у провайдера.')
+            return 'не отвечает ни один VPN-сервер', why, 'restart'
+        return f'не работает сервер {cur}', L['server']['t'] + '.', 'switch'
+    return 'причина не найдена', 'Все проверки сейчас проходят — возможно, сбой уже прошёл сам.', None
+
+
+# --- починка ---
+def clock_fix():
+    """Поправить часы: включить синхронизацию, при большом расхождении — выставить по точному времени."""
+    run(['timedatectl', 'set-ntp', 'true'], 10)
+    for cmd in (['chronyc', '-a', 'makestep'], ['systemctl', 'restart', 'systemd-timesyncd'],
+                ['systemctl', 'restart', 'chrony']):
+        if shutil.which(cmd[0]):
+            run(cmd, 20)
+    time.sleep(6)
+    off = clock_offset()
+    if off is not None and abs(off) >= 10:
+        run(['date', '-s', '@%d' % int(time.time() - off)], 10)
+        off2 = clock_offset()
+        return off2 if off2 is not None else off
+    return off
+
+
+def clock_tick():
+    """Раз в 10 минут: часы не ушли? Ушли на 10 с и больше — поправить и сказать."""
+    if time.time() - inc_rt['clock_ts'] < 600:
+        return
+    inc_rt['clock_ts'] = time.time()
+    off = clock_offset()
+    if off is None or abs(off) < 10:
+        return
+    after = clock_fix()
+    add_event(f'Часы шлюза расходились на {off} с — исправлено' if after is not None and abs(after) < 10 else
+              f'Часы шлюза расходятся на {off} с — исправить не удалось')
+    if abs(off) >= 30 or after is None or abs(after) >= 10:
+        ok = after is not None and abs(after) < 10
+        notify('server', f'🕒 <b>Часы шлюза {"спешили" if off > 0 else "отставали"} на {fmt_dur(abs(off))}</b>\n'
+                         + ('Исправил: синхронизация времени снова работает.' if ok else
+                            'Исправить не удалось — проверьте синхронизацию времени: <code>timedatectl</code>')
+                         + '\nС таким расхождением VPN-серверы (REALITY) могут не принимать соединения.')
+
+
+def mihomo_cfg_ok(path):
+    binary = shutil.which('mihomo') or '/usr/bin/mihomo'
+    r = run([binary, '-d', GEO_DIR, '-f', path, '-t'], 120)
+    out = (r.stdout + r.stderr).strip()
+    line = next((x for x in reversed(out.splitlines()) if re.search(r'(?i)error|fatal|failed|parse', x)), out[-200:])
+    return r.returncode == 0, re.sub(r'^.*?(level=\w+ )?msg=', '', line)[:200]
+
+
+def good_cfg_tick(ok_now):
+    """Конфиг, с которым mihomo 10 минут работает без сбоев, запоминаем как «последний рабочий»."""
+    if not ok_now:
+        inc_rt['good_ts'] = 0
+        return
+    if not inc_rt['good_ts']:
+        inc_rt['good_ts'] = time.time()
+        return
+    if time.time() - inc_rt['good_ts'] < 600:
+        return
+    try:
+        if os.path.exists(MIHOMO_GOOD_CFG) and os.path.getmtime(MIHOMO_GOOD_CFG) >= os.path.getmtime(MIHOMO_CFG):
+            return
+        shutil.copy2(MIHOMO_CFG, MIHOMO_GOOD_CFG)
+        os.chmod(MIHOMO_GOOD_CFG, 0o600)
+    except OSError:
+        pass
+
+
+def mihomo_heal(restart=True):
+    """mihomo лежит или падает по кругу. Ошибка в настройках — вернуть последние рабочие; иначе — перезапуск.
+    Возвращает текст «что сделал»."""
+    ok, err = mihomo_cfg_ok(MIHOMO_CFG)
+    if not ok:
+        for src in (MIHOMO_GOOD_CFG, MIHOMO_BAK_CFG):
+            if os.path.exists(src) and mihomo_cfg_ok(src)[0]:
+                when = time.strftime('%d.%m %H:%M', time.localtime(os.path.getmtime(src)))
+                shutil.copy2(MIHOMO_CFG, MIHOMO_CFG + '.broken')
+                shutil.copy2(src, MIHOMO_CFG)
+                run(['systemctl', 'reset-failed', 'mihomo'], 10)
+                run(['systemctl', 'restart', 'mihomo'], 60)
+                add_event(f'mihomo: ошибка в настройках ({err}) — возвращены рабочие от {when}')
+                return (f'в настройках mihomo ошибка: «{err}». Вернул последние рабочие настройки от {when} '
+                        f'(испорченные сохранены в {MIHOMO_CFG}.broken)')
+        return f'в настройках mihomo ошибка: «{err}», а рабочей копии нет — нужна ручная правка'
+    if not restart:
+        return 'настройки mihomo в порядке — значит, дело не в них (смотрите причину выше и журнал: ' \
+               'journalctl -u mihomo -n 80)'
+    st = svc_show('mihomo')
+    why = journal_reason('mihomo')
+    run(['systemctl', 'reset-failed', 'mihomo'], 10)
+    run(['systemctl', 'restart', 'mihomo'], 60)
+    add_event('mihomo перезапущен ботом' + (f' ({why})' if why else ''))
+    return 'перезапустил mihomo' + (f' (до этого: {why})' if why else '') + (
+        f'; служба уже перезапускалась {times_ru(int(st.get("NRestarts") or 0))}' if (st.get('NRestarts') or '0') != '0' else '')
+
+
+def xray_restart(vid):
+    x = vps_all().get(vid)
+    if not x:
+        return None
+    vs = vs_conn(x)
+    rc, out, err = ssh_exec(vs, as_root(vs, 'systemctl restart xray; sleep 2; systemctl is-active xray; '
+                                            'journalctl -u xray -n 5 -p err --no-pager -o cat | tail -1'), timeout=40)
+    st, _, last = out.strip().partition('\n')
+    if st.strip() == 'active':
+        add_event(f'{vs_name(x)}: Xray был остановлен — перезапущен')
+        return f'перезапустил Xray на {vs_name(x)}' + (f' (последняя ошибка: {last.strip()[:120]})' if last.strip() else '')
+    return f'Xray на {vs_name(x)} не запускается: {(last or err).strip()[:160]}'
+
+
+def mh_loop_tick():
+    """mihomo падает и поднимается по кругу (systemd перезапускает) — даже если API иногда отвечает.
+    3 перезапуска за 10 минут — разбираемся: ошибка в настройках → рабочие настройки; иначе — сказать почему."""
+    n = int(svc_show('mihomo', ('NRestarts',)).get('NRestarts') or 0)
+    prev = inc_rt.get('mh_n')
+    inc_rt['mh_n'] = n
+    if prev is None or n <= prev:
+        return
+    now = time.time()
+    rs = [t for t in inc_rt['mh_restarts'] if now - t < 600] + [now] * (n - prev)
+    inc_rt['mh_restarts'] = rs
+    if len(rs) < 3 or now - inc_rt.get('mh_loop_ts', 0) < 1800:
+        return
+    inc_rt['mh_loop_ts'] = now
+    inc_rt['mh_restarts'] = []
+    why = journal_reason('mihomo')
+    done = mihomo_heal(restart=False)
+    add_event(f'mihomo падал {times_ru(len(rs))} за 10 минут' + (f': {why}' if why else ''))
+    if inc():
+        inc_ev(f'mihomo падал {times_ru(len(rs))} за 10 мин — {done}')
+        return
+    notify('dead', f'♻️ <b>mihomo падал {times_ru(len(rs))} за 10 минут</b>\n'
+                   + (f'Причина: {h(why)}.\n' if why else '') + f'Что сделал: {h(done)}.'
+                   + (f'\nПеред этим на шлюзе: {h(hist_before(now, 10))}.' if hist_before(now, 10) else ''),
+           keep=True)
+
+
+def times_ru(n):
+    return f'{n} раза' if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else f'{n} раз'
+
+
+def auto_retest():
+    """Попросить автовыбор сразу перепроверить серверы (а не ждать интервала) — быстрее уйдёт с мёртвого."""
+    try:
+        api(f'/group/{AUTO_GROUP}/delay?url={q(TEST_URL)}&timeout=5000', timeout=15)
+    except Exception:
+        pass
+
+
+# --- карточка сбоя ---
+def inc():
+    return state.get('inc')
+
+
+def inc_ev(text, ts=None):
+    with inc_lock:
+        i = inc()
+        if not i:
+            return
+        i.setdefault('ev', []).append([ts or time.time(), text])
+        del i['ev'][:-12]
+        with lock:
+            save_state()
+
+
+def notify_targets(kind):
+    with lock:
+        return [int(uid) for uid, a in state['admins'].items()
+                if a['notify'].get(kind, True) and (LINK_MODE or 'm' in gw_allowed(int(uid)))]
+
+
+INC_TITLE = {'vpn': 'VPN не работает', 'mihomo': 'mihomo не отвечает'}
+
+
+def inc_text(i, final=False):
+    dur = (i.get('end') or time.time()) - i['ts']
+    head = ('✅ <b>Сбой закрыт</b>' if final else f'🔴 <b>{h(INC_TITLE.get(i["kind"], "Сбой"))}</b>') + \
+        f' · {fmt_dur(max(int(dur), 1))}'
+    lines = [gw_prefix(head)]
+    if i.get('srv'):
+        lines.append(f'Сервер: {h(i["srv"])}' + (f' ({MODE_RU.get(i.get("mode"), "")})' if i.get('mode') else ''))
+    lines.append('')
+    if i.get('layers'):
+        lines.append(f'<b>Проверка</b> ({time.strftime("%H:%M:%S", time.localtime(i["diag_ts"]))}):')
+        for x in i['layers']:
+            mark = '✅' if x['ok'] else '❌' if x['ok'] is False else '▫️'
+            lines.append(f'{mark} {LAYER_RU[x["k"]]}: {h(x["t"])}')
+        lines.append('')
+    elif not final:
+        lines += ['⏳ Проверяю интернет, часы, mihomo, серверы… до 30 секунд.', '']
+    if i.get('cause'):
+        lines.append(f'<b>Причина:</b> {h(i["cause"])}. {h(i.get("why", ""))}')
+    for a in i.get('acts') or []:
+        lines.append(f'🔧 {h(a)}')
+    if i.get('ev'):
+        lines += [''] + [f'<code>{time.strftime("%H:%M:%S", time.localtime(t))}</code> {h(x)}' for t, x in i['ev']]
+    st = lambda x: 'ok' if x['ok'] else 'bad' if x['ok'] is False else ''
+    title = INC_TITLE.get(i['kind'], 'Сбой')
+    cause = i.get('cause') or title
+    doc = mkdoc(f'Сбой закрыт · {fmt_dur(max(int(dur), 1))}' if final else f'Срочно · {fmt_dur(max(int(dur), 1))}',
+                cause[:1].upper() + cause[1:], 'ok' if final else 'bad',
+                i.get('why') or ('' if i.get('layers') else 'Проверяю интернет, часы, mihomo, серверы — до 30 секунд.'),
+                [[LAYER_RU[x['k']], x['t'], st(x)] for x in i.get('layers') or []],
+                '; '.join(i.get('acts') or []) or (time.strftime('%H:%M:%S ', time.localtime(i['ev'][-1][0])) +
+                                                   i['ev'][-1][1] if i.get('ev') else ''))
+    return styled('\n'.join(lines), doc)
+
+
+def inc_cards(i, final=False):
+    """Разослать/обновить карточку сбоя. Первая отправка — со звуком, правки — тихо (Telegram их не озвучивает)."""
+    text = inc_text(i, final)
+    kb = [[btn('✔️ Понятно', 'ok'), btn('🩺 Подробнее', 'ninc')]] if final else \
+        [[btn('🔄 Проверить ещё раз', 'incre'), btn('🏠 Меню', 'nmenu')]]
+    cards = i.setdefault('cards', {})
+    for uid in notify_targets('dead'):
+        mid = cards.get(str(uid))
+        if mid:
+            edit(uid, mid, text, kb)
+        elif not final:
+            r = raw_send(uid, text, kb, ttl_kind='keep')
+            if r:                             # не ушла (нет связи) — не копим версии карточки: итог встанет в очередь
+                cards[str(uid)] = r['message_id']
+    i['edit_ts'] = time.time()
+    with lock:
+        save_state()
+
+
+def inc_open(kind, cur=None, mode=None):
+    with inc_lock:
+        i = inc()
+        if i:
+            if kind == 'mihomo' and i['kind'] != 'mihomo':
+                i['kind'] = 'mihomo'
+                inc_ev('mihomo перестал отвечать')
+                threading.Thread(target=inc_run, daemon=True).start()
+            return i
+        i = {'id': int(time.time()), 'kind': kind, 'ts': time.time(), 'srv': cur, 'mode': mode, 'ev': [],
+             'acts': [], 'cards': {}}
+        with lock:
+            state['inc'] = i
+            save_state()
+        i['ev'].append([time.time(), INC_TITLE[kind]])
+        add_event(INC_TITLE[kind] + (f' ({cur})' if cur else ''))
+    mail_async('dead', plain(inc_text(i)))
+    threading.Thread(target=inc_run, daemon=True).start()
+    return i
+
+
+def inc_run(first=True):
+    """Проверка всех слоёв → причина → починка, что можно починить сам → карточка."""
+    if inc_rt['diag']:
+        return
+    inc_rt['diag'] = True
+    try:
+        i = inc()
+        if not i:
+            return
+        if first and not i.get('cards'):
+            inc_cards(i)                       # карточка «проверяю…» уходит сразу
+        layers, data = diagnose(i.get('srv'))
+        i = inc()
+        if not i:
+            return
+        i['layers'], i['diag_ts'], i['data'] = layers, time.time(), {'vps': data.get('vps'), 'srv': data.get('srv')}
+        cause, why, act = verdict(layers, data)
+        if cause != i.get('cause'):
+            inc_ev('причина: ' + cause)
+        i['cause'], i['why'] = cause, why
+        done = inc_heal(i, act, data)
+        if done:
+            i['acts'].append(done)
+            inc_ev(done)
+        inc_cards(i)
+    except Exception:
+        log('проверка сбоя:', traceback.format_exc())
+    finally:
+        inc_rt['diag'] = False
+
+
+def inc_heal(i, act, data):
+    """Одно и то же действие — не чаще раза в 5 минут за сбой."""
+    if not act:
+        return None
+    last = inc_rt['healed'].get((i['id'], act), 0)
+    if time.time() - last < 300:
+        return None
+    inc_rt['healed'][(i['id'], act)] = time.time()
+    if act == 'mihomo':
+        return mihomo_heal()
+    if act == 'clock':
+        off = clock_fix()
+        return ('поправил часы' if off is not None and abs(off) < 10 else 'часы поправить не удалось')
+    if act == 'route':
+        run(['systemctl', 'restart', 'mihomo'], 60)
+        return 'перезапустил mihomo, чтобы восстановить маршруты'
+    if act == 'xray':
+        return xray_restart((data.get('vps') or {}).get('vid'))
+    if act == 'switch':
+        mode = i.get('mode')
+        if mode == 'auto':
+            auto_retest()
+            return 'попросил автовыбор сразу перепроверить серверы'
+        return None                            # ручной выбор снимет наблюдатель (fallback_to_auto)
+    if act == 'restart' and time.time() - i['ts'] > 180:
+        run(['systemctl', 'restart', 'mihomo'], 60)
+        return 'перезапустил mihomo (вдруг дело в нём)'
+    inc_rt['healed'].pop((i['id'], act), None)  # рано — попробуем на следующей проверке
+    return None
+
+
+def inc_tick():
+    """Пока сбой открыт: раз в минуту перепроверять и править карточку."""
+    i = inc()
+    if i and time.time() - (i.get('diag_ts') or i['ts']) >= 60 and not inc_rt['diag']:
+        threading.Thread(target=inc_run, args=(False,), daemon=True).start()
+
+
+def vps_postmortem(i):
+    """После сбоя своего VPS — что было на нём: перезагрузка (штатная или нет), нехватка памяти, падения Xray."""
+    vid = ((i.get('data') or {}).get('vps') or {}).get('vid')
+    x = vps_all().get(vid) if vid else None
+    if not x:
+        return ''
+    try:
+        st = vs_call(vs_conn(x), 'postmortem', {'SINCE': int(i['ts']) - 600}, timeout=60)
+    except Exception as e:
+        return f'Что было на {vs_name(x)}, узнать не удалось: {e}.'
+    out = []
+    boot = int(st.get('BOOT') or 0)
+    if boot and boot > i['ts'] - 900:
+        clean = st.get('CLEAN')
+        out.append(f'{vs_name(x)} перезагрузился в {time.strftime("%H:%M", time.localtime(boot))}' +
+                   {'yes': ' (штатно — перезагрузку запустили на сервере)',
+                    'no': ' аварийно — без штатного выключения: сбой питания или зависание у хостинга'}.get(clean, ''))
+    if st.get('OOM'):
+        out.append(f'на {vs_name(x)} не хватило памяти — ядро остановило: {st["OOM"]}')
+    n = int(st.get('XRESTARTS') or 0)
+    if n:
+        out.append(f'Xray падал {times_ru(n)}' + (f': {st["XERR"]}' if st.get('XERR') else ''))
+    pts = []
+    for p in (st.get('HIST') or '').split(';'):
+        try:
+            t, c, m, la = p.split(',')
+            pts.append({'t': int(t), 'c': int(c) if c.isdigit() else None, 'm': int(m), 'l': float(la)})
+        except ValueError:
+            continue
+    if pts:
+        c = [p['c'] for p in pts if p['c'] is not None]
+        m = [p['m'] for p in pts]
+        out.append(f'нагрузка на {vs_name(x)} перед сбоем: процессор до {max(c) if c else "?"} %, '
+                   f'память {m[0]} % → {m[-1]} %')
+    return '; '.join(out)
+
+
+def inc_close():
+    with inc_lock:
+        i = inc()
+        if not i or i.get('closing'):
+            return
+        i['closing'] = True
+    try:
+        i['end'] = time.time()
+        try:
+            cur = mode_and_current()[1]
+        except Exception:
+            cur = None
+        if i.get('acts'):
+            how = i['acts'][-1]
+        elif cur and i.get('srv') and cur != i['srv']:
+            how = f'шлюз переключился на {cur}'
+        elif any(x['k'] == 'net' and x['ok'] is False for x in i.get('layers') or []):
+            how = 'интернет у провайдера вернулся'
+        elif i.get('cause'):
+            how = 'восстановилось само, без вмешательства'
+        else:
+            how = 'восстановилось само до того, как проверка закончилась'
+        pm = ''
+        if (i.get('data') or {}).get('vps'):
+            pm = vps_postmortem(i)
+        inc_ev('VPN снова работает' + (f' через {cur}' if cur else ''))
+        inc_cards(i, final=True)
+        dur = fmt_dur(max(int(i['end'] - i['ts']), 1))
+        lines = [f'🟢 <b>VPN снова работает</b> · простой {dur}',
+                 f'<b>Что случилось:</b> {h(i.get("cause") or INC_TITLE.get(i["kind"], "сбой"))}.']
+        if i.get('why'):
+            lines.append(f'<b>Почему:</b> {h(i["why"])}')
+        lines.append(f'<b>Как восстановилось:</b> {h(how)}.')
+        if pm:
+            lines.append(f'<b>На сервере:</b> {h(pm)}.')
+        pre = hist_before(i['ts'], 10)
+        if pre and any(x['k'] == 'mihomo' and x['ok'] is False for x in i.get('layers') or []):
+            lines.append(f'Шлюз перед сбоем: {h(pre)}.')
+        text = styled('\n'.join(lines), mkdoc(
+            'Итоги', f'VPN снова работает · простой {dur}', 'ok', i.get('why') or '',
+            [['Что случилось', i.get('cause') or INC_TITLE.get(i['kind'], 'сбой'), 'bad'],
+             ['Как восстановилось', how, 'ok'], ['Простой', dur, '']] + ([['На сервере', pm, '']] if pm else []),
+            f'Шлюз перед сбоем: {pre}' if pre else ''))
+        rec = {k: i.get(k) for k in ('id', 'kind', 'ts', 'end', 'srv', 'cause', 'why', 'acts', 'ev', 'layers')}
+        rec['how'], rec['pm'] = how, pm
+        with lock:
+            state.setdefault('inc_hist', []).insert(0, rec)
+            del state['inc_hist'][INC_HIST_MAX:]
+            state.pop('inc', None)
+            save_state()
+        add_event(f'Сбой закрыт за {dur}: {i.get("cause") or "?"}')
+        notify('dead', text, keep=False)
+    except Exception:
+        log('закрытие сбоя:', traceback.format_exc())
+        with lock:
+            state.pop('inc', None)
+            save_state()
+
+
+def switch_reason(prev, cur):
+    """Почему автовыбор ушёл с prev на cur — по замерам mihomo."""
+    p, c = server_info(prev), server_info(cur)
+    dp = delay_of(p) if p.get('history') else None
+    dc = delay_of(c) if c.get('history') else None
+    b = svc_bad.get(prev)
+    if b and svc_is_bad(prev):
+        return f'{prev} {b["why"]}'
+    if p and (not p.get('alive', True) or dp == 0):
+        return f'{prev} перестал отвечать'
+    if dp and dc and dp > dc:
+        return f'{cur} быстрее: {dc} мс против {dp} мс у {prev}'
+    return 'автовыбор счёл его лучшим по последнему замеру'
+
+
+def card_press(cq, data):
+    """Кнопки под карточкой сбоя: карточка остаётся карточкой, а не превращается в экран меню."""
+    chat = cq['message']['chat']['id']
+    if data == 'incre':
+        if inc() and not inc_rt['diag']:
+            threading.Thread(target=inc_run, args=(False,), daemon=True).start()
+        return
+    t, kb = handle_inc(cq['from']['id'], 'inc:d0', chat, None)
+    send(chat, t, kb)
+
+
+def handle_inc(uid, data, chat, mid):
+    act = data.split(':', 1)[1] if ':' in data else ''
+    if act == 'now' and mid:
+        edit(chat, mid, '🧪 Проверяю интернет, DNS, часы, mihomo, маршруты, серверы, подписку… до 30 секунд.')
+    return scr_inc(uid, data)
+
+
+def scr_inc(uid, data=''):
+    act = data.split(':', 1)[1] if ':' in data else ''
+    if act == 're':
+        if not inc():
+            return '✅ Сбоя сейчас нет — всё работает.', [[btn('📜 Сбои', 'inc'), btn('🏠 Меню', 'menu')]]
+        inc_run(False)
+        i = inc()
+        return (inc_text(i) if i else '✅ Пока проверял, всё заработало.'), \
+            [[btn('🔄 Проверить ещё раз', 'inc:re'), btn('🏠 Меню', 'menu')]]
+    hist = state.get('inc_hist') or []
+    if act.startswith('d'):
+        try:
+            r = hist[int(act[1:])]
+        except (ValueError, IndexError):
+            return scr_inc(uid, '')
+        lines = [f'🩺 <b>Сбой {time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))}</b> · '
+                 f'{fmt_dur(max(int((r.get("end") or r["ts"]) - r["ts"]), 1))}', '',
+                 f'<b>Что случилось:</b> {h(r.get("cause") or "?")}.']
+        if r.get('why'):
+            lines.append(f'<b>Почему:</b> {h(r["why"])}')
+        lines.append(f'<b>Как восстановилось:</b> {h(r.get("how") or "?")}.')
+        if r.get('pm'):
+            lines.append(f'<b>На сервере:</b> {h(r["pm"])}.')
+        if r.get('layers'):
+            lines += [''] + [f'{"✅" if x["ok"] else "❌" if x["ok"] is False else "▫️"} {LAYER_RU[x["k"]]}: '
+                             f'{h(x["t"])}' for x in r['layers']]
+        if r.get('ev'):
+            lines += [''] + [f'<code>{time.strftime("%H:%M:%S", time.localtime(t))}</code> {h(x)}'
+                             for t, x in r['ev']]
+        return '\n'.join(lines), [[btn('⬅️ Все сбои', 'inc'), btn('🏠 Меню', 'menu')]]
+    lines = ['🩺 <b>Что случалось</b>', '']
+    i = inc()
+    if i:
+        lines += [f'🔴 Сейчас: {h(INC_TITLE.get(i["kind"], "сбой"))}, {fmt_dur(int(time.time() - i["ts"]))}'
+                  + (f' — {h(i["cause"])}' if i.get('cause') else ''), '']
+    if not hist:
+        lines.append('Сбоев не было.' if not i else '')
+    kb = []
+    for n, r in enumerate(hist[:10]):
+        d = fmt_dur(max(int((r.get('end') or r['ts']) - r['ts']), 1))
+        lines.append(f'{time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))} · {d} — {h(r.get("cause") or "?")}')
+        kb.append([btn(f'{time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))} · {r.get("cause") or "?"}'[:60],
+                       f'inc:d{n}')])
+    kb.append(([btn('🔄 Проверить сейчас', 'inc:re')] if i else [btn('🧪 Проверить всё сейчас', 'inc:now')]))
+    kb.append([btn('⬅️ Самодиагностика', 'diag'), btn('🏠 Меню', 'menu')])
+    if act == 'now':
+        layers, d = diagnose()
+        cause, why, _ = verdict(layers, d)
+        lines = ['🧪 <b>Проверка всех слоёв</b>', ''] + [
+            f'{"✅" if x["ok"] else "❌" if x["ok"] is False else "▫️"} {LAYER_RU[x["k"]]}: {h(x["t"])}'
+            for x in layers] + ['', f'<b>Итог:</b> {h(cause if cause != "причина не найдена" else "всё в порядке")}.']
+        if cause != 'причина не найдена':
+            lines.append(h(why))
+        kb = [[btn('🔁 Ещё раз', 'inc:now'), btn('⬅️ Сбои', 'inc')]]
+    return '\n'.join(lines), kb
+
+
+# ---------------- надёжность: сторож зависания, «признаки жизни», очередь уведомлений ----------------
+# Бот раз в 30 с сообщает systemd «я жив» (WATCHDOG=1), но только если его главные циклы действительно крутятся.
+# Завис цикл — сообщения прекращаются, systemd через WD_SEC перезапускает бота. Файл признаков жизни (HB_FILE)
+# пишется туда же: после запуска по нему видно, было ли выключение штатным, падал ли бот, что висело.
+HB_FILE = '/var/lib/vpnbot/hb.json'
+WD_DROPIN = '/etc/systemd/system/vpnbot.service.d/watchdog.conf'
+WD_SEC = 180
+BEAT_MAX = {'poll': 300, 'watcher': 900}        # сколько секунд цикл может не отмечаться, прежде чем считать его зависшим
+OUTBOX_MAX = 40
+beats = {}
+wd_rt = {'stale_logged': False}
+
+
+def beat(name):
+    beats[name] = time.time()
+
+
+def sd_notify(msg):
+    addr = os.environ.get('NOTIFY_SOCKET')
+    if not addr:
+        return False
+    if addr.startswith('@'):
+        addr = '\0' + addr[1:]
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.connect(addr)
+            s.sendall(msg.encode())
+        finally:
+            s.close()
+        return True
+    except OSError:
+        return False
+
+
+BOOT = boot_id()
+
+
+def hb_read():
+    try:
+        return json.load(open(HB_FILE, encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def hb_write(**kw):
+    try:
+        os.makedirs(os.path.dirname(HB_FILE), exist_ok=True)
+        tmp = HB_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(kw, f)
+        os.replace(tmp, HB_FILE)
+    except Exception:
+        pass
+
+
+def wd_setup():
+    """Сторож systemd для бота. Включается со следующего запуска; откат версии в установщике его убирает."""
+    want = f'[Service]\nWatchdogSec={WD_SEC}\nNotifyAccess=main\n'
+    try:
+        if open(WD_DROPIN).read() == want:
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(WD_DROPIN), exist_ok=True)
+        with open(WD_DROPIN, 'w') as f:
+            f.write(want)
+        run(['systemctl', 'daemon-reload'], 30)
+        add_event('Включён сторож зависания бота (действует со следующего перезапуска)')
+    except Exception as e:
+        log('сторож systemd:', e)
+
+
+def wd_loop():
+    while True:
+        now = time.time()
+        stale = [k for k, t in beats.items() if now - t > BEAT_MAX.get(k, 600)]
+        hb_write(t=now, boot=BOOT, pid=os.getpid(), clean=False, stale=stale, ver=BOT_VERSION)
+        if not stale:
+            sd_notify('WATCHDOG=1')
+            wd_rt['stale_logged'] = False
+        elif not wd_rt['stale_logged']:
+            wd_rt['stale_logged'] = True
+            log('завис цикл:', stale, '— systemd перезапустит бота')
+        time.sleep(30)
+
+
+def on_term(*_):
+    hb_write(t=time.time(), boot=BOOT, pid=os.getpid(), clean=True, stale=[], ver=BOT_VERSION)
+    os._exit(0)
+
+
+def journal_reason(unit, lines=80):
+    """Почему служба остановилась в прошлый раз — по журналу systemd: сторож, падение, нехватка памяти."""
+    try:
+        out = run(['journalctl', '-u', unit, '-n', str(lines), '--no-pager', '-o', 'cat'], 15).stdout
+    except Exception:
+        return ''
+    found = ''
+    for line in out.splitlines():
+        if 'Watchdog timeout' in line:
+            found = 'сторож: бот не отвечал и был перезапущен'
+        elif 'oom-kill' in line or 'out-of-memory' in line.lower():
+            found = 'ядро остановило процесс из-за нехватки памяти'
+        elif re.search(r'Main process exited, code=(killed|dumped|exited)', line):
+            found = found or line.split(': ', 1)[-1][:160]
+        elif re.match(r'^\w*(Error|Exception)\b', line):
+            found = line[:160]
+    return found
+
+
+def crash_report(prev):
+    """После запуска: прошлый раз бот или весь сервер остановились не штатно? Если да — что известно о причине."""
+    if not prev or prev.get('clean') or not prev.get('t'):
+        return None
+    last = prev['t']
+    if prev.get('boot') and prev['boot'] != BOOT:
+        try:
+            up = float(open('/proc/uptime').read().split()[0])
+        except Exception:
+            up = 0
+        started = time.time() - up
+        gap = max(0, started - last)
+        lines = ['⚡ <b>Сервер выключался аварийно</b>',
+                 f'Последний признак жизни: {time.strftime("%d.%m %H:%M:%S", time.localtime(last))}, '
+                 f'включился в {time.strftime("%H:%M:%S", time.localtime(started))}'
+                 + (f' — не работал {fmt_dur(gap)}.' if gap >= 60 else '.'),
+                 'Штатного выключения не было: пропало питание, сервер завис или его сбросили кнопкой.']
+        pre = hist_before(last)
+        if pre:
+            lines.append('Перед этим: ' + pre)
+        if prev.get('stale'):
+            lines.append('Перед выключением бот уже не отвечал: ' + ', '.join(prev['stale']) + '.')
+        return '\n'.join(lines)
+    why = 'сторож: завис ' + ', '.join(prev['stale']) if prev.get('stale') else journal_reason('vpnbot')
+    return ('♻️ <b>Бот перезапускался аварийно</b>\n'
+            f'Последний признак жизни: {time.strftime("%d.%m %H:%M:%S", time.localtime(last))}.\n'
+            + (f'Причина: {h(why)}.' if why else 'Причина в журнале не найдена: <code>journalctl -u vpnbot -n 80</code>')
+            + '\nБот поднялся сам, VPN это не затрагивало.')
+
+
+def tg_reachable():
+    if LINK_MODE:
+        return bool(link_cli.get('up'))
+    return not tg_rt.get('down') and time.time() - tg_rt.get('net_err', 0) > 60
+
+
+def outbox_add(uid, kind, text):
+    """Не удалось отправить из-за сети — сохраняем; придёт, когда связь вернётся (а не потеряется)."""
+    if tg_reachable():
+        return                            # Telegram доступен, но не принял (бот заблокирован и т. п.) — не копим
+    with lock:
+        ob = state.setdefault('outbox', [])
+        if any(x['u'] == uid and x['x'] == text for x in ob):
+            return
+        ob.append({'u': uid, 'k': kind, 't': time.time(), 'x': text[:3000]})
+        del ob[:-OUTBOX_MAX]
+        save_state()
+
+
+outbox_lock = threading.Lock()
+
+
+def outbox_flush():
+    if not state.get('outbox') or not tg_reachable() or not outbox_lock.acquire(blocking=False):
+        return
+    try:
+        with lock:
+            items = list(state.get('outbox') or [])
+        per = {}
+        for x in items:
+            per.setdefault(x['u'], []).append(x)
+        done = []
+        for uid, lst in per.items():
+            first, lastt = lst[0]['t'], lst[-1]['t']
+            head = ('📬 <b>Пока не было связи, случилось вот что</b>\n'
+                    f'<i>с {time.strftime("%d.%m %H:%M", time.localtime(first))} '
+                    f'по {time.strftime("%H:%M", time.localtime(lastt))}</i>')
+            body = '\n\n'.join(f'<i>{time.strftime("%H:%M:%S", time.localtime(x["t"]))}</i>\n{x["x"]}' for x in lst)
+            if len(lst) > 3 or len(head) + len(body) > 3900:      # длинное — по строке на событие, без обрезки тегов
+                rows = [f'• <i>{time.strftime("%H:%M", time.localtime(x["t"]))}</i> '
+                        f'{h(plain(x["x"]).splitlines()[0][:120])}' for x in lst]
+                while len(rows) > 1 and len(head) + sum(len(r) + 1 for r in rows) > 3800:
+                    rows.pop(0)
+                body = ('' if len(rows) == len(lst) else f'…и ещё {len(lst) - len(rows)} раньше\n') + '\n'.join(rows)
+            ok = raw_send(uid, head + '\n\n' + body,
+                          [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]], ttl_kind='keep')
+            if ok:
+                done += lst
+            else:
+                break
+        if done:
+            with lock:
+                state['outbox'] = [x for x in state.get('outbox') or [] if x not in done]
+                save_state()
+    finally:
+        outbox_lock.release()
+
+
 def main():
     global LINK_MODE, OWNER, GW_NAME
+    hb_prev = hb_read()
+    hist_load()
+    signal.signal(signal.SIGTERM, on_term)
+    beat('watcher')
+    threading.Thread(target=wd_loop, daemon=True).start()
     load_state()
+    state_rt['crash'] = hb_prev
     if os.path.exists(RESTORED_FILE):
         restore_cleanup()
     cfg = gw_startup_migrate()
@@ -12396,6 +14243,8 @@ def main():
         {'command': 'site', 'description': 'Куда идёт сайт: /site youtube.com'},
     ])
     threading.Thread(target=watcher, daemon=True).start()
+    threading.Thread(target=hist_loop, daemon=True).start()
+    wd_setup()
     threading.Thread(target=fmt_autoapply, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
     threading.Thread(target=queue_upgrade, daemon=True).start()
@@ -12430,11 +14279,12 @@ def main():
         log('бот запущен как ведомый шлюз, ждёт главного', cfg.get('bot', ''))
         while True:
             time.sleep(3600)
-    startup_reports()
+    threading.Thread(target=startup_reports, daemon=True).start()     # отчёт о сбое ждёт до 45 с — не держим опрос
     add_event('Бот запущен')
     log('бот запущен, владелец', OWNER)
     offset = None
     while True:
+        beat('poll')
         params = {'timeout': 25, 'allowed_updates': ['message', 'callback_query']}
         if offset:
             params['offset'] = offset

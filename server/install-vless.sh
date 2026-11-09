@@ -11,6 +11,7 @@
 #     sudo bash install-vless.sh status      состояние
 #     sudo bash install-vless.sh os-upgrade  обновить Ubuntu/Debian в фоне (ход: os-job)
 #     sudo bash install-vless.sh reboot      перезагрузить сервер через 5 секунд
+#     sudo bash install-vless.sh postmortem  что было: перезагрузки, нехватка памяти, падения Xray, нагрузка
 #     sudo bash install-vless.sh sni-scan    найти сайты для маскировки: соседи по сети и запасной список
 #     sudo bash install-vless.sh uninstall   удалить VLESS с сервера
 #  Настройки через переменные: PORT=8443 SNI=www.nvidia.com NAME=latvia sudo -E bash install-vless.sh
@@ -202,8 +203,60 @@ open_firewall() {
 
 # MPTCP не нужен, а через него атакуют ядро (CVE-2026-98432: Go 1.24+ открывает порты с MPTCP);
 # обновления безопасности ставятся сами (перезагрузку делает бот шлюза ночью)
+# История нагрузки: раз в 30 с — процессор, память, нагрузка (последние 2 часа, переживает перезагрузку).
+# Нужна боту шлюза, чтобы после сбоя сказать, что было с сервером перед ним (см. postmortem).
+HIST_BIN=/usr/local/sbin/vpngw-hist
+hist_setup() {
+    mkdir -p "$JOB_DIR"
+    cat >"$HIST_BIN" <<'EOS'
+#!/bin/bash
+D=/var/lib/vpngw-vless; F=$D/hist; mkdir -p "$D"
+read -r _ u n s i w x y z _ </proc/stat
+tot=$((u+n+s+i+w+x+y+z)); idl=$((i+w)); cpu=-
+if read -r pt pi 2>/dev/null <"$D/cpu.prev" && [ "$tot" -gt "$pt" ]; then cpu=$((100 - 100*(idl-pi)/(tot-pt))); fi
+echo "$tot $idl" >"$D/cpu.prev"
+mem=$(awk '/^MemTotal/{t=$2}/^MemAvailable/{a=$2}END{if(t) printf "%d", 100-100*a/t}' /proc/meminfo)
+echo "$(date +%s),$cpu,${mem:-0},$(cut -d' ' -f1 /proc/loadavg)" >>"$F"
+if [ "$(wc -l <"$F")" -gt 300 ]; then tail -n 240 "$F" >"$F.tmp" && mv -f "$F.tmp" "$F"; fi
+EOS
+    chmod 755 "$HIST_BIN"
+    printf '[Unit]\nDescription=vpn-gateway: история нагрузки\n[Service]\nType=oneshot\nExecStart=%s\n' "$HIST_BIN" \
+        >/etc/systemd/system/vpngw-hist.service
+    printf '[Unit]\nDescription=vpn-gateway: история нагрузки раз в 30 с\n[Timer]\nOnBootSec=20\nOnUnitActiveSec=30\nAccuracySec=1\n[Install]\nWantedBy=timers.target\n' \
+        >/etc/systemd/system/vpngw-hist.timer
+    run systemctl daemon-reload
+    run systemctl enable --now vpngw-hist.timer
+}
+
+# Что было с сервером: перезагрузка (штатная или нет), нехватка памяти, падения Xray, нагрузка перед сбоем.
+# SINCE — с какого момента смотреть (время Unix).
+do_postmortem() {
+    local since=${SINCE:-$(( $(date +%s) - 3600 ))} boot clean=unknown oom xerr hist
+    boot=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))
+    out "BOOT $boot"
+    if [ "$boot" -gt "$since" ] && [ "$(journalctl --list-boots -q 2>/dev/null | wc -l)" -ge 2 ]; then
+        if journalctl -b -1 -q -o cat 2>/dev/null | tail -n 400 \
+            | grep -Eq 'systemd-shutdown|Journal stopped|Reached target .*(Power-Off|Reboot|Shutdown|Final Step)'; then
+            clean=yes; else clean=no; fi
+    fi
+    out "CLEAN $clean"
+    oom=$( { journalctl -k -b 0 --since "@$since" -o cat 2>/dev/null
+             [ "$boot" -gt "$since" ] && journalctl -k -b -1 --since "@$since" -o cat 2>/dev/null; } \
+           | grep -oP 'Killed process \d+ \(\K[^)]+' | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1?", ":""), $2, $1}')
+    [ -n "$oom" ] && out "OOM $oom"
+    out "XRESTARTS $(systemctl show xray -p NRestarts --value 2>/dev/null || echo 0)"
+    xerr=$(journalctl -u xray --since "@$since" -p err -o cat 2>/dev/null | tail -1 | cut -c1-160)
+    [ -n "$xerr" ] && out "XERR $xerr"
+    if [ -f "$JOB_DIR/hist" ]; then
+        hist=$(awk -F, -v a="$since" -v b="$((since + 1200))" '$1>=a && $1<=b' "$JOB_DIR/hist" | tail -n 40 | paste -sd';')
+        [ -n "$hist" ] && out "HIST $hist"
+    fi
+    out "OK"
+}
+
 harden() {
     compat_conf
+    [ -f /etc/systemd/system/vpngw-hist.timer ] || hist_setup
     if [ -e /proc/sys/net/mptcp/enabled ]; then
         printf '# vpn-gateway: MPTCP выключен (CVE-2026-98432)\nnet.mptcp.enabled = 0\n' >"$MPTCP_CONF"
         run sysctl -q -w net.mptcp.enabled=0
@@ -223,6 +276,7 @@ harden() {
 
 # защита и совместимость на месте: MPTCP выключен, в конфиге есть minClientVer (автообновления — строка UU)
 hard_ok() {
+    [ -f /etc/systemd/system/vpngw-hist.timer ] || return 1
     { [ ! -e /proc/sys/net/mptcp/enabled ] || [ "$(cat /proc/sys/net/mptcp/enabled)" = 0 ]; } || return 1
     [ ! -f "$CONF" ] || [ ! -f "$INFO" ] || grep -q '"minClientVer"' "$CONF"
 }
@@ -613,8 +667,9 @@ do_uninstall() {
     say "Удаляю VLESS…"
     systemctl disable --now xray >/dev/null 2>&1
     if fetch_installer; then run bash /tmp/xray-install.sh remove --purge; fi
+    systemctl disable --now vpngw-hist.timer >/dev/null 2>&1
     rm -rf /usr/local/etc/xray /usr/local/bin/xray /usr/local/share/xray /etc/systemd/system/xray*.service \
-        /etc/systemd/system/xray*.service.d
+        /etc/systemd/system/xray*.service.d /etc/systemd/system/vpngw-hist.* "$HIST_BIN"
     systemctl daemon-reload >/dev/null 2>&1
     rm -f "$INFO"
     if [ -n "$port" ] && command -v ufw >/dev/null; then run ufw delete allow "$port/tcp"; fi
@@ -669,6 +724,7 @@ case "$MODE" in
     os-upgrade) do_os_upgrade ;;
     os-job)  do_os_job ;;
     reboot)  do_reboot ;;
+    postmortem) do_postmortem ;;
     sni-scan) do_sni_scan ;;
     sni-try) do_sni_try ;;
     sni-confirm) do_sni_confirm ;;

@@ -701,6 +701,7 @@ EOF
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
         run ufw allow "$WG_PORT/udp"; run ufw route allow in on wg0
     fi
+    ufw_open_mihomo
     run systemctl daemon-reload
     run systemctl enable wg-quick@wg0
     run systemctl restart wg-quick@wg0 || die "WireGuard не запустился."
@@ -736,6 +737,15 @@ PY
 LAN2_CONF=$CONF_DIR/lan2.conf
 LAN2_SH=/usr/local/lib/vpngw/lan2.sh
 LAN2_NETPLAN=/etc/netplan/60-vpngw-lan2.yaml
+
+# mihomo (stack: system) принимает перехваченный трафик как входящие соединения на интерфейсе mihomo
+# и возвращает ответы через него же — при включённом ufw без этих правил клиенты WireGuard и сеть
+# за вторым портом остаются без интернета (проверено: SYN уходят в mihomo, ответы не возвращаются)
+ufw_open_mihomo() {
+    command -v ufw >/dev/null && ufw status | grep -q "Status: active" || return 0
+    ufw status | grep -qE '^Anywhere on mihomo +ALLOW' || run ufw allow in on mihomo
+    ufw status | grep -qE 'ALLOW FWD +Anywhere on mihomo' || run ufw route allow in on mihomo
+}
 
 lan2_ifaces() {   # физические проводные порты, кроме основного
     local d n
@@ -859,6 +869,7 @@ lan2_apply() {
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
         run ufw route allow in on "$IF"
     fi
+    ufw_open_mihomo
     run systemctl daemon-reload
     run systemctl enable vpngw-lan2
     run systemctl restart vpngw-lan2
@@ -1463,7 +1474,7 @@ uninstall() {
         /root/wg-clients 2>/dev/null; chmod 600 "$bak"
     [ -f "$LAN2_CONF" ] && lan2_off
     for s in vpnbot wg-quick@wg0 mihomo; do run systemctl disable --now "$s"; done
-    rm -rf /etc/systemd/system/vpnbot.service /etc/systemd/system/mihomo.service /etc/systemd/system/mihomo.service.d \
+    rm -rf /etc/systemd/system/vpnbot.service /etc/systemd/system/vpnbot.service.d /etc/systemd/system/mihomo.service /etc/systemd/system/mihomo.service.d \
         /etc/systemd/system/wg-quick@wg0.service.d /etc/wireguard/wg0.conf /etc/vpnbot.env /etc/vpnnotify.env \
         /var/lib/vpnbot /usr/local/bin/vpnbot.py /usr/local/bin/vpngw /usr/local/bin/vpngw-setup \
         /usr/local/lib/vpngw /var/lib/vpngw "$CONF_DIR" /etc/sysctl.d/99-vpngw.conf /etc/sysctl.d/99-vpngw-mptcp.conf /run/vpngw
@@ -1491,6 +1502,15 @@ ensure_killswitch() {
     fi
 }
 
+# Сторож systemd (WatchdogSec) включает сам бот начиная с 2.8. Старая версия не сообщает «я жив» —
+# с включённым сторожем systemd перезапускал бы её каждые 3 минуты. Поэтому при откате сторож снимается.
+wd_drop_if_old() {
+    local D=/etc/systemd/system/vpnbot.service.d/watchdog.conf
+    [ -f "$D" ] || return 0
+    grep -q 'WATCHDOG=1' /usr/local/bin/vpnbot.py 2>/dev/null && return 0
+    rm -f "$D"; systemctl daemon-reload; log "сторож зависания снят: прежняя версия бота его не поддерживает"
+}
+
 # Без вопросов: обновляет бота и vpngw, проверяет запуск, при неудаче откатывает.
 self_update() {
     mkdir -p /var/lib/vpngw/backup "$CONF_DIR"; touch "$LOG"
@@ -1512,6 +1532,7 @@ self_update() {
     ensure_killswitch
     ensure_os
     [ -f "$LAN2_CONF" ] && lan2_write_files     # второй порт: свежий скрипт службы
+    ufw_open_mihomo
     grep -q '^UPDATE_REPO=' /etc/vpnbot.env 2>/dev/null || printf 'UPDATE_REPO=%s\nUPDATE_BRANCH=%s\n' "$REPO" "$BRANCH" >>/etc/vpnbot.env
     if ! systemctl is-enabled --quiet vpnbot 2>/dev/null; then
         echo "$GW_VERSION" >"$CONF_DIR/version"
@@ -1532,6 +1553,7 @@ self_update() {
     [ -f "$B/install.sh" ] && install -m 700 "$B/install.sh" /usr/local/lib/vpngw/install.sh
     [ -f "$B/version" ] && cp "$B/version" "$CONF_DIR/version"
     echo "fail версия $GW_VERSION не запустилась за минуту: $(journalctl -u vpnbot -n 3 --no-pager 2>/dev/null | tail -1 | cut -c1-200)" >"$UPD_RESULT"
+    wd_drop_if_old
     systemctl restart vpnbot
     return 1
 }
@@ -1556,6 +1578,7 @@ rollback() {
     if [ -f "$B/install.sh" ]; then
         install -m 700 "$B/install.sh" /usr/local/lib/vpngw/install.sh.new && mv -f /usr/local/lib/vpngw/install.sh.new /usr/local/lib/vpngw/install.sh
     fi
+    wd_drop_if_old
     systemctl restart vpnbot
     log "откат выполнен"
 }
