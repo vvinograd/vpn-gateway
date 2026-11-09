@@ -121,6 +121,7 @@ main_menu() {
         4 "Проверить состояние" \
         5 "Проверить обновления (GitHub)" \
         6 "Обновить mihomo" \
+        l "Второй сетевой порт (сервер «в разрыв» перед роутером)" \
         7 "Переустановить / изменить настройки" \
         r "Восстановить из резервной копии" \
         b "Откатить последнее обновление" \
@@ -137,6 +138,7 @@ main_menu() {
         3) clear; vpngw peers; read -rp $'\nEnter — назад ' _ ;;
         4) clear; vpngw status; echo; vpngw peers; read -rp $'\nEnter — назад ' _ ;;
         5) check_updates_interactive ;;
+        l) step_lan2 menu ;;
         6) install_mihomo && run systemctl restart mihomo && msg "Готово" "mihomo обновлён: $(mihomo -v 2>/dev/null | head -1)" 9 ;;
         7) full_install ;;
         r) restore_install; clear; grapes; cat "$SUMMARY" 2>/dev/null; exit 0 ;;
@@ -727,6 +729,218 @@ json.dump(st, open(p + ".tmp", "w"), ensure_ascii=False); os.chmod(p + ".tmp", 0
 PY
 }
 
+# ================================================================ второй сетевой порт («шлюз в разрыв»)
+# Кабель провайдера — в основной порт, во второй — роутер (например, UniFi USG), которому этот сервер
+# раздаёт интернет: по правилам маршрутизации — через VPN или напрямую. Если mihomo не работает,
+# таблица 100 пуста, и устройства за вторым портом идут в интернет напрямую (а не теряют его, как WireGuard).
+LAN2_CONF=$CONF_DIR/lan2.conf
+LAN2_SH=/usr/local/lib/vpngw/lan2.sh
+LAN2_NETPLAN=/etc/netplan/60-vpngw-lan2.yaml
+
+lan2_ifaces() {   # физические проводные порты, кроме основного
+    local d n
+    for d in /sys/class/net/*; do
+        n=${d##*/}
+        [ "$n" = "${IFACE:-}" ] && continue
+        [ -e "$d/device" ] && [ "$(cat "$d/type" 2>/dev/null)" = 1 ] && [ ! -d "$d/wireless" ] || continue
+        echo "$n"
+    done
+}
+
+# адрес/маска → «сеть адрес_роутера маска»; код 1 — адрес не подходит, 2 — пересекается с WireGuard, 3 — с другой сетью
+lan2_net() {
+    python3 - "$@" <<'PY'
+import ipaddress, sys
+try:
+    i = ipaddress.ip_interface(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+n = i.network
+if i.version != 4 or n.prefixlen > 30 or n.prefixlen < 16 or not i.ip.is_private \
+        or i.ip in (n.network_address, n.broadcast_address):
+    sys.exit(1)
+if n.overlaps(ipaddress.ip_network(sys.argv[2] + ".0/24", strict=False)):
+    sys.exit(2)
+for o in sys.argv[3:]:
+    try:
+        if n.overlaps(ipaddress.ip_network(o, strict=False)):
+            print(o); sys.exit(3)
+    except ValueError:
+        pass
+print(n, next(h for h in n.hosts() if h != i.ip), n.netmask)
+PY
+}
+
+lan2_write_files() {
+    mkdir -p /usr/local/lib/vpngw
+    cat >"$LAN2_SH" <<'EOF'
+#!/bin/sh
+# VPN-шлюз: второй сетевой порт. Трафик с него — в mihomo (таблица 100);
+# если mihomo не работает, таблица пуста и трафик идёт напрямую через основной порт.
+. /etc/vpngw/lan2.conf || exit 1
+[ -n "$LAN2_IF" ] && [ -n "$LAN2_ADDR" ] && [ -n "$LAN2_NET" ] || exit 1
+case "$1" in
+up)
+    ip link set dev "$LAN2_IF" up || exit 1
+    ip addr replace "$LAN2_ADDR" dev "$LAN2_IF" || exit 1
+    while ip rule del iif "$LAN2_IF" lookup 100 2>/dev/null; do :; done
+    ip rule add iif "$LAN2_IF" lookup 100 priority 102 || exit 1
+    nft delete table ip vpngw_lan2 2>/dev/null
+    nft -f - <<NFT || exit 1
+table ip vpngw_lan2 {
+    chain post {
+        type nat hook postrouting priority 100; policy accept;
+        ip saddr $LAN2_NET oifname != { "$LAN2_IF", "mihomo" } masquerade
+    }
+}
+NFT
+    ;;
+down)
+    while ip rule del iif "$LAN2_IF" lookup 100 2>/dev/null; do :; done
+    while ip rule del iif "$LAN2_IF" lookup main 2>/dev/null; do :; done
+    nft delete table ip vpngw_lan2 2>/dev/null
+    ;;
+esac
+exit 0
+EOF
+    chmod 755 "$LAN2_SH"
+    cat >/etc/systemd/system/vpngw-lan2.service <<EOF
+[Unit]
+Description=VPN-шлюз: раздача интернета через второй сетевой порт
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$LAN2_SH up
+ExecStop=$LAN2_SH down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+lan2_netplan_reload() {   # $1 — порт; перенастраиваем только его, основной порт не трогаем
+    command -v netplan >/dev/null || return 0
+    run netplan generate || return 1
+    if systemctl is-active --quiet systemd-networkd; then
+        run networkctl reload; run networkctl reconfigure "$1"
+    else
+        run netplan apply
+    fi
+}
+
+# адрес закрепляем через netplan: иначе systemd-networkd может снять его при перенастройке сети
+lan2_netplan() {   # $1 — порт, $2 — адрес/маска
+    command -v netplan >/dev/null || return 0
+    umask 077
+    cat >"$LAN2_NETPLAN" <<EOF
+# VPN-шлюз: второй сетевой порт (vpngw-setup → «Второй сетевой порт»)
+network:
+  version: 2
+  ethernets:
+    $1:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      optional: true
+      addresses: [$2]
+EOF
+    umask 022
+    lan2_netplan_reload "$1"
+}
+
+lan2_apply() {
+    local IF ADDR
+    IF=$(grep -oP '^LAN2_IF=\K.*' "$LAN2_CONF"); ADDR=$(grep -oP '^LAN2_ADDR=\K.*' "$LAN2_CONF")
+    lan2_write_files
+    lan2_netplan "$IF" "$ADDR" || log "netplan: не удалось применить, адрес задаст служба vpngw-lan2"
+    if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+        run ufw route allow in on "$IF"
+    fi
+    run systemctl daemon-reload
+    run systemctl enable vpngw-lan2
+    run systemctl restart vpngw-lan2
+}
+
+lan2_off() {
+    local IF; IF=$(grep -oP '^LAN2_IF=\K.*' "$LAN2_CONF" 2>/dev/null)
+    run systemctl disable --now vpngw-lan2
+    rm -f /etc/systemd/system/vpngw-lan2.service "$LAN2_SH" "$LAN2_CONF" "$LAN2_NETPLAN"
+    run systemctl daemon-reload
+    [ -n "$IF" ] || return 0
+    lan2_netplan_reload "$IF"
+    run ip addr flush dev "$IF"
+    if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+        run ufw route delete allow in on "$IF"
+    fi
+}
+
+step_lan2() {   # $1 = menu — вызвано из меню vpngw-setup (спрашиваем без предварительного «Да/Нет»)
+    load_conf
+    local cur_if="" cur_addr="" c n st IF A r rc NET PEER MASK
+    local -a ifs list
+    if [ -f "$LAN2_CONF" ]; then
+        cur_if=$(grep -oP '^LAN2_IF=\K.*' "$LAN2_CONF"); cur_addr=$(grep -oP '^LAN2_ADDR=\K.*' "$LAN2_CONF")
+    fi
+    mapfile -t ifs < <(lan2_ifaces)
+    if [ -n "$cur_if" ]; then
+        c=$(need menu "Второй сетевой порт" "Сейчас: порт $cur_if, адрес $cur_addr.\nРоутер за этим портом получает интернет через шлюз." 14 \
+            keep "Оставить как есть" \
+            change "Изменить порт или адрес" \
+            off "Выключить раздачу через второй порт")
+        case $c in
+            keep) info "Применяю настройки второго порта…"; lan2_apply; return 0 ;;
+            off)  info "Выключаю второй порт…"; lan2_off
+                  msg "Второй сетевой порт" "Раздача через порт $cur_if выключена.\nРоутер за ним остался без интернета." 9; return 0 ;;
+        esac
+    else
+        if [ ${#ifs[@]} -eq 0 ]; then
+            [ "${1:-}" = menu ] && msg "Второй сетевой порт" "Кроме основного порта ($IFACE), других проводных портов на сервере нет." 8
+            return 0
+        fi
+        [ "${1:-}" = menu ] || ask "Второй сетевой порт" "На сервере есть ещё сетевой порт: ${ifs[*]}.\n
+Можно поставить сервер «в разрыв»: кабель провайдера — в основной порт ($IFACE), во второй — роутер (например, UniFi USG). Роутер и вся сеть за ним получат интернет через шлюз: заблокированное — через VPN, остальное — напрямую.\n
+Если mihomo перестанет работать, сеть за роутером пойдёт в интернет напрямую, без VPN, а не останется без связи.\n
+Настроить?" 18 1 || return 0
+    fi
+    for n in "${ifs[@]}"; do
+        st=$(cat "/sys/class/net/$n/operstate" 2>/dev/null)
+        list+=("$n" "$( [ "$st" = up ] && echo "кабель подключён" || echo "кабеля нет"), MAC $(cat "/sys/class/net/$n/address" 2>/dev/null)")
+    done
+    IF=$(MENU_DEFAULT=$cur_if need menu "Второй сетевой порт" "Какой порт смотрит в сторону роутера?\n\nОсновной порт (кабель провайдера): $IFACE" 16 "${list[@]}")
+    while :; do
+        A=$(need inp "Адрес второго порта" "IP этого сервера на втором порту, с маской.\nРоутер за портом получит соседний адрес этой же подсети.\n
+Подсеть не должна совпадать с сетями за роутером (например, 192.168.10.0/23) и с туннелем WireGuard ($WG_NET.0/24)." "${cur_addr:-172.31.250.1/30}" 14)
+        # shellcheck disable=SC2046  # список сетей — отдельными аргументами
+        r=$(lan2_net "$A" "${WG_NET:-10.10.10}" $(ip -4 -o route show proto kernel | awk -v i="$IF" '$3 != i {print $1}')); rc=$?
+        case $rc in
+            0) break ;;
+            2) msg "Адрес второго порта" "$A пересекается с подсетью WireGuard ($WG_NET.0/24). Выберите другую." 8 ;;
+            3) msg "Адрес второго порта" "$A пересекается с сетью $r, которая уже есть на сервере. Выберите другую." 8 ;;
+            *) msg "Адрес второго порта" "Нужен частный IPv4-адрес с маской от /16 до /30, например 172.31.250.1/30." 8 ;;
+        esac
+    done
+    read -r NET PEER MASK <<<"$r"
+    [ -n "$cur_if" ] && [ "$cur_if" != "$IF" ] && lan2_off
+    mkdir -p "$CONF_DIR"
+    printf 'LAN2_IF=%s\nLAN2_ADDR=%s\nLAN2_NET=%s\n' "$IF" "$A" "$NET" >"$LAN2_CONF"; chmod 644 "$LAN2_CONF"
+    info "Настраиваю второй порт $IF…"
+    lan2_apply
+    systemctl is-active --quiet vpngw-lan2 || die "Не удалось настроить второй порт $IF (служба vpngw-lan2)."
+    log "второй порт: $IF $A, роутер $PEER"
+    msg "Настройте роутер за вторым портом" "WAN роутера (UniFi: Settings → Internet → WAN):
+  Подключение:  Static IP (статический)
+  IP-адрес:     $PEER
+  Маска:        $MASK
+  Шлюз:         ${A%/*}
+  DNS:          1.1.1.1 и 77.88.8.8\n
+Запросы DNS тоже проходят через mihomo, поэтому заблокированные сайты откроются и с этими DNS.\n
+Что идёт через VPN, решает режим маршрутизации шлюза (бот: Настройки → Маршрутизация), он общий и для WireGuard. Для сети с камерами и Wi-Fi подходит «Только заблокированное» или «Умная».\n
+Если mihomo остановится, сеть за роутером пойдёт напрямую. Выключить или изменить: sudo vpngw-setup → «Второй сетевой порт»." 24
+}
+
 install_bot_files() {
     unpack "$P_VPNBOT" "$TMP/vpnbot.py"
     python3 -m py_compile "$TMP/vpnbot.py" || { die "Встроенный бот повреждён."; return 1; }
@@ -943,6 +1157,7 @@ full_install() {
     step_mode
     step_mihomo
     step_wireguard
+    step_lan2
     step_bot
     step_email
     step_timezone
@@ -1220,6 +1435,7 @@ restore_install() {
     step_mihomo
     python3 /usr/local/bin/vpnbot.py --mark-applied >>"$LOG" 2>&1
     step_wireguard
+    step_lan2             # порты на новом сервере могут называться иначе — спрашиваем заново
     step_bot              # новый токен спрашиваем здесь: Telegram из России доступен только через mihomo
     [ "${RST_EMAIL:-}" = new ] && step_email
     step_timezone
@@ -1245,6 +1461,7 @@ uninstall() {
     local bak="/root/vpngw-backup-$(date +%Y%m%d-%H%M).tar.gz"
     tar czf "$bak" /etc/mihomo /etc/wireguard /etc/vpngw /etc/vpnbot.env /etc/vpnnotify.env /var/lib/vpnbot \
         /root/wg-clients 2>/dev/null; chmod 600 "$bak"
+    [ -f "$LAN2_CONF" ] && lan2_off
     for s in vpnbot wg-quick@wg0 mihomo; do run systemctl disable --now "$s"; done
     rm -rf /etc/systemd/system/vpnbot.service /etc/systemd/system/mihomo.service /etc/systemd/system/mihomo.service.d \
         /etc/systemd/system/wg-quick@wg0.service.d /etc/wireguard/wg0.conf /etc/vpnbot.env /etc/vpnnotify.env \
@@ -1294,6 +1511,7 @@ self_update() {
     install_tools
     ensure_killswitch
     ensure_os
+    [ -f "$LAN2_CONF" ] && lan2_write_files     # второй порт: свежий скрипт службы
     grep -q '^UPDATE_REPO=' /etc/vpnbot.env 2>/dev/null || printf 'UPDATE_REPO=%s\nUPDATE_BRANCH=%s\n' "$REPO" "$BRANCH" >>/etc/vpnbot.env
     if ! systemctl is-enabled --quiet vpnbot 2>/dev/null; then
         echo "$GW_VERSION" >"$CONF_DIR/version"

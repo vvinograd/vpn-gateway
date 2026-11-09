@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.6.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.7.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -111,6 +111,7 @@ SELECT_GROUP = 'PROXY'
 AUTO_GROUP = 'AUTO'
 WG_IF = 'wg0'
 WG_CONF = f'/etc/wireguard/{WG_IF}.conf'
+LAN2_CONF = '/etc/vpngw/lan2.conf'   # второй сетевой порт («шлюз в разрыв»), настраивает vpngw-setup
 PEERS_PAGE = 8
 WATCH_EVERY = 30          # как часто проверять состояние, сек
 TRAFFIC_EVERY = 60        # как часто учитывать трафик, сек
@@ -2492,27 +2493,71 @@ def run(cmd, timeout=30, inp=None):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=inp)
 
 
-# ---------------- сторож маршрута: wg0 → таблица 100 → mihomo ----------------
+# ---------------- сторож маршрута: wg0 / второй порт → таблица 100 → mihomo ----------------
 route_miss = {'n': 0}
 
 
+def lan2_conf():
+    """Второй сетевой порт: {'if', 'addr', 'net'} или None, если не настроен."""
+    try:
+        kv = dict(ln.split('=', 1) for ln in open(LAN2_CONF, encoding='utf-8').read().split('\n') if '=' in ln)
+    except OSError:
+        return None
+    iface = kv.get('LAN2_IF', '').strip().strip('\'"')
+    if not re.fullmatch(r'[\w.:@-]{1,15}', iface):
+        return None
+    return {'if': iface, 'addr': kv.get('LAN2_ADDR', '').strip(), 'net': kv.get('LAN2_NET', '').strip()}
+
+
+def lan2_status():
+    """Строка о втором порте для экрана «Состояние» или None."""
+    l2 = lan2_conf()
+    if not l2:
+        return None
+    name = f'🔌 Второй порт {h(l2["if"])}'
+    if not os.path.isdir(f'/sys/class/net/{l2["if"]}'):
+        return f'{name}: ⚠️ порт не найден'
+    try:
+        carrier = open(f'/sys/class/net/{l2["if"]}/carrier').read().strip() == '1'
+    except OSError:
+        carrier = False               # порт выключен (down) — carrier не читается
+    rules = run(['ip', 'rule', 'show'], 5).stdout
+    if not re.search(rf'iif {re.escape(l2["if"])} lookup 100', rules):
+        return f'{name}: ⚠️ не настроен (служба vpngw-lan2)'
+    if not carrier:
+        return f'{name}: кабель не подключён'
+    if re.search(rf'iif {re.escape(l2["if"])} lookup main', rules):
+        return f'{name}: 🟡 напрямую, без VPN (аварийный режим)'
+    if run(['ip', 'link', 'show', 'mihomo'], 5).returncode != 0:
+        return f'{name}: 🟡 напрямую, без VPN (mihomo не работает)'
+    return f'{name}: 🟢 через шлюз'
+
+
 def route_tick():
-    """Трафик клиентов WireGuard идёт в VPN через правило «iif wg0 lookup 100» и маршрут
-    «default dev mihomo» в таблице 100. Если что-то пропало (сбой при перезапуске mihomo) —
+    """Трафик клиентов WireGuard и второго порта идёт в VPN через правила «iif … lookup 100» и маршрут
+    «default dev mihomo» в таблице 100. Если что-то пропало (сбой при перезапуске mihomo, перенастройка сети) —
     возвращаем на место. Чиним со второй проверки подряд, чтобы не мешать обычному запуску mihomo."""
-    if run(['ip', 'link', 'show', 'mihomo'], 5).returncode != 0 or \
-            run(['ip', 'link', 'show', WG_IF], 5).returncode != 0:
-        route_miss['n'] = 0          # mihomo или WireGuard не запущены — об этом предупреждают другие проверки
+    if run(['ip', 'link', 'show', 'mihomo'], 5).returncode != 0:
+        route_miss['n'] = 0          # mihomo не запущен — об этом предупреждают другие проверки
+        return
+    wg_up = run(['ip', 'link', 'show', WG_IF], 5).returncode == 0
+    l2 = lan2_conf()
+    if l2 and run(['ip', 'link', 'show', l2['if']], 5).returncode != 0:
+        l2 = None
+    if not wg_up and not l2:
+        route_miss['n'] = 0
         return
     rules = run(['ip', 'rule', 'show'], 5).stdout
     table = run(['ip', 'route', 'show', 'table', '100'], 5).stdout
     missing = []
     if not re.search(r'^default dev mihomo\b', table, re.M):
         missing.append('route')
-    if not re.search(rf'iif {re.escape(WG_IF)} lookup 100', rules):
+    if wg_up and not re.search(rf'iif {re.escape(WG_IF)} lookup 100', rules):
         missing.append('rule')
-    if not re.search(rf'iif {re.escape(WG_IF)} prohibit', rules):
+    if wg_up and not re.search(rf'iif {re.escape(WG_IF)} prohibit', rules):
         missing.append('kill')
+    if l2 and not re.search(rf'iif {re.escape(l2["if"])} lookup 100', rules):
+        missing.append('lan2')
     if not missing:
         route_miss['n'] = 0
         if route_miss.get('alert'):
@@ -2529,26 +2574,38 @@ def route_tick():
             'rule': (['ip', 'rule', 'add', 'iif', WG_IF, 'lookup', '100', 'priority', '100'],
                      f'правило {WG_IF} → таблица 100'),
             'kill': (['ip', 'rule', 'add', 'iif', WG_IF, 'prohibit', 'priority', '101'], 'защита от утечек')}
+    if l2:
+        cmds['lan2'] = (['ip', 'rule', 'add', 'iif', l2['if'], 'lookup', '100', 'priority', '102'],
+                        f'правило второго порта {l2["if"]} → таблица 100')
     for k in missing:
         cmd, what = cmds[k]
         r = run(cmd, 5)
         (fixed if r.returncode == 0 else errs).append(what if r.returncode == 0 else f'{what}: {r.stderr.strip()}')
     if fixed:
         add_event('Сторож маршрута восстановил: ' + ', '.join(fixed))
+    lost = ', '.join(cmds[k][1] for k in missing)
+    wg_hit = wg_up and bool({'route', 'rule'} & set(missing))
+    l2_hit = bool(l2) and bool({'route', 'lan2'} & set(missing))
     if errs:
         log('route_tick:', errs)
         if route_miss.get('alert'):
             return                    # уже предупредили, не повторяем каждую минуту
         route_miss['alert'] = True
-        text = ('⚠️ <b>Сбой маршрутизации VPN</b>\n\nПропало: ' + ', '.join(cmds[k][1] for k in missing) +
-                '.\nКлиенты WireGuard сейчас без VPN.\n\nНе удалось починить: ' + h('; '.join(errs)) +
+        who = ([] if not wg_hit else ['Клиенты WireGuard сейчас без VPN.']) + \
+              ([] if not l2_hit else ['Сеть за вторым портом идёт напрямую, без VPN.'])
+        text = (f'⚠️ <b>Сбой маршрутизации VPN</b>\n\nПропало: {lost}.\n' + '\n'.join(who) +
+                '\n\nНе удалось починить: ' + h('; '.join(errs)) +
                 '\nПомогает «🔧 Управление → ♻️ Перезапуск mihomo».')
     else:
         route_miss['alert'] = False
-        text = ('🛠 <b>Восстановлена маршрутизация VPN</b>\n\nПропало: ' + ', '.join(cmds[k][1] for k in missing) +
-                '.\nНа время сбоя клиенты WireGuard были без VPN (утечки IP не было — сработала защита).'
-                if 'kill' not in missing else
-                '🛠 <b>Восстановлена маршрутизация VPN</b>\n\nПропало: ' + ', '.join(cmds[k][1] for k in missing) + '.')
+        notes = []
+        if wg_hit:
+            notes.append('На время сбоя клиенты WireGuard были без VPN (утечки IP не было — сработала защита).'
+                         if 'kill' not in missing else 'На время сбоя клиенты WireGuard могли идти без VPN.')
+        if l2_hit:
+            notes.append('Сеть за вторым портом на время сбоя шла напрямую.')
+        text = f'🛠 <b>Восстановлена маршрутизация VPN</b>\n\nПропало: {lost}.' + \
+               ('\n' + '\n'.join(notes) if notes else '')
     notify('dead', text)
 
 
@@ -2921,8 +2978,8 @@ def fmt_dur(s):
 
 
 # ---------------- учёт трафика ----------------
-def _traffic_delta():
-    c = api('/connections')
+def _traffic_delta(c=None):
+    c = api('/connections') if c is None else c
     down, up = c.get('downloadTotal', 0), c.get('uploadTotal', 0)
     last = state.get('last_raw')
     if last and down >= last[0] and up >= last[1]:
@@ -2935,8 +2992,9 @@ def _traffic_delta():
 
 
 def sample_traffic():
+    c = api('/connections')           # запрос к mihomo — без замка состояния, чтобы зависший API не держал бота
     with lock:
-        down, up, dd, du, _ = _traffic_delta()
+        down, up, dd, du, _ = _traffic_delta(c)
         t = state['traffic'].setdefault(date.today().isoformat(), [0, 0])
         t[0] += dd
         t[1] += du
@@ -2948,13 +3006,16 @@ def sample_traffic():
 
 
 def traffic_view():
+    try:
+        c = api('/connections')       # экран обновляется раз в 3 с — HTTP-запрос не под замком состояния
+    except Exception:
+        c = None
     with lock:
         days = {k: list(v) for k, v in state['traffic'].items()}
-        try:
-            _, _, dd, du, conns = _traffic_delta()
-        except Exception:
-            dd = du = 0
-            conns = None
+        dd = du = 0
+        conns = None
+        if c is not None:
+            _, _, dd, du, conns = _traffic_delta(c)
     t = days.setdefault(date.today().isoformat(), [0, 0])
     t[0] += dd
     t[1] += du
@@ -3049,6 +3110,9 @@ def scr_status(uid):
         lines.append(f'🔐 WireGuard: на связи {online} из {len([p for p in peers.values() if p["enabled"]])}')
     except Exception:
         lines.append('🔐 WireGuard: ⚠️ не запущен')
+    l2s = lan2_status()
+    if l2s:
+        lines.append(l2s)
     lines += ['', f'<i>Обновлено {time.strftime("%H:%M:%S")}</i>']
     return '\n'.join(lines), kb_back('status')
 
@@ -3658,11 +3722,41 @@ def scr_srv(uid, note=''):
     return '\n'.join(lines), kb
 
 
-# ---------------- живой монитор: процессор, память, сеть раз в 5 секунд ----------------
-MON_PERIOD = 5
+# ---------------- живой монитор: процессор, память, сеть раз в 3 секунды ----------------
+MON_PERIOD = 3
 MON_LEN = 180                      # потом «▶️ Ещё»: не дёргать Telegram, если экран забыли открытым
 SPARK = '▁▂▃▄▅▆▇█'
 mon_rt = {}                        # chat → {'tok', 'mid'}
+live_rt = {}                       # chat → {'tok', 'mid', 'data'}: открытый экран, который обновляется сам
+_live_locks = {}
+_live_guard = threading.Lock()
+
+
+def live_lock(chat):
+    """Замок чата: фоновое обновление экрана и нажатие кнопки не правят сообщение одновременно
+    (иначе фоновый кадр может лечь поверх только что открытого экрана)."""
+    with _live_guard:
+        return _live_locks.setdefault(chat, threading.Lock())
+
+
+def live_stop(chat, keep_mon=False):
+    with live_lock(chat):
+        live_rt.pop(chat, None)
+        if not keep_mon:
+            mon_rt.pop(chat, None)
+
+
+def live_edit(chat, mid, tok, rt, text, kb):
+    """Правка из фонового обновления — только если экран всё ещё открыт (тот же токен).
+    None — экран уже сменили; иначе ответ Telegram (пусто — правка не прошла)."""
+    with live_lock(chat):
+        if (rt.get(chat) or {}).get('tok') != tok:
+            return None
+        p = {'chat_id': chat, 'message_id': mid, 'text': text, 'parse_mode': 'HTML',
+             'disable_web_page_preview': True}
+        if kb:
+            p['reply_markup'] = {'inline_keyboard': kb}
+        return tg('editMessageText', 8, **p) or False
 
 
 def spark(vals, top=None):
@@ -3744,7 +3838,8 @@ def mon_start(chat, mid):
         return mon_frame(m, 0), mon_kb(False)
     tok = os.urandom(4).hex()
     end = time.time() + MON_LEN
-    mon_rt[chat] = {'tok': tok, 'mid': mid}
+    with live_lock(chat):
+        mon_rt[chat] = {'tok': tok, 'mid': mid}
 
     def loop():
         while True:
@@ -3754,10 +3849,13 @@ def mon_start(chat, mid):
             left = end - time.time()
             try:
                 if left <= 0:
-                    mon_rt.pop(chat, None)
-                    edit(chat, mid, mon_frame(m, 0), mon_kb(False))
+                    live_edit(chat, mid, tok, mon_rt, mon_frame(m, 0), mon_kb(False))
+                    with live_lock(chat):
+                        if (mon_rt.get(chat) or {}).get('tok') == tok:
+                            mon_rt.pop(chat, None)
                     return
-                edit(chat, mid, mon_frame(m, left), mon_kb(True))
+                if live_edit(chat, mid, tok, mon_rt, mon_frame(m, left), mon_kb(True)) is None:
+                    return
             except Exception as e:
                 log('монитор:', e)
                 mon_rt.pop(chat, None)
@@ -5332,7 +5430,6 @@ def scr_vs(uid, note=''):
     if lst:
         rel = c.get('rel') or {}
         old = xray_outdated(rel)
-        bad = c.get('bad_ver') or {}
         lines += ['', f'⬆️ Последний Xray: <b>{h(rel["tag"])}</b>' + (
             ' — ⛔ не заработал с шлюзом, ставить не буду' if xray_bad(rel['tag']) else
             f', старее на {len(old)} из {len(lst)}' if old else ', у всех свежий')
@@ -7447,6 +7544,109 @@ SCREENS = {'menu': scr_menu, 'status': scr_status, 'servers': scr_servers, 'traf
 OWNER_ONLY = ('zt:', 'diag:set:', 'diag:auto', 'vs', 'os', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
               'upd:', 'subs', 'sub:', 'srvthr', 'srvt:', 'srvclean')
 
+# ---------------- живые экраны: открытый экран (кроме главного меню) обновляется раз в 3 секунды ----------------
+LIVE_PERIOD = 3
+LIVE_LEN = 180                     # потом экран остаётся как есть — не дёргать Telegram, если его забыли открытым
+LIVE_SKIP = {'menu'}               # главное меню — без живых данных
+
+
+def live_view(uid, data):
+    """Чем перерисовать экран, открытый кнопкой data: функция без аргументов → (text, kb) или None, если
+    показывать больше нечего (клиента удалили и т.п.). Только экраны просмотра: действия не повторяются."""
+    if data in LIVE_SKIP:
+        return None
+    if data in SCREENS:
+        return lambda: SCREENS[data](uid)
+    cmd, _, arg = data.partition(':')
+    if cmd == 'wg' and arg.isdigit():
+        return lambda: scr_wg(uid, page=int(arg))
+    if cmd == 'wgp' and arg:
+        def peer():
+            pub = peer_by_tag(arg)
+            return scr_wg_peer(uid, pub) if pub else None
+        return peer
+    if data.startswith('sub:v:'):
+        pid = data[6:]
+        return lambda: scr_sub(uid, pid) if sub_by_id(pid) else None
+    if data.startswith('vs:v:'):
+        vid = data[5:]
+        return lambda: scr_vs_one(uid, vid) if vid in vps_all() else None
+    if data.startswith('gw:n:') and not LINK_MODE:
+        nid = data[5:]
+        return lambda: scr_gw_node(uid, nid) if nid in gw_nodes() else None
+    simple = {'gws': lambda: scr_gws(uid), 'zt': lambda: scr_zt(uid), 'upd': lambda: scr_upd(uid),
+              'bk:list': lambda: scr_bk_list(uid), 'bk:dst': lambda: scr_bk_dst(uid),
+              'gw:adm': lambda: scr_gw_adm(uid)}
+    if data in ('gws', 'gw:adm') and LINK_MODE:
+        return None
+    return simple.get(data)
+
+
+def live_start(chat, mid, uid, data, shown):
+    """После нажатия: если открыт экран просмотра — перерисовывать его, пока не нажмут другую кнопку
+    (не дольше LIVE_LEN). Сообщение правится только когда данные изменились."""
+    if chat == CLI_CHAT or not mid:
+        return
+    view = live_view(uid, data)
+    if not view:
+        return
+    tok = os.urandom(4).hex()
+    with live_lock(chat):
+        live_rt[chat] = {'tok': tok, 'mid': mid, 'data': data}
+    end = time.time() + LIVE_LEN
+
+    def loop():
+        last, errs, fails = tuple(shown), 0, 0
+        while time.time() < end:
+            time.sleep(LIVE_PERIOD)
+            if (live_rt.get(chat) or {}).get('tok') != tok:
+                return                    # нажали другую кнопку
+            if not is_admin(uid):
+                break
+            try:
+                res = view()
+            except Exception as e:
+                errs += 1
+                log('живой экран', data, e)
+                if errs >= 3:
+                    break
+                continue
+            errs = 0
+            if not res:
+                break                     # показывать больше нечего
+            res = tuple(res)
+            if res == last:
+                continue
+            r = live_edit(chat, mid, tok, live_rt, *res)
+            if r is None:
+                return
+            if not r:
+                fails += 1                # сообщение удалили или Telegram недоступен
+                if fails >= 2:
+                    break
+                continue
+            fails, last = 0, res
+        with live_lock(chat):
+            if (live_rt.get(chat) or {}).get('tok') == tok:
+                live_rt.pop(chat, None)
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def live_stop_remote(uid, chat):
+    """Главный правит экран, который прислал ведомый (🏢 Шлюзы, админы): ведомый должен перестать его обновлять."""
+    if LINK_MODE:
+        return
+    try:
+        sel = gw_sel(uid)
+        if sel == 'm':
+            return
+        with links_lock:
+            lk = links.get(sel)
+        if lk:
+            lk.send({'t': 'live_stop', 'chat': chat})
+    except Exception as e:
+        log('связь шлюзов: live_stop', e)
+
 CONFIRM = {
     'mihomo': ('♻️ <b>Перезапустить mihomo?</b>\n\nVPN прервётся на 5–10 секунд, '
                'активные соединения оборвутся.', False),
@@ -8380,11 +8580,13 @@ def handle_callback(cq):
     if mid and ui['menu'].get(str(chat)) != mid:
         set_menu(chat, mid)               # нажали кнопку в другом сообщении — теперь меню здесь
     if data not in ('adm:add', 'em:add', 'em:name', 'wgepd', 'wgepi') and not data.startswith(
-            ('wgadd:', 'wgr:', 'swea:', 'wgxd:', 'wglc:', 'em:pv:', 'sub:', 'vsw:', 'mtw:')):
+            ('wgadd:', 'wgr:', 'swea:', 'wgxd:', 'wglc:', 'em:pv:', 'sub:', 'vsw:', 'mtw:')) \
+            or data.startswith('sub:v:'):     # «✖️ Отмена» при вводе имени или ссылки подписки
         awaiting.pop(uid, None)
     who = h(admin_name(uid))
-    if data != 'mon':
-        mon_rt.pop(chat, None)            # любая другая кнопка останавливает монитор
+    live_stop(chat, keep_mon=data == 'mon')   # любая кнопка останавливает обновление прежнего экрана
+    live_stop_remote(uid, chat)
+    shown = False
     try:
         if data.startswith(OWNER_ONLY) and not is_owner(uid):
             text, kb = scr_menu(uid)
@@ -8610,10 +8812,13 @@ def handle_callback(cq):
                 text, kb = scr_admins(uid, '✅ Администратор удалён' if removed else '')
         else:
             text, kb = scr_menu(uid)
+        shown = not (data.startswith(OWNER_ONLY) and not is_owner(uid))
     except Exception as e:
         log(traceback.format_exc())
         text, kb = f'⚠️ <b>Ошибка</b>\n<code>{h(str(e))[:300]}</code>', kb_back()
     edit(chat, mid, text, kb)
+    if shown:
+        live_start(chat, mid, uid, data, (text, kb))
 
 
 def set_peer_expiry(pub, ts, who):
@@ -8894,6 +9099,7 @@ def handle_message(m):
         return
     touch_admin(u)
     CTX.chat = chat
+    live_stop(chat)                       # ввод текста — экран, открытый раньше, больше не обновляем
     has_file = bool(m.get('document') or m.get('photo'))
     if not has_file and m.get('message_id'):
         tg('deleteMessage', chat_id=chat, message_id=m['message_id'])   # чистый чат: ввод не остаётся
@@ -9770,12 +9976,16 @@ def cli_find_server(q):
 
 
 def cli_direct(on):
-    """Аварийно: трафик клиентов WireGuard напрямую, мимо mihomo (если VPN лёг совсем)."""
+    """Аварийно: трафик клиентов WireGuard (и второго порта) напрямую, мимо mihomo (если VPN лёг совсем)."""
     rules = run(['ip', 'rule', 'show'], 5).stdout
     net = f'{WG_NET}.0/24'
+    l2 = lan2_conf()
+    ifs = [WG_IF] + ([l2['if']] if l2 else [])
+    who = 'клиенты WireGuard' + (' и сеть за вторым портом' if l2 else '')
     if on:
-        if not re.search(rf'iif {re.escape(WG_IF)} lookup main', rules):
-            run(['ip', 'rule', 'add', 'iif', WG_IF, 'lookup', 'main', 'priority', '99'], 5)
+        for i in ifs:
+            if not re.search(rf'iif {re.escape(i)} lookup main', rules):
+                run(['ip', 'rule', 'add', 'iif', i, 'lookup', 'main', 'priority', '99'], 5)
         run(['nft', 'add', 'table', 'ip', 'vpngw_direct'], 5)
         run(['nft', 'add', 'chain', 'ip', 'vpngw_direct', 'post',
              '{ type nat hook postrouting priority 100 ; }'], 5)
@@ -9785,18 +9995,19 @@ def cli_direct(on):
         with lock:
             state['direct_mode'] = time.time()
             save_state()
-        add_event('Консоль: аварийный режим — клиенты WireGuard напрямую, без VPN')
-        return 'Аварийный режим включён: клиенты WireGuard идут в интернет напрямую, без VPN.\n' \
+        add_event(f'Консоль: аварийный режим — {who} напрямую, без VPN')
+        return f'Аварийный режим включён: {who} идут в интернет напрямую, без VPN.\n' \
                'Выключить: vpngw direct off. Режим сбросится и при перезагрузке сервера.'
-    while re.search(rf'iif {re.escape(WG_IF)} lookup main', run(['ip', 'rule', 'show'], 5).stdout):
-        if run(['ip', 'rule', 'del', 'iif', WG_IF, 'lookup', 'main', 'priority', '99'], 5).returncode != 0:
-            break
+    for i in ifs:
+        while re.search(rf'iif {re.escape(i)} lookup main', run(['ip', 'rule', 'show'], 5).stdout):
+            if run(['ip', 'rule', 'del', 'iif', i, 'lookup', 'main', 'priority', '99'], 5).returncode != 0:
+                break
     run(['nft', 'delete', 'table', 'ip', 'vpngw_direct'], 5)
     with lock:
         state.pop('direct_mode', None)
         save_state()
     add_event('Консоль: аварийный режим выключен, клиенты снова через VPN')
-    return 'Аварийный режим выключен: клиенты WireGuard снова идут через VPN.'
+    return f'Аварийный режим выключен: {who} снова идут через VPN.'
 
 
 def cli_tg_test():
@@ -9877,7 +10088,7 @@ CLI_HELP = {
     'mode': ('<fast|stable|priority>', 'режим переключения серверов'),
     'route': ('[smart|list|blocked|all]', 'показать или сменить маршрутизацию'),
     'site': ('<адрес>', 'куда идёт сайт: правило, сервер, открывается ли'),
-    'direct': ('<on|off>', 'АВАРИЙНО: клиенты WireGuard напрямую, мимо VPN'),
+    'direct': ('<on|off>', 'АВАРИЙНО: клиенты WireGuard и второй порт напрямую, мимо VPN'),
     'restart': ('<mihomo|bot|wg|all>', 'перезапустить службу'),
     'logs': ('<bot|mihomo|wg|install|os> [строк]', 'журнал службы'),
     'peers': ('', 'клиенты WireGuard'),
@@ -11933,6 +12144,8 @@ def link_conn(conn):
                 link_apply_sync(msg)
             elif t == 'upd':
                 threading.Thread(target=dispatch, args=(msg['u'],), daemon=True).start()
+            elif t == 'live_stop':
+                live_stop(msg.get('chat'))
             elif t == 'unlink':
                 link_off('главный бот отключил этот шлюз')
                 return

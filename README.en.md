@@ -196,6 +196,28 @@ The code contains only the main gateway's public key. The secondary gateway allo
 admins get access per gateway. If the main server is gone, run `sudo python3 /usr/local/bin/vpnbot.py --unlink`
 on the secondary one to bring its own bot back.
 
+## Gateway in front of a router
+
+With two network ports the server can sit between the provider and another network's router (for example, a
+camera and Wi-Fi network behind a UniFi USG):
+
+```
+provider → [main port] gateway [second port] → router WAN → network behind the router
+```
+
+The installer offers it when it finds a second port; later: `sudo vpngw-setup` → "Second network port". Pick the
+port and the gateway address on it (default `172.31.250.1/30`); the installer shows what to enter in the
+router's WAN: static IP `172.31.250.2`, mask `255.255.255.252`, gateway `172.31.250.1`, DNS `1.1.1.1` and
+`77.88.8.8`.
+
+- The common routing mode decides what goes through VPN ("Blocked only" or "Smart" suit such a network). DNS
+  queries also pass through mihomo, so blocked sites open with ordinary DNS servers.
+- If mihomo is down, the network behind the router goes online directly instead of losing internet.
+- If the server itself is off, the network behind the router has no internet: use a UPS and power-on after AC
+  loss in the BIOS.
+- The port address is pinned via netplan (`/etc/netplan/60-vpngw-lan2.yaml`), the route rule and NAT come from
+  the `vpngw-lan2` service, and the bot's route watchdog keeps the rule in place.
+
 ## Ubuntu updates and the nightly reboot
 
 Management → "🐧 Ubuntu". The gateway checks for updates daily. Security fixes install themselves
@@ -249,7 +271,7 @@ admins get an e-mail explaining this.
 | `sudo vpngw restart <service>` / `logs <service> [N]` | bot, mihomo, wg, install, os |
 | `sudo vpngw-setup` | installer menu: the bot menu, clients, updates, rollback, reinstall, uninstall |
 
-The bot also has a live monitor (🖥 Server → 📊 Monitor, every 5 seconds). mihomo updates itself at night once a
+The bot also has a live monitor (🖥 Server → 📊 Monitor, every 3 seconds). mihomo updates itself at night once a
 release is 3 days old and rolls back if the VPN gets worse.
 
 ## Files on the server
@@ -261,6 +283,7 @@ release is 3 days old and rolls back if the VPN gets worse.
 | `/etc/vpnbot.env` | bot token, owner, update source |
 | `/var/lib/vpnbot/state.json` | clients, admins, settings, statistics |
 | `/etc/vpngw/` | wizard answers, version, auto-backup password (root only) |
+| `/etc/vpngw/lan2.conf` | second network port: port name and address (if configured) |
 | `/var/lib/vpnbot/backups/` | the last 5 backups (`.vpngw`) |
 | `/var/log/vpngw-install.log` | installation and update log |
 
