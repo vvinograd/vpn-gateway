@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.8'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.8.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -590,13 +590,11 @@ def raw_send(chat, text, kb=None, ttl_kind=None):
     doc = getattr(text, 'doc', None)
     if doc and chat != CLI_CHAT:
         st = admin_style(chat)
-        if st == 'vestnik':
-            r = send_widget(chat, doc, kb)
+        if st in WIDGET_TPL:
+            r = send_widget(chat, doc, kb, tpl=st)
             if r:
                 track(chat, r['message_id'], clean_ttl(chat, ttl_kind))
                 return r
-        elif st == 'check':
-            text = render_check(doc)
     p = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
     if kb:
         p['reply_markup'] = {'inline_keyboard': kb}
@@ -11565,7 +11563,7 @@ while True:
         os.write(1, d)
 '''
 LINK_CALLS = {'sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'deleteMessage', 'deleteMessages',
-              'answerCallbackQuery', 'sendChatAction', 'getChat'}
+              'answerCallbackQuery', 'sendChatAction', 'getChat', 'sendWidget', 'editMessageWidgetData'}
 CODE_PREFIX = 'VPNGW2-'
 LINK_MODE = False             # этот бот — ведомый шлюз
 links = {}                    # на главном: nid → живое соединение
@@ -11835,7 +11833,8 @@ def link_exec(lk, msg):
 def gw_sync(lk):
     nid = lk.nid
     payload = {'t': 'sync', 'owner': OWNER, 'name': gw_name(nid), 'main': GW_NAME,
-               'admins': {a: x['name'] for a, x in state['admins'].items() if nid in gw_allowed(int(a))}}
+               'admins': {a: x['name'] for a, x in state['admins'].items() if nid in gw_allowed(int(a))},
+               'styles': {a: x.get('style', 'plain') for a, x in state['admins'].items() if nid in gw_allowed(int(a))}}
     if payload != lk.synced:
         lk.send(payload)
         lk.synced = payload
@@ -12450,8 +12449,12 @@ def link_apply_sync(msg):
         for a in list(adm):
             if a not in want:
                 adm.pop(a)
+        styles = msg.get('styles') or {}
         for a, name in want.items():
-            adm.setdefault(a, {'name': name, 'notify': default_notify()})['name'] = name
+            x = adm.setdefault(a, {'name': name, 'notify': default_notify()})
+            x['name'] = name
+            if a in styles:
+                x['style'] = styles[a]       # вид экранов выбирают на главном боте
         save_state()
 
 
@@ -12775,15 +12778,15 @@ def startup_reports():
 # Каждый админ выбирает сам (⚙️ Настройки → 🎨 Вид экранов). Экраны статуса, серверов, WireGuard, сервера,
 # карточки сбоя и результата обновления, кроме текста, несут «выпуск» doc — общее описание:
 #   r — рубрика, h — заголовок, s — ok/warn/bad, l — заметка, w — строки [подпись, значение, ok/warn/bad], n — сноска.
-# «Чек» печатает doc моноширинной кассовой лентой в 30 знаков. «Вестник» — первая полоса газеты: виджет Telegram
+# «Вестник» (первая полоса газеты) и «Чек» (кассовый чек) — виджеты Telegram
 # (Bot API 10.4, sendWidget): HTML отправляется один раз, дальше бот меняет только данные (editMessageWidgetData,
 # без звука и пометки «изменено»). Telegram без виджетов покажет подпись — короткий заголовок. Не принял виджет —
 # этот админ получает обычный текст, а бот повторит попытку через 6 часов.
 STYLES = {'plain': ('📄 Обычный', 'текст с эмодзи — как было'),
           'vestnik': ('📰 Вестник', 'первая полоса газеты: заголовок, заметка и колонки. Живая картинка в сообщении — '
                                    'нужен свежий Telegram (с виджетами)'),
-          'check': ('🧾 Чек', 'кассовая лента: строки с точками, итог внизу, моноширинный шрифт')}
-CHECK_W = 30
+          'check': ('🧾 Чек', 'кассовый чек: лента с зубчатым краем, строки с точками, итог внизу. Тоже живая '
+                             'картинка в сообщении — нужен свежий Telegram')}
 WIDGET_RETRY = 6 * 3600
 
 
@@ -12813,7 +12816,7 @@ def admin_style(uid):
         st = (state['admins'].get(str(uid)) or {}).get('style', 'plain')
     except Exception:
         return 'plain'
-    if st == 'vestnik' and time.time() - (tg_rt.get('widget_off') or 0) < WIDGET_RETRY:
+    if st in WIDGET_TPL and time.time() - (tg_rt.get('widget_off') or 0) < WIDGET_RETRY:
         return 'plain'
     return st if st in STYLES else 'plain'
 
@@ -12830,63 +12833,6 @@ def deemoji(s):
         s = s.replace(a, b)
     s = EMOJI_RE.sub('', s)
     return re.sub(r'\s+', ' ', s).strip()
-
-
-def wrap_w(s, w=CHECK_W):
-    out, line = [], ''
-    for word in s.split():
-        while len(word) > w:
-            if line:
-                out.append(line)
-                line = ''
-            out.append(word[:w])
-            word = word[w:]
-        if not line:
-            line = word
-        elif len(line) + 1 + len(word) <= w:
-            line += ' ' + word
-        else:
-            out.append(line)
-            line = word
-    if line:
-        out.append(line)
-    return out
-
-
-def ck_row(label, value):
-    label, value = deemoji(label), deemoji(value)
-    if len(label) + len(value) + 3 <= CHECK_W:
-        return [label + ' ' + '.' * (CHECK_W - len(label) - len(value) - 2) + ' ' + value]
-    out = wrap_w(label)
-    out += [x.rjust(CHECK_W) for x in wrap_w(value, CHECK_W - 2)]
-    return out
-
-
-CHECK_SUM = {'ok': 'ВСЁ В ПОРЯДКЕ', 'warn': 'ЕСТЬ ЗАМЕЧАНИЯ', 'bad': 'СБОЙ'}
-
-
-def render_check(doc):
-    W = CHECK_W
-    with ui_lock:
-        ui['issue'] = ui.get('issue', 0) + 1
-        no = ui['issue']
-    L = ['=' * W, deemoji(GW_NAME).upper()[:W].center(W), deemoji(doc.get('r', '')).upper()[:W].center(W),
-         time.strftime('%d.%m.%Y  %H:%M:%S').center(W), '-' * W]
-    L += [x.center(W) for x in wrap_w(deemoji(doc.get('h', '')).upper())]
-    if doc.get('l'):
-        L.append('')
-        L += wrap_w(deemoji(doc['l']))
-    if doc.get('w'):
-        L.append('-' * W)
-        for row in doc['w']:
-            L += ck_row(row[0], row[1])
-    L.append('-' * W)
-    L += ck_row('ИТОГ', CHECK_SUM.get(doc.get('s'), ''))
-    if doc.get('n'):
-        L.append('')
-        L += wrap_w(deemoji(doc['n']))
-    L += ['=' * W, f'ЧЕК № {no:05d}'.center(W)]
-    return '<pre>' + h('\n'.join(L)) + '</pre>'
 
 
 def widget_data(doc):
@@ -12942,20 +12888,68 @@ if(T&&T.onEvent)T.onEvent("chatDataChanged",draw);draw();if(T&&T.ready)T.ready()
 </script>'''
 
 
+# Кассовый чек. Тоже только обычные шрифты.
+CHECK_HTML = '''<!doctype html><meta charset="utf-8"><style>
+*{box-sizing:border-box}body{margin:0;background:transparent;font:14px/1.35 monospace;color:#1d1d1b}
+.r{background:#fbfaf6;margin:6px auto 0;max-width:420px;padding:14px 16px 26px;position:relative;
+box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.r:after{content:"";position:absolute;left:0;right:0;bottom:-8px;height:8px;
+background:linear-gradient(-45deg,transparent 6px,#fbfaf6 0) 0 0/12px 8px repeat-x,
+linear-gradient(45deg,transparent 6px,#fbfaf6 0) 0 0/12px 8px repeat-x}
+.c{text-align:center}.t{font-weight:700;font-size:16px;letter-spacing:.06em;text-transform:uppercase}
+.s{font-size:12px;color:#555;text-transform:uppercase;letter-spacing:.08em}
+hr{border:0;border-top:1px dashed #9a968b;margin:8px 0}hr.d{border-top:3px double #1d1d1b}
+h2{margin:6px 0 4px;font:700 17px/1.2 monospace;text-align:center;text-transform:uppercase}
+p{margin:0;font-size:13px;color:#333}
+.w{display:flex;gap:6px;align-items:baseline;padding:1px 0}.w span{white-space:nowrap}
+.w i{flex:1;border-bottom:1px dotted #9a968b;transform:translateY(-3px);min-width:10px}
+.w b{font-weight:600;text-align:right}.bad b{color:#b3261e}.warn b{color:#8a5a00}
+.tot{font-weight:700;font-size:16px}.tot.bad b{color:#b3261e}.tot.ok b{color:#1f6a3a}
+.n{font-size:12px;color:#555;margin-top:6px}.no{margin-top:10px;font-size:12px;letter-spacing:.2em}
+</style><div class="r"><div class="c t" id="g"></div><div class="c s" id="rb"></div><div class="c s" id="d"></div>
+<hr><h2 id="h"></h2><p id="l"></p><hr><div id="w"></div><hr class="d">
+<div class="w tot" id="tt"><span>ИТОГ</span><i></i><b id="ts"></b></div><div class="n" id="n"></div>
+<div class="c no" id="i"></div></div><script>
+var T=window.TelegramWidget,S={ok:"ВСЁ В ПОРЯДКЕ",warn:"ЕСТЬ ЗАМЕЧАНИЯ",bad:"СБОЙ"};
+function $(x){return document.getElementById(x)}
+function e(t,c,x){var n=document.createElement(t);if(c)n.className=c;if(x!=null)n.textContent=x;return n}
+function draw(){var d={};try{d=JSON.parse((T&&T.chatData)||"{}")||{}}catch(_){}
+$("g").textContent=d.g||"VPN-шлюз";$("rb").textContent=d.r||"";$("d").textContent=d.d||"";
+$("h").textContent=d.h||"";$("l").textContent=d.l||"";$("l").style.display=d.l?"":"none";
+var w=$("w");while(w.firstChild)w.removeChild(w.firstChild);(d.w||[]).forEach(function(x){var r=e("div","w "+(x[2]||""));
+r.appendChild(e("span","",x[0]));r.appendChild(e("i"));r.appendChild(e("b","",x[1]));w.appendChild(r)});
+if(d.m)w.appendChild(e("div","n","…и ещё "+d.m));
+$("tt").className="w tot "+(d.s||"ok");$("ts").textContent=S[d.s]||"";
+$("n").textContent=d.n||"";$("n").style.display=d.n?"":"none";$("i").textContent="ЧЕК № "+("0000"+(d.i||1)).slice(-5)}
+if(T&&T.onEvent)T.onEvent("chatDataChanged",draw);draw();if(T&&T.ready)T.ready();
+</script>'''
+WIDGET_TPL = {'vestnik': VESTNIK_HTML, 'check': CHECK_HTML}
+
+
 def widget_caption(doc):
-    return (f'📰 {deemoji(doc.get("r", ""))}: {doc.get("h", "")}')[:200]
+    return (f'{deemoji(doc.get("r", ""))}: {doc.get("h", "")}')[:200]
 
 
 def is_widget(chat, mid):
+    """Вид виджета в сообщении ('vestnik'/'check') или None — если это обычный текст."""
     with ui_lock:
-        return str(mid) in (ui.setdefault('wid', {}).get(str(chat)) or {})
+        v = (ui.setdefault('wid', {}).get(str(chat)) or {}).get(str(mid))
+    if v is None:
+        return None
+    return v.split('|', 1)[0] if '|' in v and v.split('|', 1)[0] in WIDGET_TPL else 'vestnik'
 
 
-def mark_widget(chat, mid, kb=None, on=True):
+def widget_kb(chat, mid):
+    with ui_lock:
+        v = (ui.get('wid', {}).get(str(chat)) or {}).get(str(mid)) or ''
+    return v.split('|', 1)[1] if '|' in v else v
+
+
+def mark_widget(chat, mid, kb=None, on=True, tpl='vestnik'):
     with ui_lock:
         w = ui.setdefault('wid', {}).setdefault(str(chat), {})
         if on:
-            w[str(mid)] = json.dumps(kb or [], sort_keys=True)
+            w[str(mid)] = tpl + '|' + json.dumps(kb or [], sort_keys=True)
             for k in sorted(w, key=int)[:-30]:
                 w.pop(k, None)
         else:
@@ -12963,10 +12957,10 @@ def mark_widget(chat, mid, kb=None, on=True):
     ui_save()
 
 
-def send_widget(chat, doc, kb=None, timeout=20):
+def send_widget(chat, doc, kb=None, timeout=20, tpl='vestnik'):
     with ui_lock:
         ui['issue'] = ui.get('issue', 0) + 1
-    p = {'chat_id': chat, 'html': VESTNIK_HTML, 'chat_data': widget_data(doc), 'caption': widget_caption(doc),
+    p = {'chat_id': chat, 'html': WIDGET_TPL[tpl], 'chat_data': widget_data(doc), 'caption': widget_caption(doc),
          'width': 0, 'height': 0}
     if kb:
         p['reply_markup'] = {'inline_keyboard': kb}
@@ -12974,9 +12968,9 @@ def send_widget(chat, doc, kb=None, timeout=20):
     if not r:
         if tg_reachable():
             tg_rt['widget_off'] = time.time()   # Telegram не принял виджет — до повторной попытки обычный текст
-            log('виджет не принят — «Вестник» временно показывается текстом')
+            log('виджет не принят — «Вестник» и «Чек» временно показываются текстом')
         return None
-    mark_widget(chat, r['message_id'], kb)
+    mark_widget(chat, r['message_id'], kb, tpl=tpl)
     return r
 
 
@@ -12989,21 +12983,16 @@ def put_screen(chat, mid, text, kb=None, timeout=20):
     mid = redirect.get((chat, mid), mid)
     doc = getattr(text, 'doc', None)
     style = admin_style(chat) if chat != CLI_CHAT else 'plain'
-    if doc and style == 'check':
-        text = render_check(doc)
     wid = is_widget(chat, mid)
-    if doc and style == 'vestnik':
-        if wid:
+    if doc and style in WIDGET_TPL:
+        if wid == style:                  # тот же вид — меняем только данные (HTML виджета неизменен)
             r = tg('editMessageWidgetData', timeout, chat_id=chat, message_id=mid, chat_data=widget_data(doc))
-            kbs = json.dumps(kb or [], sort_keys=True)
-            with ui_lock:
-                old = (ui.get('wid', {}).get(str(chat)) or {}).get(str(mid))
-            if kbs != old:
+            if json.dumps(kb or [], sort_keys=True) != widget_kb(chat, mid):
                 tg('editMessageReplyMarkup', timeout, chat_id=chat, message_id=mid,
                    reply_markup={'inline_keyboard': kb or []})
-                mark_widget(chat, mid, kb)
+                mark_widget(chat, mid, kb, tpl=style)
             return (r or True), mid
-        r = send_widget(chat, doc, kb, timeout)
+        r = send_widget(chat, doc, kb, timeout, tpl=style)
         if r:
             return r, replace_msg(chat, mid, r['message_id'])
     if wid:                                 # был виджет, а этот экран — текст: новое сообщение вместо виджета
@@ -13046,8 +13035,11 @@ def scr_style(uid, note=''):
              'Выбор — только для вас, у других админов свой.', '']
     for k, (t, d) in STYLES.items():
         lines.append(f'{"✅" if k == cur else "▫️"} <b>{t}</b> — {d}')
-    if cur == 'vestnik' and admin_style(uid) != 'vestnik':
-        lines += ['', '⚠️ Telegram сейчас не принимает виджеты — «Вестник» временно показывается обычным текстом.']
+    if cur in WIDGET_TPL and admin_style(uid) != cur:
+        lines += ['', f'⚠️ Telegram сейчас не принимает виджеты — «{STYLES[cur][0][2:]}» временно показывается '
+                      'обычным текстом.']
+    if LINK_MODE:
+        lines += ['', 'Это ведомый шлюз: вид берётся из главного бота (⚙️ Настройки там).']
     if note:
         lines += ['', note]
     kb = [[btn(('✅ ' if k == cur else '') + t, f'sty:{k}') for k, (t, _) in STYLES.items()],
@@ -13057,11 +13049,13 @@ def scr_style(uid, note=''):
 
 def handle_style(uid, data):
     k = data.split(':', 1)[1]
+    if LINK_MODE:
+        return scr_style(uid, 'Вид выбирается на главном боте — там и поменяйте.')
     if k in STYLES:
         with lock:
             state['admins'][str(uid)]['style'] = k
             save_state()
-        if k == 'vestnik':
+        if k in WIDGET_TPL:
             tg_rt.pop('widget_off', None)    # выбрали заново — попробовать сразу
         add_event(f'{admin_name(uid)} выбрал вид экранов «{STYLES[k][0][2:]}»')
     return scr_style(uid, f'Готово: {STYLES.get(k, ("?",))[0]}')
@@ -13147,11 +13141,13 @@ def d_dns():
     return lay('dns', False, 'не отвечает' if 'err' not in res else 'не находит адреса: ' + res['err'][:80])
 
 
-def clock_offset():
-    """Насколько часы шлюза расходятся с точным временем, с (плюс — спешат). По заголовку Date от двух
-    надёжных сайтов напрямую, без VPN. None — не удалось узнать."""
+def clock_offset(need=1):
+    """Насколько часы шлюза расходятся с точным временем, с (плюс — спешат). По заголовку Date надёжных
+    сайтов напрямую, без VPN, только по HTTPS (подменить время по дороге нельзя). need=2 — нужны два сайта,
+    согласные между собой в пределах 3 с (так проверяем перед тем, как самим выставить часы). None — не узнать."""
     import email.utils
-    for url in ('https://ya.ru/', 'http://1.1.1.1/', 'https://www.google.com/'):
+    got = []
+    for url in ('https://ya.ru/', 'https://1.1.1.1/', 'https://www.google.com/'):
         try:
             t0 = time.time()
             try:
@@ -13162,9 +13158,11 @@ def clock_offset():
             except urllib.error.HTTPError as e:
                 d = e.headers.get('Date')
             t1 = time.time()
-            if d:
+            if d and t1 - t0 < 4:
                 srv = email.utils.parsedate_to_datetime(d).timestamp()
-                return round((t0 + t1) / 2 - srv - 0.5)
+                got.append(round((t0 + t1) / 2 - srv - 0.5))
+                if len(got) >= need and max(got) - min(got) <= 3:
+                    return sorted(got)[len(got) // 2]
         except Exception:
             continue
     return None
@@ -13347,6 +13345,8 @@ def reach_abroad(host, port, via):
                     return r
         except Exception as e:
             log('проверка через другой сервер:', e)
+    if not re.fullmatch(r'[A-Za-z0-9.:-]{1,253}', str(host)) or not str(port).isdigit():
+        return None                          # адрес уходит в команду на другом сервере — только безопасные символы
     for vid, x in vps_all().items():
         if x['host'] == host:
             continue
@@ -13511,6 +13511,9 @@ def clock_fix():
     time.sleep(6)
     off = clock_offset()
     if off is not None and abs(off) >= 10:
+        off = clock_offset(need=2)           # выставляем сами только если два сайта согласны
+        if off is None or abs(off) < 10:
+            return off
         run(['date', '-s', '@%d' % int(time.time() - off)], 10)
         off2 = clock_offset()
         return off2 if off2 is not None else off
@@ -14154,7 +14157,8 @@ def outbox_add(uid, kind, text):
         ob = state.setdefault('outbox', [])
         if any(x['u'] == uid and x['x'] == text for x in ob):
             return
-        ob.append({'u': uid, 'k': kind, 't': time.time(), 'x': text[:3000]})
+        # длинное — без разметки: обрезанный HTML Telegram отклонил бы, и очередь встала бы
+        ob.append({'u': uid, 'k': kind, 't': time.time(), 'x': text if len(text) <= 3000 else h(plain(text)[:2900]) + '…'})
         del ob[:-OUTBOX_MAX]
         save_state()
 
@@ -14166,8 +14170,10 @@ def outbox_flush():
     if not state.get('outbox') or not tg_reachable() or not outbox_lock.acquire(blocking=False):
         return
     try:
-        with lock:
-            items = list(state.get('outbox') or [])
+        with lock:                        # старше 2 суток или для того, кто уже не админ, — не досылаем
+            state['outbox'] = [x for x in state.get('outbox') or []
+                               if time.time() - x['t'] < 2 * 86400 and str(x['u']) in state['admins']]
+            items = list(state['outbox'])
         per = {}
         for x in items:
             per.setdefault(x['u'], []).append(x)
@@ -14188,8 +14194,10 @@ def outbox_flush():
                           [[btn('✔️ Понятно', 'ok'), btn('🏠 Меню', 'nmenu')]], ttl_kind='keep')
             if ok:
                 done += lst
+            elif not tg_reachable():
+                break                     # связь снова пропала — дошлём потом
             else:
-                break
+                done += lst               # Telegram отказал этому админу (заблокировал бота) — не держим очередь
         if done:
             with lock:
                 state['outbox'] = [x for x in state.get('outbox') or [] if x not in done]
@@ -14319,6 +14327,7 @@ def cli():
         state['subs'] = P['subs']
         ids = {x['id'] for x in P['subs']}
         v['svc'] = {k: x for k, x in (old.get('svc') or {}).items() if x in ids and k in SERVICES}
+        v['probe_off'] = True     # установщик собирает без входа диагностики; бот добавит его сам, проверив mihomo -t
         out = render_config(open(a[1], encoding='utf-8').read(), v)
         with open(a[3], 'w', encoding='utf-8') as f:
             f.write(out)
