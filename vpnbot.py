@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.8.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.8.2'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -353,8 +353,9 @@ def tg(method, _timeout=20, **params):
                     return json.load(r).get('result')
             except urllib.error.HTTPError as e:
                 body = e.read().decode(errors='ignore')
+                tg_rt['http_err'] = (method, e.code, body[:300])
                 if not re.search(r'message is not modified|message to (delete|edit) not found|'
-                                 r"message can't be (deleted|edited)", body):
+                                 r"message can't be (deleted|edited)|WIDGET_NOT_ALLOWED", body):
                     log('Telegram', method, e.code, body[:200])
                 if e.code == 429:             # Telegram просит притормозить — фоновые обновления экранов ждут
                     m = re.search(r'"retry_after"\s*:\s*(\d+)', body)
@@ -595,7 +596,7 @@ def raw_send(chat, text, kb=None, ttl_kind=None):
             if r:
                 track(chat, r['message_id'], clean_ttl(chat, ttl_kind))
                 return r
-    p = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
+    p = {'chat_id': chat, 'text': fit_text(text), 'parse_mode': 'HTML', 'disable_web_page_preview': True}
     if kb:
         p['reply_markup'] = {'inline_keyboard': kb}
     r = tg('sendMessage', **p)
@@ -700,6 +701,37 @@ def email_cfg():
 
 def plain(text):
     return html.unescape(re.sub(r'<[^>]+>', '', text))
+
+
+TG_TEXT_MAX = 4000                # лимит Telegram — 4096 символов видимого текста (считает в UTF-16)
+FIT_TAGS = ('pre', 'code', 'blockquote', 'b', 'i', 'u', 's', 'a')
+
+
+def tg_len(text):
+    return len(plain(text).encode('utf-16-le')) // 2
+
+
+def fit_text(text, limit=TG_TEXT_MAX):
+    """Сообщение длиннее лимита Telegram отклоняет целиком (MESSAGE_TOO_LONG) — экран или карточка сбоя
+    перестают обновляться. Обрезаем по строкам с конца (строку «Обновлено …» сохраняем) и закрываем теги."""
+    if not isinstance(text, str) or tg_len(text) <= limit:
+        return text
+    lines = text.split('\n')
+    tail = lines[-1:] if lines and 'Обновлено' in lines[-1] else []
+    if tail:
+        lines = lines[:-1]
+    note = '<i>…не поместилось, сокращено</i>'
+    while len(lines) > 1 and tg_len('\n'.join(lines + [note] + tail)) > limit:
+        lines.pop()
+    out = '\n'.join(lines)
+    if tg_len(out) > limit:               # одна огромная строка — режем без разметки
+        out = h(plain(out)[:limit - 100])
+    for t in FIT_TAGS:
+        opened = len(re.findall(rf'<{t}[\s>]', out))
+        out += f'</{t}>' * max(0, opened - out.count(f'</{t}>'))
+    out = out + '\n' + note + ('\n' + '\n'.join(tail) if tail else '')
+    d = getattr(text, 'doc', None)
+    return styled(out, d) if d else out
 
 
 def smtp_connect(cfg):
@@ -12790,6 +12822,11 @@ STYLES = {'plain': ('📄 Обычный', 'текст с эмодзи — ка�
 WIDGET_RETRY = 6 * 3600
 
 
+def widget_retry():
+    """Через сколько снова пробовать виджет: запрет Telegram — раз в сутки, прочие ошибки — через 6 часов."""
+    return 24 * 3600 if tg_rt.get('widget_why') == 'banned' else WIDGET_RETRY
+
+
 class Styled(str):
     """Текст экрана, к которому приложен «выпуск» для видов «Вестник» и «Чек»."""
     doc = None
@@ -12816,7 +12853,7 @@ def admin_style(uid):
         st = (state['admins'].get(str(uid)) or {}).get('style', 'plain')
     except Exception:
         return 'plain'
-    if st in WIDGET_TPL and time.time() - (tg_rt.get('widget_off') or 0) < WIDGET_RETRY:
+    if st in WIDGET_TPL and time.time() - (tg_rt.get('widget_off') or 0) < widget_retry():
         return 'plain'
     return st if st in STYLES else 'plain'
 
@@ -12964,12 +13001,21 @@ def send_widget(chat, doc, kb=None, timeout=20, tpl='vestnik'):
          'width': 0, 'height': 0}
     if kb:
         p['reply_markup'] = {'inline_keyboard': kb}
+    tg_rt.pop('http_err', None)
     r = tg('sendWidget', timeout, **p)
     if not r:
-        if tg_reachable():
-            tg_rt['widget_off'] = time.time()   # Telegram не принял виджет — до повторной попытки обычный текст
-            log('виджет не принят — «Вестник» и «Чек» временно показываются текстом')
+        err = tg_rt.get('http_err') or ('', 0, '')
+        if err[0] == 'sendWidget' and 'WIDGET_NOT_ALLOWED' in err[2]:
+            # С 13.11.2026 Telegram не даёт обычным ботам слать виджеты (даже в личке). Пробуем раз в сутки.
+            if tg_rt.get('widget_why') != 'banned':
+                log('Telegram запретил боту виджеты (INPUT_MEDIA_WIDGET_NOT_ALLOWED) — «Вестник» и «Чек» '
+                    'показываются текстом, повторная попытка через сутки')
+            tg_rt['widget_off'], tg_rt['widget_why'] = time.time(), 'banned'
+        elif tg_reachable():
+            tg_rt['widget_off'], tg_rt['widget_why'] = time.time(), 'error'
+            log('виджет не принят — «Вестник» и «Чек» временно показываются текстом:', err[2][:150])
         return None
+    tg_rt.pop('widget_why', None)
     mark_widget(chat, r['message_id'], kb, tpl=tpl)
     return r
 
@@ -12995,6 +13041,7 @@ def put_screen(chat, mid, text, kb=None, timeout=20):
         r = send_widget(chat, doc, kb, timeout, tpl=style)
         if r:
             return r, replace_msg(chat, mid, r['message_id'])
+    text = fit_text(text)
     if wid:                                 # был виджет, а этот экран — текст: новое сообщение вместо виджета
         p = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
         if kb:
@@ -13036,8 +13083,13 @@ def scr_style(uid, note=''):
     for k, (t, d) in STYLES.items():
         lines.append(f'{"✅" if k == cur else "▫️"} <b>{t}</b> — {d}')
     if cur in WIDGET_TPL and admin_style(uid) != cur:
-        lines += ['', f'⚠️ Telegram сейчас не принимает виджеты — «{STYLES[cur][0][2:]}» временно показывается '
-                      'обычным текстом.']
+        if tg_rt.get('widget_why') == 'banned':
+            lines += ['', f'⚠️ С 13 ноября Telegram не разрешает обычным ботам присылать виджеты. Пока запрет '
+                          f'действует, «{STYLES[cur][0][2:]}» показывается обычным текстом. Раз в сутки бот пробует '
+                          'снова — как только Telegram разрешит, вид включится сам.']
+        else:
+            lines += ['', f'⚠️ Telegram сейчас не принимает виджеты — «{STYLES[cur][0][2:]}» временно показывается '
+                          'обычным текстом.']
     if LINK_MODE:
         lines += ['', 'Это ведомый шлюз: вид берётся из главного бота (⚙️ Настройки там).']
     if note:
@@ -13672,6 +13724,11 @@ def notify_targets(kind):
 INC_TITLE = {'vpn': 'VPN не работает', 'mihomo': 'mihomo не отвечает'}
 
 
+def cut(s, n):
+    s = str(s or '')
+    return s if len(s) <= n else s[:n - 1].rstrip() + '…'
+
+
 def inc_text(i, final=False):
     dur = (i.get('end') or time.time()) - i['ts']
     head = ('✅ <b>Сбой закрыт</b>' if final else f'🔴 <b>{h(INC_TITLE.get(i["kind"], "Сбой"))}</b>') + \
@@ -13684,16 +13741,19 @@ def inc_text(i, final=False):
         lines.append(f'<b>Проверка</b> ({time.strftime("%H:%M:%S", time.localtime(i["diag_ts"]))}):')
         for x in i['layers']:
             mark = '✅' if x['ok'] else '❌' if x['ok'] is False else '▫️'
-            lines.append(f'{mark} {LAYER_RU[x["k"]]}: {h(x["t"])}')
+            t = x['t'] if x['ok'] is False else x['t'][:90]       # подробно — только то, что сломано
+            lines.append(f'{mark} {LAYER_RU[x["k"]]}: {h(cut(t, 260))}')
         lines.append('')
     elif not final:
         lines += ['⏳ Проверяю интернет, часы, mihomo, серверы… до 30 секунд.', '']
     if i.get('cause'):
-        lines.append(f'<b>Причина:</b> {h(i["cause"])}. {h(i.get("why", ""))}')
-    for a in i.get('acts') or []:
-        lines.append(f'🔧 {h(a)}')
+        lines.append(f'<b>Причина:</b> {h(i["cause"])}. {h(cut(i.get("why", ""), 500))}')
+    for a in (i.get('acts') or [])[-3:]:
+        lines.append(f'🔧 {h(cut(a, 300))}')
     if i.get('ev'):
-        lines += [''] + [f'<code>{time.strftime("%H:%M:%S", time.localtime(t))}</code> {h(x)}' for t, x in i['ev']]
+        ev = i['ev'][-8:]
+        lines += [''] + ([f'<i>…ещё {len(i["ev"]) - 8} событий раньше</i>'] if len(i['ev']) > 8 else []) + \
+            [f'<code>{time.strftime("%H:%M:%S", time.localtime(t))}</code> {h(cut(x, 160))}' for t, x in ev]
     st = lambda x: 'ok' if x['ok'] else 'bad' if x['ok'] is False else ''
     title = INC_TITLE.get(i['kind'], 'Сбой')
     cause = i.get('cause') or title
@@ -14018,8 +14078,13 @@ def beat(name):
     beats[name] = time.time()
 
 
+# Сокет сторожа systemd забираем из окружения: иначе его наследуют все команды, которые запускает бот, и некоторые
+# сами шлют systemd «я жив» — systemd их отклоняет и пишет в журнал «Got notification message from PID …» дважды в минуту.
+NOTIFY_SOCKET = os.environ.pop('NOTIFY_SOCKET', '')
+
+
 def sd_notify(msg):
-    addr = os.environ.get('NOTIFY_SOCKET')
+    addr = NOTIFY_SOCKET
     if not addr:
         return False
     if addr.startswith('@'):
