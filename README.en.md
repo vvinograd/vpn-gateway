@@ -254,7 +254,7 @@ one last.
 
 If the gateway is behind a router, forward the WireGuard UDP port (51820 by default) to it.
 
-A MikroTik is added in the bot (WireGuard → "➕ 📡 MikroTik") or with
+A MikroTik is added in the bot (👥 Клиенты → "➕ 📡 MikroTik") or with
 `sudo vpngw mikrotik "Office" 192.168.88.0/24 [wan_interface]`. The bot asks for the output of a check command
 (addresses, WireGuard interfaces, default route), picks a free port, checks the subnet, finds the WAN interface and
 produces RouterOS 7.4+ commands: tunnel only, the whole LAN, or selected addresses via VPN.
@@ -266,7 +266,7 @@ produces RouterOS 7.4+ commands: tunnel only, the whole LAN, or selected address
 
 ## Client protocols: AmneziaWG and VLESS
 
-In 🔐 WireGuard → 🧩 Протоколы the owner can enable two more protocols, each separately; wg0 and MikroTik are untouched.
+In 👥 Клиенты → 🧩 Протоколы the owner can enable two more protocols, each separately; wg0 and MikroTik are untouched.
 AmneziaWG runs on its own interface `awg0` (`10.10.11.0/24`, 51821/udp by default) and is installed by the bot from
 the amnezia PPA (Ubuntu). VLESS Reality is an inbound in mihomo (443/tcp if free), disguised as HTTPS to a regular site
 (`ya.ru` by default). The protocol is picked when a client is created and can be added or removed later; expiry,

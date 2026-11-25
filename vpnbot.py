@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.9'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.9.1'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -3310,13 +3310,18 @@ def awg_setup_job(port, report):
         if 'ID=ubuntu' not in osr:
             raise RuntimeError('автоматическая установка AmneziaWG — только на Ubuntu')
         report('⏳ Устанавливаю AmneziaWG из PPA amnezia (сборка модуля ядра, 3–10 минут)…')
-        script = ('set -e; export DEBIAN_FRONTEND=noninteractive; A="apt-get -o DPkg::Lock::Timeout=600 -y -qq"; '
+        # прерванная установка пакетов (выключили питание, оборвалось обновление) блокирует apt: сначала
+        # доделываем её (если dpkg занят автообновлением — ждём до 3 минут)
+        script = ('export DEBIAN_FRONTEND=noninteractive; '
+                  'for i in 1 2 3 4 5 6; do dpkg --configure -a --force-confdef --force-confold && break; sleep 30; done; '
+                  'set -e; A="apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef '
+                  '-o Dpkg::Options::=--force-confold -y -qq"; $A -f install; '
                   '$A update; $A install software-properties-common python3-launchpadlib gnupg2 '
                   '"linux-headers-$(uname -r)" || $A install software-properties-common gnupg2 linux-headers-generic; '
                   'add-apt-repository -y ppa:amnezia/ppa; $A update; $A install amneziawg; modprobe amneziawg')
         r = run(['bash', '-c', script], 1800)
         if r.returncode != 0 or not awg_installed():
-            tail = (r.stdout + r.stderr).strip().split('\n')[-4:]
+            tail = list(dict.fromkeys(x.strip() for x in (r.stdout + r.stderr).strip().split('\n') if x.strip()))[-4:]
             raise RuntimeError('не установился: ' + ' / '.join(tail)[-400:])
     report('⏳ Настраиваю интерфейс awg0…')
     a = dict(awg_cfg())
@@ -3696,7 +3701,7 @@ def scr_menu(uid):
         head = '🔴 <b>mihomo не отвечает</b>'
     text = f'🛡 <b>{h(GW_NAME)}</b>\n\n{head}\n\nВыберите раздел:'
     kb = [[btn('📊 Статус', 'status'), btn('🌍 Серверы', 'servers')],
-          [btn('🔐 WireGuard', 'wg'), btn('📈 Трафик', 'traffic')],
+          [btn('👥 Клиенты', 'wg'), btn('📈 Трафик', 'traffic')],
           [btn('🖥 Сервер' + (' ⚠️' if srv_problems() else ''), 'srv'), btn('⚡ Скорость', 'speed')],
           [btn('⚙️ Настройки', 'set'), btn('🔧 Управление', 'manage')],
           [btn('📜 Журнал', 'log'), btn('🧹 Очистить чат', 'clean')]]
@@ -3782,7 +3787,7 @@ def scr_status(uid):
             if p.get('monitor') and p['enabled']:
                 lines.append(f'{"📡" if p["kind"] == "mikrotik" else "📱"} {h(p["name"])}: '
                              + (f'🟢 на связи ({fmt_dur(lv["age"])} назад)' if up else '🔴 нет связи'))
-        lbl = '👥 Клиенты' if awg_on() or vless_on() else '🔐 WireGuard'
+        lbl = '👥 Клиенты'
         lines.append(f'{lbl}: на связи {online} из {len([p for p in peers.values() if p["enabled"]])}')
         rows.append(['WireGuard', f'на связи {online} из {len([p for p in peers.values() if p["enabled"]])}', ''])
         for k, (ic, st) in (('awg', awg_status()), ('vless', vless_status())):
@@ -3790,7 +3795,7 @@ def scr_status(uid):
                 lines.append(f'{PROTO_ICON[k]} {PROTO_RU[k]}: {ic} {h(st)}')
                 rows.append([PROTO_RU[k], st, 'ok' if ic == '🟢' else 'warn' if ic == '🟡' else 'bad'])
     except Exception:
-        lines.append('🔐 WireGuard: ⚠️ не запущен')
+        lines.append('👥 Клиенты: ⚠️ WireGuard не запущен')
         rows.append(['WireGuard', 'не запущен', 'bad'])
     l2s = lan2_status()
     if l2s:
@@ -8210,13 +8215,13 @@ def scr_wg(uid, note='', page=0):
     peers = list(w['peers'].items())
     pages = max((len(peers) - 1) // PEERS_PAGE + 1, 1)
     page = min(max(page, 0), pages - 1)
-    lines = ['🔐 <b>WireGuard</b>', '',
-             f'Сервер: <code>{WG_NET}.1</code>, порт {live["port"]}',
+    lines = ['👥 <b>Клиенты VPN</b>', '',
+             f'🔐 WireGuard: <code>{WG_NET}.1</code>, порт {live["port"]}',
              f'Адрес для подключения: <code>{h(wg_endpoint())}</code>']
     if awg_on() or vless_on():
         lines.append('🧩 ' + ' · '.join(f'{PROTO_ICON[k]} {PROTO_RU[k]} {st[0]}' for k, st in
                                         (('awg', awg_status()), ('vless', vless_status())) if st[0] != '⚪'))
-    lines += ['', f'<b>Пиры ({len(peers)}):</b>']
+    lines += ['', f'<b>Клиенты ({len(peers)}):</b>']
     kb, row, rows = [], [], []
     online = sum(1 for pub, p in peers if peer_status(p, live['peers'].get(pub))[0] == '🟢')
     for pub, p in peers[page * PEERS_PAGE:(page + 1) * PEERS_PAGE]:
@@ -8307,7 +8312,7 @@ def scr_wg_peer(uid, pub, note=''):
                    btn('⏸ Выключить' if p['enabled'] else '▶️ Включить', f'wgt:{t}')])
         kb.append([btn(('🔕 Не следить' if p.get('monitor') else '🔔 Следить за связью'), f'wgm:{t}'),
                    btn('🗑 Удалить', f'wgd:{t}')])
-    kb.append([btn('🔄 Обновить', f'wgp:{t}'), btn('⬅️ Пиры', 'wg')])
+    kb.append([btn('🔄 Обновить', f'wgp:{t}'), btn('⬅️ Клиенты', 'wg')])
     return '\n'.join(lines), kb
 
 
@@ -8367,7 +8372,7 @@ def scr_wg_stat(uid):
     if rows:
         lines += ['', f'Всего за месяц: ↓ {fmt_bytes(total[0])}  ↑ {fmt_bytes(total[1])}']
     lines.append('<i>Полоса: доля от лимита, а без лимита — от самого активного клиента.</i>')
-    return '\n'.join(lines), [[btn('🔄 Обновить', 'wgstat'), btn('⬅️ Пиры', 'wg')]]
+    return '\n'.join(lines), [[btn('🔄 Обновить', 'wgstat'), btn('⬅️ Клиенты', 'wg')]]
 
 
 def scr_wg_ep(uid, note=''):
@@ -8397,7 +8402,7 @@ def scr_wg_ep(uid, note=''):
         kb.append([btn('🗑 Убрать IP', 'wgepx:i')])
     if mails:
         kb.append([btn(f'📧 Разослать новые конфиги ({mails})', 'wgepm')])
-    kb.append([btn('⬅️ Пиры', 'wg')])
+    kb.append([btn('⬅️ Клиенты', 'wg')])
     return '\n'.join(lines), kb
 
 
@@ -8565,7 +8570,7 @@ def scr_peer_proto(uid, pub, proto, note=''):
         elif awg_on():
             kb.append([btn('➕ Подключить AmneziaWG', f'wgo:{t}:awg:a')])
         else:
-            lines.append('Сначала включите AmneziaWG на шлюзе: 🔐 WireGuard → 🧩 Протоколы.')
+            lines.append('Сначала включите AmneziaWG на шлюзе: 👥 Клиенты → 🧩 Протоколы.')
     else:
         icon, st = vless_status()
         lines += ['VLESS Reality — соединение выглядит как обычный HTTPS к сайту '
@@ -8585,7 +8590,7 @@ def scr_peer_proto(uid, pub, proto, note=''):
         elif vless_on():
             kb.append([btn('➕ Подключить VLESS', f'wgo:{t}:vless:a')])
         else:
-            lines.append('Сначала включите VLESS на шлюзе: 🔐 WireGuard → 🧩 Протоколы.')
+            lines.append('Сначала включите VLESS на шлюзе: 👥 Клиенты → 🧩 Протоколы.')
     if not p['enabled']:
         lines += ['', '⏸ Клиент выключен — не работает ни один протокол.']
     if note:
@@ -8777,7 +8782,7 @@ def scr_proto(uid, note=''):
         kb.append([btn('⏹ Выключить VLESS', 'prt:vl:off')])
     else:
         kb.append([btn('▶️ Включить VLESS', 'prt:vl:on')])
-    kb.append([btn('🔄 Обновить', 'prt'), btn('⬅️ WireGuard', 'wg')])
+    kb.append([btn('🔄 Обновить', 'prt'), btn('⬅️ Клиенты', 'wg')])
     return '\n'.join(lines), kb
 
 
@@ -8786,7 +8791,7 @@ def awg_job(uid, chat, port):
         proto_rt['job'] = plain(text).lstrip('⏳ ')
     try:
         awg_setup_job(port, report)
-        res = f'✅ AmneziaWG включён, порт {port}/udp. Подключайте его клиентам: 🔐 WireGuard → клиент → 🛡 AmneziaWG.'
+        res = f'✅ AmneziaWG включён, порт {port}/udp. Подключайте его клиентам: 👥 Клиенты → клиент → 🛡 AmneziaWG.'
         add_event(f'{admin_name(uid)} включил AmneziaWG (порт {port})')
     except Exception as e:
         log('awg setup:', traceback.format_exc())
@@ -8855,7 +8860,7 @@ def handle_prt(uid, data, chat, mid):
             except Exception as e:
                 return scr_proto(uid, f'🔴 VLESS не включён: {h(str(e))[:400]}')
             add_event(f'{who} включил VLESS (порт {port})')
-            return scr_proto(uid, f'✅ VLESS включён. Подключайте его клиентам: 🔐 WireGuard → клиент → 🕶 VLESS.')
+            return scr_proto(uid, f'✅ VLESS включён. Подключайте его клиентам: 👥 Клиенты → клиент → 🕶 VLESS.')
         if act == 'off':
             if len(a) < 4:
                 return ('⏹ Выключить VLESS? Клиенты потеряют этот протокол (ключи сохранятся).',
@@ -9046,7 +9051,7 @@ def scr_wg_ops(uid):
     if hints:
         lines += [''] + hints
     lines += ['', '<i>Цифры: на связи сейчас / подключались. Оператор определяется по IP через RIPEstat.</i>']
-    return '\n'.join(lines), [[btn('🔄 Обновить', 'wgops'), btn('⬅️ Пиры', 'wg')]]
+    return '\n'.join(lines), [[btn('🔄 Обновить', 'wgops'), btn('⬅️ Клиенты', 'wg')]]
 
 
 def ping_ok(ip, iface=None, n=3):
@@ -10402,8 +10407,8 @@ def handle_wg(uid, data, chat, mid):
             w['peers'].pop(pub, None)
             save_state()
         peers_apply()
-        add_event(f'{who} удалил пир «{p["name"]}»')
-        notify('actions', f'👤 {h(who)} удалил пир WireGuard «{h(p["name"])}»', exclude=uid)
+        add_event(f'{who} удалил клиента «{p["name"]}»')
+        notify('actions', f'👤 {h(who)} удалил клиента VPN «{h(p["name"])}»', exclude=uid)
         return scr_wg(uid, f'🗑 Пир «{h(p["name"])}» удалён')
     return scr_wg(uid)
 
@@ -10892,8 +10897,8 @@ def handle_wg_input(uid, chat, kind, wdata, text):
         t, kb = scr_wg(uid, f'🔴 Не удалось создать пир: <code>{h(str(ex))[:250]}</code>')
         send(chat, t, kb)
         return
-    add_event(f'{admin_name(uid)} добавил пир «{name}»')
-    notify('actions', f'👤 {h(admin_name(uid))} добавил пир WireGuard «{h(name)}»', exclude=uid)
+    add_event(f'{admin_name(uid)} добавил клиента «{name}»')
+    notify('actions', f'👤 {h(admin_name(uid))} добавил клиента VPN «{h(name)}»', exclude=uid)
     if awg_on() or vless_on():
         send(chat, *scr_new_proto(uid, pub))
         return
@@ -10901,7 +10906,7 @@ def handle_wg_input(uid, chat, kind, wdata, text):
     tips = {'mikrotik': f'Вставь команды из файла в терминал MikroTik, затем проверь: <code>/ping {WG_NET}.1</code>.',
             'pc': 'Установи WireGuard на компьютер и импортируй файл. QR можно получить кнопкой ниже.',
             }.get(wdata, 'Отсканируй QR-код в приложении WireGuard на телефоне. Файл .conf — кнопкой ниже.')
-    t, kb = scr_wg_peer(uid, pub, f'✅ Пир создан. {tips}')
+    t, kb = scr_wg_peer(uid, pub, f'✅ Клиент создан. {tips}')
     send(chat, t, kb)
 
 
@@ -12862,7 +12867,7 @@ def peers_tick(live):
             if p['enabled'] and p.get('expires') and p['expires'] <= now:
                 p['enabled'], p['off_reason'] = False, 'expired'
                 changed_wg = True
-                msgs.append(f'⌛ <b>Срок доступа истёк: {name}</b>\nКлиент отключён. Продлить: 🔐 WireGuard → {name} → ⏳ Срок доступа.')
+                msgs.append(f'⌛ <b>Срок доступа истёк: {name}</b>\nКлиент отключён. Продлить: 👥 Клиенты → {name} → ⏳ Срок доступа.')
             elif p['enabled'] and p.get('expires') and p['expires'] - now <= 3 * 86400 and warned.get('exp') != p['expires']:
                 warned['exp'] = p['expires']
                 msgs.append(f'⏳ <b>{name}</b>: доступ закончится {fmt_date(p["expires"])} (через {days_word(days_left(p["expires"]))})')
@@ -14348,7 +14353,7 @@ def report_restored():
              f'Клиентов WireGuard: {len(wg_state()["peers"])}, подписок: {len(subs())}.', '',
              '<b>Проверьте:</b>',
              f'• проброс UDP {port} на роутере ведёт на новый адрес <code>{h(lan_ip())}</code>;',
-             '• домен для клиентов указывает на ваш внешний IP (🔐 WireGuard → 🌐 Адрес для подключения → 🔎);',
+             '• домен для клиентов указывает на ваш внешний IP (👥 Клиенты → 🌐 Адрес для подключения → 🔎);',
              '• старый сервер выключен — два бота с одним токеном мешают друг другу.']
     if r.get('new_link'):
         lines.append('• подписка привязана заново: старое устройство в личном кабинете можно удалить.')
