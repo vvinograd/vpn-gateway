@@ -55,6 +55,11 @@ Notifications arrive by themselves: "⚠️ Server X blocks Telegram — switche
 **Connectivity and routing**
 - **mihomo** — VLESS (Reality) client with automatic server selection across one or several subscriptions;
 - **WireGuard** — phones, computers and MikroTik routers connect to the gateway (the wizard generates a ready `.rsc`);
+- **AmneziaWG 2.0 and VLESS Reality for clients** — for mobile carriers that block WireGuard: chosen per client,
+  several at once if needed; each is enabled separately in «🧩 Протоколы»;
+- **client diagnostics** — handshake, carrier, two-way data check, in-tunnel ping for MikroTik, the chain
+  client → gateway → server → site; per-carrier summary; Telegram/YouTube/ChatGPT monitor through the VPN;
+  connection-storm (loop) guard;
 - **routing by domain**, not only by IP: smart, "selected services only", "blocked only", "everything via VPN",
   custom exceptions; "🔎 Where does a site go" check;
 - **your own VLESS server** on any VPS — the bot deploys it by IP and password;
@@ -258,6 +263,14 @@ produces RouterOS 7.4+ commands: tunnel only, the whole LAN, or selected address
 - If the gateway or the VPN stops passing traffic (netwatch opens a real connection through the tunnel every
   10 seconds), the tunnel route is disabled and the LAN goes direct; it switches back when things recover.
 - The commands can be run again: they first remove what they added before.
+
+## Client protocols: AmneziaWG and VLESS
+
+In 🔐 WireGuard → 🧩 Протоколы the owner can enable two more protocols, each separately; wg0 and MikroTik are untouched.
+AmneziaWG runs on its own interface `awg0` (`10.10.11.0/24`, 51821/udp by default) and is installed by the bot from
+the amnezia PPA (Ubuntu). VLESS Reality is an inbound in mihomo (443/tcp if free), disguised as HTTPS to a regular site
+(`ya.ru` by default). The protocol is picked when a client is created and can be added or removed later; expiry,
+traffic limits, disabling and deletion apply to all of a client's protocols.
 
 ## Console: management without Telegram
 

@@ -1470,10 +1470,14 @@ PY
 uninstall() {
     ask "Удаление" "Удалить VPN-шлюз с этого сервера?\n\nБудут остановлены и удалены mihomo, WireGuard (wg0) и бот.\nПеред удалением настройки и ключи клиентов сохранятся в архив в /root." 13 1 || return
     local bak="/root/vpngw-backup-$(date +%Y%m%d-%H%M).tar.gz"
-    tar czf "$bak" /etc/mihomo /etc/wireguard /etc/vpngw /etc/vpnbot.env /etc/vpnnotify.env /var/lib/vpnbot \
+    tar czf "$bak" /etc/mihomo /etc/wireguard /etc/amnezia /etc/vpngw /etc/vpnbot.env /etc/vpnnotify.env /var/lib/vpnbot \
         /root/wg-clients 2>/dev/null; chmod 600 "$bak"
     [ -f "$LAN2_CONF" ] && lan2_off
     for s in vpnbot wg-quick@wg0 mihomo; do run systemctl disable --now "$s"; done
+    if [ -f /etc/amnezia/amneziawg/awg0.conf ]; then          # AmneziaWG, если его включали в боте (сам пакет остаётся)
+        run systemctl disable --now awg-quick@awg0
+        rm -rf /etc/amnezia/amneziawg/awg0.conf /etc/systemd/system/awg-quick@awg0.service.d
+    fi
     rm -rf /etc/systemd/system/vpnbot.service /etc/systemd/system/vpnbot.service.d /etc/systemd/system/mihomo.service /etc/systemd/system/mihomo.service.d \
         /etc/systemd/system/wg-quick@wg0.service.d /etc/wireguard/wg0.conf /etc/vpnbot.env /etc/vpnnotify.env \
         /var/lib/vpnbot /usr/local/bin/vpnbot.py /usr/local/bin/vpngw /usr/local/bin/vpngw-setup \
