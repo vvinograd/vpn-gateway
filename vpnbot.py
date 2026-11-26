@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.9.2'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.9.3'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -3078,7 +3078,30 @@ AWG_ANDROID = 'https://play.google.com/store/apps/details?id=org.amnezia.awg'
 AWG_IOS = 'https://apps.apple.com/app/amneziawg/id6478942365'
 AMNEZIA_SITE = 'https://amnezia.org/downloads'
 VLESS_NAME = 'vpngw-vless'
-VLESS_DESTS = ['ya.ru:443', 'www.microsoft.com:443', 'dl.google.com:443', 'www.apple.com:443']
+# запасной список маскировки (TLS 1.3 + HTTP/2, Reality с ними работает; www.microsoft.com — нет). Лучше всего —
+# сайт-сосед по сети шлюза (🔎 поиск): тогда имя сайта и адрес сервера правдоподобно совпадают
+VLESS_DESTS = ['www.samsung.com:443', 'dl.google.com:443', 'www.nvidia.com:443', 'www.amd.com:443',
+               'www.apple.com:443', 'ya.ru:443']
+# поиск соседей: те же пробы, что в server/install-vless.sh (openssl + curl с самого шлюза, напрямую)
+VLESS_SCAN_SH = r'''
+probe_ip() {
+    local ip=$1 out dom r v code t same=0 dest
+    out=$(timeout 4 openssl s_client -connect "$ip:443" -tls1_3 -alpn h2 -groups X25519 </dev/null 2>/dev/null) || return 0
+    grep -q 'ALPN protocol: h2' <<<"$out" || return 0
+    dom=$(openssl x509 -noout -subject -ext subjectAltName 2>/dev/null <<<"$out" \
+        | grep -oE '(CN ?= ?|DNS:)[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sed -E 's/^(CN ?= ?|DNS:)//' | grep -v '^\*' | head -1)
+    [ -n "$dom" ] || return 0
+    r=$(curl -s -o /dev/null --max-time 6 --tlsv1.3 --http2 --resolve "$dom:443:$ip" \
+        -w '%{http_version} %{http_code} %{time_appconnect}' "https://$dom/") || return 0
+    read -r v code t <<<"$r"
+    [ "$v" = 2 ] && [ "$code" != 000 ] || return 0
+    if getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1}' | grep -q "^$NET\."; then same=1; dest=$dom; else dest=$ip; fi
+    echo "$dom $dest $(awk -v t="$t" 'BEGIN{printf "%d", t*1000}') $same n"
+}
+export -f probe_ip
+export NET="${IP%.*}"
+seq 1 254 | grep -vx "${IP##*.}" | sed "s/^/$NET./" | xargs -P 48 -I{} bash -c 'probe_ip {}' 2>/dev/null
+'''
 VLESS_APPS = ('iPhone: Happ, v2RayTun или Streisand · Android: v2rayNG, Happ или v2RayTun · '
               'Windows/macOS: Hiddify или Happ')
 PROTO_ICON = {'wg': '🔐', 'awg': '🛡', 'vless': '🕶'}
@@ -3390,7 +3413,7 @@ def vless_listener():
     users = [(pub, p) for pub, p in wg_state()['peers'].items() if p.get('vless') and p['enabled']]
     if not users:
         return []
-    sni = v['dest'].rsplit(':', 1)[0]
+    sni = vless_sni()
     out = [f'  - name: {VLESS_NAME}', '    type: vless', f'    port: {v["port"]}', '    listen: 0.0.0.0', '    users:']
     for pub, p in users:
         out += [f'      - username: {vless_user(pub)}', f'        uuid: {p["vless"]["uuid"]}',
@@ -3398,6 +3421,55 @@ def vless_listener():
     out += ['    reality-config:', f'      dest: {v["dest"]}', f'      private-key: {v["priv"]}',
             f'      short-id: [{v["sid"]}]', f'      server-names: [{sni}]']
     return out
+
+
+def vless_sni():
+    """Имя сайта маскировки (SNI). Для соседа по сети адрес (dest) может быть IP, имя — отдельно."""
+    v = vless_cfg()
+    return v.get('sni') or (v.get('dest') or VLESS_DESTS[0]).rsplit(':', 1)[0]
+
+
+def vless_scan_ip():
+    """Внешний адрес, к которому подключаются клиенты: в его сети ищем соседей."""
+    cands = [lan_ip()]
+    try:
+        cands.append(socket.gethostbyname(wg_endpoint().rsplit(':', 1)[0]))
+    except Exception:
+        pass
+    for ip in cands:
+        try:
+            if ip and ipaddress.ip_address(ip).is_global:
+                return ip
+        except ValueError:
+            pass
+    return public_ip()
+
+
+def vless_scan():
+    """Сайты-соседи по сети шлюза для маскировки VLESS: [{'dom', 'dest', 'ms', 'same'}], лучшие первыми."""
+    ip = vless_scan_ip()
+    if not ip or not IP_RE.match(ip) or not shutil.which('openssl') or not shutil.which('curl'):
+        return []
+    r = subprocess.run(['bash', '-c', VLESS_SCAN_SH], capture_output=True, text=True, timeout=150,
+                       env=dict(os.environ, IP=ip, LC_ALL='C'))
+    out, seen = [], set()
+    for ln in r.stdout.splitlines():
+        f = ln.split()
+        if len(f) >= 4 and f[0] not in seen:
+            seen.add(f[0])
+            out.append({'dom': f[0], 'dest': f[1], 'ms': int(f[2]) if f[2].isdigit() else 0, 'same': f[3] == '1'})
+    out.sort(key=lambda c: (not c['same'], c['ms']))       # сначала те, чьё имя и правда в этой сети
+    return out[:8]
+
+
+def dest_near(dest):
+    """Сайт, введённый вручную, — сосед по сети шлюза (его адрес в той же /24)?"""
+    try:
+        me = vless_scan_ip() or ''
+        ips = {x[4][0] for x in socket.getaddrinfo(dest.rsplit(':', 1)[0], 443, socket.AF_INET)}
+        return bool(me) and any(ip.rsplit('.', 1)[0] == me.rsplit('.', 1)[0] for ip in ips)
+    except Exception:
+        return False
 
 
 def vless_port_ext():
@@ -3410,7 +3482,7 @@ def vless_link(pub, via=None):
     v = vless_cfg()
     host = wg_endpoint(via).rsplit(':', 1)[0]
     qs = urllib.parse.urlencode({'encryption': 'none', 'flow': 'xtls-rprx-vision', 'security': 'reality',
-                                 'sni': v['dest'].rsplit(':', 1)[0], 'fp': 'chrome', 'pbk': v['pub'],
+                                 'sni': vless_sni(), 'fp': 'chrome', 'pbk': v['pub'],
                                  'sid': v['sid'], 'type': 'tcp'})
     return f'vless://{p["vless"]["uuid"]}@{host}:{vless_port_ext()}?{qs}#' + q(f'{GW_NAME} {p["name"]}'[:60])
 
@@ -3447,7 +3519,12 @@ def vless_enable(port, dest=None):
     if not v.get('priv'):
         v['priv'], v['pub'] = reality_keypair()
         v['sid'] = os.urandom(8).hex()
-    v.update(on=True, port=int(port), dest=dest or v.get('dest') or VLESS_DESTS[0], err='')
+    if dest:
+        v.update(dest=dest['dest'] + ':443', sni=dest['dom'], near=True) if isinstance(dest, dict) else \
+            v.update(dest=dest, sni='', near=False)
+    elif not v.get('dest'):
+        v.update(dest=VLESS_DESTS[0], sni='', near=False)
+    v.update(on=True, port=int(port), err='')
     with lock:
         old = state.get('vless')
         state['vless'] = v
@@ -3496,7 +3573,8 @@ def vless_status():
     who = port_busy(v['port'])
     if who != 'mihomo':
         return '🔴', f'порт {v["port"]} не слушает mihomo' + (f' (занят: {who})' if who else '')
-    return '🟢', f'работает, порт {v["port"]}/tcp, маскировка под {v["dest"]}'
+    return '🟢', f'работает, порт {v["port"]}/tcp, маскировка под {vless_sni()}' + \
+        (' (сосед по сети)' if v.get('near') else '')
 
 
 def vless_tick():
@@ -3513,11 +3591,14 @@ def vless_tick():
     seen, now, active = {}, time.time(), {}
     last = proto_rt['vl_conns']
     delta = {}
+    cmap = {}
     for c in conns:
         md = c.get('metadata') or {}
         pub = users.get(md.get('inboundUser') or '')
         if not pub:
             continue
+        if md.get('sourceIP') and md.get('sourcePort'):
+            cmap[f'{md["sourceIP"]}:{md["sourcePort"]}'] = pub
         cid = c.get('id')
         up, down = int(c.get('upload') or 0), int(c.get('download') or 0)
         lu, ld = last.get(cid, (0, 0))
@@ -3533,6 +3614,13 @@ def vless_tick():
                 wg_state()['peers'][pub].setdefault('eps', {})['vless'] = [md['sourceIP'], now]
     proto_rt['vl_conns'] = seen
     proto_rt['vl_active'] = active
+    dt = now - (proto_rt.get('vl_ts') or now)
+    proto_rt['vl_ts'] = now
+    proto_rt['vl_rate'] = {pub: (d[0] / dt, d[1] / dt) for pub, d in delta.items()} if dt > 0 else {}
+    try:
+        vlq_tick(cmap, now)
+    except Exception:
+        log('vlq_tick:', traceback.format_exc())
     if not delta:
         return
     today = date.today().isoformat()
@@ -3545,6 +3633,159 @@ def vless_tick():
                 t[1] += d[1]
                 peers[pub]['vl_seen'] = now
         save_state()
+
+
+# --- качество VLESS: «замершие» соединения и скорость ---
+# Типичная поломка через мобильных операторов: соединение открылось, прошло 15–20 КБ, и дальше данные до
+# клиента не доходят. Шлюз это видит по TCP: отправленные данные не подтверждаются (unacked > 0), а последнее
+# подтверждение было давно (lastack). Такие соединения считаем «замершими» — по клиенту и по оператору.
+VLQ_LAG = 10_000                 # мс без подтверждения при неподтверждённых данных — соединение замерло
+VLQ_BUCKET = 600                 # статистика по 10 минут
+VLQ_ALERT_MIN = 20               # оценённых соединений за час, чтобы судить об операторе
+VLQ_ALERT_PCT = 30               # столько % замерших — уведомление
+vlq_rt = {'socks': {}, 'ts': 0, 'alert_ts': 0}
+
+
+def tcp_socks(port):
+    """Входящие TCP-соединения на порт: {'ip:порт клиента': {'acked', 'unacked', 'lastack'}}."""
+    r = run(['ss', '-Hnti', 'state', 'established', f'( sport = :{port} )'], 5)
+    out, peer = {}, None
+    for ln in r.stdout.splitlines():
+        if not ln[:1].isspace():
+            f = ln.split()
+            peer = f[3] if len(f) >= 4 else None
+            if peer:
+                peer = peer.replace('[::ffff:', '').replace(']', '')
+            continue
+        if not peer:
+            continue
+        kv = dict(x.split(':', 1) for x in ln.split() if ':' in x and not x.startswith(('rtt', 'wscale')))
+        try:
+            out[peer] = {'acked': int(kv.get('bytes_acked', 0)), 'unacked': int(kv.get('unacked', 0)),
+                         'lastack': int(kv.get('lastack', 0))}
+        except ValueError:
+            pass
+        peer = None
+    return out
+
+
+def vlq_add(scope, key, good, stall, now, keep):
+    q = state.setdefault('vlq', {}).setdefault(scope, {})
+    b = q.setdefault(key, {})
+    k = str(int(now // VLQ_BUCKET * VLQ_BUCKET))
+    x = b.setdefault(k, [0, 0])
+    x[0] += good
+    x[1] += stall
+    for old in [t for t in b if now - int(t) > keep]:
+        del b[old]
+
+
+def vlq_stats(scope, key, since=86400, until=None):
+    """(хороших, замерших) соединений за период."""
+    b = ((state.get('vlq') or {}).get(scope) or {}).get(key) or {}
+    now = time.time()
+    g = s = 0
+    for t, (a, z) in b.items():
+        t = int(t)
+        if now - t <= since and (until is None or t < until):
+            g += a
+            s += z
+    return g, s
+
+
+def vlq_line(g, s, short=False):
+    n = g + s
+    if not n:
+        return 'нет данных' if short else 'соединений ещё не было'
+    pct = 100 * s / n
+    mark = '🟢' if pct < 10 else '🟡' if pct < VLQ_ALERT_PCT else '🔴'
+    return f'{mark} замирает {pct:.0f} %' + (f' ({s} из {n})' if not short else f' из {n}')
+
+
+def vlq_tick(conns_map, now):
+    """conns_map: {'ip:порт': ключ клиента} из соединений mihomo. Вызывается из vless_tick раз в 10 с."""
+    v = vless_cfg()
+    try:
+        socks = tcp_socks(v['port'])
+    except Exception:
+        return
+    st = vlq_rt['socks']
+    done = []
+    for k, x in socks.items():
+        s = st.get(k)
+        if not s:
+            s = st[k] = {'t0': now, 'stall': False, 'acked': 0, 'pub': None}
+        s['acked'] = x['acked']
+        s['pub'] = s['pub'] or conns_map.get(k)
+        if x['unacked'] > 0 and x['lastack'] >= VLQ_LAG:
+            s['stall'] = True
+    for k in [k for k in st if k not in socks]:
+        done.append((k, st.pop(k)))
+    for k, s in list(st.items()):                # замершее и долго открытое — считаем сразу, не дожидаясь закрытия
+        if s['stall'] and not s.get('counted') and now - s['t0'] > 60:
+            s['counted'] = True
+            done.append((k, dict(s, counted=False)))
+    if not done:
+        return
+    with lock:
+        for k, s in done:
+            if s.get('counted'):
+                continue
+            good, stall = (0, 1) if s['stall'] else ((1, 0) if s['acked'] > 0 else (0, 0))
+            if not good and not stall:
+                continue
+            ip = k.rsplit(':', 1)[0]
+            op = ip_operator(ip, fetch=False) or 'неизвестный оператор'
+            vlq_add('all', 'all', good, stall, now, 7 * 86400)
+            vlq_add('op', op, good, stall, now, 86400)
+            if s['pub']:
+                vlq_add('peer', s['pub'], good, stall, now, 86400)
+    vlq_alert(now)
+
+
+def vlq_alert(now):
+    if now - vlq_rt['alert_ts'] < 600:
+        return
+    vlq_rt['alert_ts'] = now
+    al = state.setdefault('vlq', {}).setdefault('alerts', {})
+    for op in list(((state.get('vlq') or {}).get('op') or {}).keys()):
+        g, s = vlq_stats('op', op, 3600)
+        n = g + s
+        pct = 100 * s / n if n else 0
+        if n >= VLQ_ALERT_MIN and pct >= VLQ_ALERT_PCT and now - al.get(op, 0) > 6 * 3600:
+            al[op] = now
+            add_event(f'VLESS через {op}: замирает {pct:.0f} % соединений')
+            notify('svc', f'🕶 <b>VLESS плохо работает через {h(op)}</b>\n\nЗа час замерло {pct:.0f} % соединений '
+                          f'({s} из {n}): данные перестают доходить до клиентов. Обычно оператору не нравится '
+                          'маскировка или подсеть сервера. Попробуйте другой сайт-сосед: 👥 Клиенты → 🧩 Протоколы → '
+                          '🎭 Сайт маскировки.')
+        elif al.get(op) and n >= 10 and pct < 10:
+            al.pop(op)
+            notify('svc', f'🟢 <b>VLESS через {h(op)} снова работает нормально</b> (замирает {pct:.0f} %)')
+    save_state()
+
+
+def vlq_mask_note():
+    """Качество до и после последней смены маскировки."""
+    v = vless_cfg()
+    ts = v.get('mask_ts')
+    if not ts:
+        g, s = vlq_stats('all', 'all', 86400)
+        return f'Качество за сутки: {vlq_line(g, s)}' if g + s else ''
+    since = time.time() - ts
+    g, s = vlq_stats('all', 'all', since)
+    g0, s0 = vlq_stats('all', 'all', 7 * 86400, until=ts)
+    line = f'С этой маскировкой (с {time.strftime("%d.%m %H:%M", time.localtime(ts))}): {vlq_line(g, s)}'
+    if g0 + s0:
+        line += f'; до смены: {vlq_line(g0, s0)}'
+    return line
+
+
+def vl_rate_line(pub):
+    r = proto_rt.get('vl_rate', {}).get(pub)
+    if not r or not (r[0] or r[1]):
+        return ''
+    return f'Скорость сейчас: ↓ {fmt_mbit(r[0])} ↑ {fmt_mbit(r[1])}'
 
 
 def vless_loop():
@@ -8252,6 +8493,10 @@ def scr_wg(uid, note='', page=0):
     if is_owner(uid):
         kb.append([btn('🌐 Адрес для подключения', 'wgep'), btn('🧩 Протоколы', 'prt')])
     kb.append([btn('📊 Статистика клиентов', 'wgstat'), btn('📶 По операторам', 'wgops')])
+    if is_owner(uid):
+        n, letters, _ = mass_count()
+        if n:
+            kb.append([btn(f'📧 Разослать конфиги всем ({n})', 'wgmm')])
     kb.append([btn('🔄 Обновить', 'wg'), btn('🏠 Меню', 'menu')])
     total = sum(1 for _, p in peers if p['enabled'])
     doc = mkdoc('WireGuard', f'На связи {online} из {total}', 'ok' if online or not total else 'warn',
@@ -8403,7 +8648,7 @@ def scr_wg_ep(uid, note=''):
     if ip and dom:
         kb.append([btn('🗑 Убрать IP', 'wgepx:i')])
     if mails:
-        kb.append([btn(f'📧 Разослать новые конфиги ({mails})', 'wgepm')])
+        kb.append([btn(f'📧 Разослать конфиги ({mails})', 'wgepm')])
     kb.append([btn('⬅️ Клиенты', 'wg')])
     return '\n'.join(lines), kb
 
@@ -8436,28 +8681,53 @@ def wg_issue(uid, chat, mid, pub, only, t, via=None):
     return None
 
 
+def mass_protos(p):
+    """Какие конфиги клиента рассылать по почте: все его протоколы (выключенные на шлюзе — нет).
+    MikroTik в локальной сети подключается по адресу Ubuntu — ему смена внешнего адреса не нужна."""
+    if not (p.get('mail') and p.get('priv')) or not p['enabled']:
+        return []
+    if p['kind'] == 'mikrotik' and (p.get('mt') or {}).get('local'):
+        return []
+    return [k for k in peer_protos(p) if (k != 'awg' or awg_on()) and (k != 'vless' or vless_on())]
+
+
 def mass_target(p):
-    # MikroTik в локальной сети подключается по адресу Ubuntu — ему смена внешнего адреса не нужна
-    return bool(p.get('mail') and p.get('priv')) and not p.get('wg_off') and \
-        not (p['kind'] == 'mikrotik' and (p.get('mt') or {}).get('local'))
+    return bool(mass_protos(p))
+
+
+def mass_count():
+    """(клиентов, писем, {протокол: писем})"""
+    by = {}
+    n = 0
+    for p in wg_state()['peers'].values():
+        ks = mass_protos(p)
+        n += bool(ks)
+        for k in ks:
+            by[k] = by.get(k, 0) + 1
+    return n, sum(by.values()), by
 
 
 def wg_mass(uid, chat, mid, via):
     """Разослать всем клиентам с почтой новые конфиги."""
-    todo = [(pub, p) for pub, p in wg_state()['peers'].items() if mass_target(p)]
+    todo = [(pub, p, k) for pub, p in wg_state()['peers'].items() for k in mass_protos(p)]
     ok, bad = [], []
-    for i, (pub, p) in enumerate(todo, 1):
-        edit(chat, mid, f'📧 Рассылаю конфиги: {i} из {len(todo)}…\n{h(p["name"])} → {h(p["mail"])}')
+    for i, (pub, p, k) in enumerate(todo, 1):
+        edit(chat, mid, f'📧 Рассылаю конфиги: {i} из {len(todo)}…\n{PROTO_ICON[k]} {h(p["name"])} → {h(p["mail"])}')
         try:
-            wg_mail(pub, p['mail'], via)
+            if k == 'wg':
+                wg_mail(pub, p['mail'], via)
+            else:
+                proto_mail(pub, p['mail'], k, via)
             ok.append(p['name'])
         except Exception as ex:
-            bad.append(f'{p["name"]}: {ex}')
-    add_event(f'{admin_name(uid)} разослал конфиги WireGuard ({len(ok)} из {len(todo)}), адрес {wg_endpoint(via)}')
-    note = f'📧 Отправлено {len(ok)} из {len(todo)} с адресом <code>{h(wg_endpoint(via))}</code>.'
+            bad.append(f'{p["name"]} ({PROTO_RU[k]}): {ex}')
+        time.sleep(1)                        # почтовые серверы не любят пачку писем подряд
+    add_event(f'{admin_name(uid)} разослал конфиги ({len(ok)} писем из {len(todo)}), адрес {wg_endpoint(via)}')
+    note = f'📧 Отправлено писем: {len(ok)} из {len(todo)}, адрес <code>{h(wg_endpoint(via))}</code>.'
     if bad:
         note += '\n🔴 Не ушло: ' + h('; '.join(bad))[:600]
-    return scr_wg_ep(uid, note)
+    back = proto_rt.pop(('mass_back', uid), 'wgep')
+    return scr_wg(uid, note) if back == 'wg' else scr_wg_ep(uid, note)
 
 
 # ---------------- экраны протоколов ----------------
@@ -8576,17 +8846,23 @@ def scr_peer_proto(uid, pub, proto, note=''):
     else:
         icon, st = vless_status()
         lines += ['VLESS Reality — соединение выглядит как обычный HTTPS к сайту '
-                  f'<code>{h(vless_cfg().get("dest") or VLESS_DESTS[0])}</code>. Работает там, где режут любой VPN по UDP.',
+                  f'<code>{h(vless_sni())}</code>. Работает там, где режут любой VPN по UDP.',
                   f'Приложения: {h(VLESS_APPS)}.', '', f'На шлюзе: {icon} {st}']
         if has:
             lv = by.get('vless')
             if lv and lv.get('conns'):
                 lines.append(f'Сейчас подключён: {lv["conns"]} соедин.' +
                              (f' с <code>{h(lv["endpoint"])}</code>' if lv.get('endpoint') else ''))
+                if vl_rate_line(pub):
+                    lines.append(vl_rate_line(pub))
             elif lv and lv.get('age') is not None:
                 lines.append(f'Был активен {fmt_dur(lv["age"])} назад')
             else:
                 lines.append('Ещё не подключался.')
+            g1, s1 = vlq_stats('peer', pub, 3600)
+            g24, s24 = vlq_stats('peer', pub, 86400)
+            if g24 + s24:
+                lines.append(f'Качество: за час {vlq_line(g1, s1, True)} · за сутки {vlq_line(g24, s24, True)}')
             kb += [[btn('🔗 Ссылка', f'wgo:{t}:vless:f'), btn('🔳 QR-код', f'wgo:{t}:vless:q')],
                    [btn('📧 На почту', f'wgo:{t}:vless:m'), btn('🗑 Убрать VLESS', f'wgo:{t}:vless:x')]]
         elif vless_on():
@@ -8785,6 +9061,12 @@ def scr_proto(uid, note=''):
     v = vless_cfg()
     if v.get('on'):
         lines.append(fwd_hint('tcp', vless_port_ext(), v['port'], 'vless'))
+        mq = vlq_mask_note()
+        if mq:
+            lines.append(mq)
+        if not v.get('near'):
+            lines.append(f'⚠️ <i>Маскировка под {h(vless_sni())} — не сосед по сети шлюза. Через мобильных операторов '
+                         'может работать плохо: 🎭 Сайт маскировки → 🔎 Найти соседей по сети.</i>')
     if note:
         lines += ['', note]
     kb = []
@@ -8862,20 +9144,33 @@ def handle_prt(uid, data, chat, mid):
                         [[btn(f'✅ Порт {alt}', f'prt:vl:on:{alt}'), btn('✏️ Другой', 'prt:vl:port')],
                          [btn('✖️ Отмена', 'prt')]])
             if len(a) < 5:
-                return (f'🕶 <b>Включить VLESS Reality?</b>\n\nВход в mihomo на порту <code>{port}/tcp</code>, маскировка '
-                        f'под <code>{h(v.get("dest") or VLESS_DESTS[0])}</code>. Вход откроется, когда появится '
-                        'первый клиент с VLESS. mihomo применит настройки без перезапуска.',
+                mask = (f'под <code>{h(vless_sni())}</code>' if v.get('dest') else
+                        'бот подберёт сам: найдёт сайт-сосед по сети шлюза (до 2 минут)')
+                return (f'🕶 <b>Включить VLESS Reality?</b>\n\nВход в mihomo на порту <code>{port}/tcp</code>, маскировка — '
+                        f'{mask}. Вход откроется, когда появится первый клиент с VLESS. mihomo применит настройки без '
+                        'перезапуска.',
                         [[btn('✅ Включить', f'prt:vl:on:{port}:go'), btn('✖️ Отмена', 'prt')]])
+            pick = None
+            if not v.get('dest'):
+                edit(chat, mid, '🔎 Ищу сайт-сосед по сети шлюза для маскировки… (до 2 минут)')
+                try:
+                    found = vless_scan()
+                except Exception as e:
+                    log('vless_scan:', e)
+                    found = []
+                pick = found[0] if found else None
             edit(chat, mid, '⏳ Включаю VLESS…')
             try:
-                vless_enable(port)
+                vless_enable(port, pick)
                 with lock:
                     state['vless']['rt200'] = router_table()
                     save_state()
             except Exception as e:
                 return scr_proto(uid, f'🔴 VLESS не включён: {h(str(e))[:400]}')
             add_event(f'{who} включил VLESS (порт {port})')
-            return scr_proto(uid, f'✅ VLESS включён. Подключайте его клиентам: 👥 Клиенты → клиент → 🕶 VLESS.')
+            return scr_proto(uid, '✅ VLESS включён, маскировка под ' + h(vless_sni()) +
+                             (' (сосед по сети)' if pick else ' (соседей по сети не нашлось — из запасного списка)') +
+                             '. Подключайте его клиентам: 👥 Клиенты → клиент → 🕶 VLESS.')
         if act == 'off':
             if len(a) < 4:
                 return ('⏹ Выключить VLESS? Клиенты потеряют этот протокол (ключи сохранятся).',
@@ -8891,16 +9186,47 @@ def handle_prt(uid, data, chat, mid):
             return ('🔢 Порт VLESS (TCP) на шлюзе. Можно указать внешний порт на роутере через двоеточие: '
                     '<code>8443:443</code> — шлюз слушает 8443, клиенты подключаются к 443.\n\nОтмена: /cancel',
                     [[btn('✖️ Отмена', 'prt')]])
+        if act == 'scan':
+            edit(chat, mid, '🔎 Ищу сайты-соседи по сети шлюза… (до 2 минут)')
+            try:
+                proto_rt['scan'] = vless_scan()
+            except Exception as e:
+                log('vless_scan:', e)
+                proto_rt['scan'] = []
+            a = ['prt', 'vl', 'dest']
+            act = 'dest'
+        if act == 'pick' and len(a) > 3 and a[3].isdigit():
+            sc = proto_rt.get('scan') or []
+            if int(a[3]) < len(sc):
+                return proto_set_vl(uid, dest=sc[int(a[3])])
+            act = 'dest'
         if act == 'dest':
             if len(a) > 3:
                 d = VLESS_DESTS[int(a[3])] if a[3].isdigit() and int(a[3]) < len(VLESS_DESTS) else None
                 if d:
                     return proto_set_vl(uid, dest=d)
             awaiting[uid] = ('prt_dest', None)
-            return ('🎭 <b>Сайт маскировки</b>\n\nVLESS Reality выдаёт себя за HTTPS к этому сайту. Нужен сайт с TLS 1.3, '
-                    'доступный из России. Выберите или отправьте свой (<code>host:443</code>). После смены разошлите '
-                    'клиентам новые ссылки.\n\nОтмена: /cancel',
-                    [[btn(d, f'prt:vl:dest:{i}')] for i, d in enumerate(VLESS_DESTS)] + [[btn('✖️ Отмена', 'prt')]])
+            sc = proto_rt.get('scan')
+            lines = ['🎭 <b>Сайт маскировки</b>', '',
+                     'VLESS Reality выдаёт себя за HTTPS к этому сайту. Лучше всего — <b>сосед по сети</b>: настоящий '
+                     'сайт у того же хостера, что и шлюз. Тогда имя сайта и адрес сервера правдоподобно совпадают, '
+                     'и мобильные операторы такое соединение не трогают. Сайт другой сети (например, ya.ru на чужом '
+                     'адресе) выглядит подозрительно.', '', f'Сейчас: <code>{h(vless_sni())}</code>'
+                     + (' (сосед по сети)' if vless_cfg().get('near') else '')]
+            kb = []
+            if sc:
+                lines += ['', '<b>Найдены соседи</b> (✅ — имя сайта и правда в этой сети, лучший выбор):']
+                for i, c in enumerate(sc):
+                    kb.append([btn(f'{"✅" if c["same"] else "▫️"} {c["dom"]} · {c["ms"]} мс'[:60], f'prt:vl:pick:{i}')])
+            elif sc is not None:
+                lines += ['', 'Соседей по сети не нашлось — выберите из запасного списка.']
+            lines += ['', 'Или отправьте свой (<code>host:443</code>). После смены разошлите клиентам новые ссылки.',
+                      '', 'Отмена: /cancel']
+            kb.append([btn('🔎 Найти соседей по сети', 'prt:vl:scan')])
+            kb += [[btn(d.rsplit(':', 1)[0], f'prt:vl:dest:{i}') for i, d in enumerate(VLESS_DESTS)][j:j + 3]
+                   for j in range(0, len(VLESS_DESTS), 3)]
+            kb.append([btn('✖️ Отмена', 'prt')])
+            return '\n'.join(lines), kb
     return scr_proto(uid)
 
 
@@ -8912,8 +9238,10 @@ def proto_set_vl(uid, port=None, ext=None, dest=None):
             v['port'] = port
         if ext is not None:
             v['ext_port'] = ext
-        if dest:
-            v['dest'] = dest
+        if isinstance(dest, dict):
+            v.update(dest=dest['dest'] + ':443', sni=dest['dom'], near=True, mask_ts=time.time())
+        elif dest:
+            v.update(dest=dest, sni='', near=dest_near(dest), mask_ts=time.time())
         save_state()
     try:
         vless_reload()
@@ -9065,6 +9393,15 @@ def scr_wg_ops(uid):
                          'Выдайте этим клиентам AmneziaWG или VLESS.')
     if hints:
         lines += [''] + hints
+    q = (state.get('vlq') or {}).get('op') or {}
+    qrows = []
+    for op in q:
+        g, s_ = vlq_stats('op', op, 86400)
+        if g + s_:
+            qrows.append((g + s_, f'{h(op)}: {vlq_line(g, s_)}'))
+    if qrows:
+        lines += ['', '🕶 <b>Качество VLESS за сутки</b> (доля соединений, где данные перестали доходить до клиента):']
+        lines += [x for _, x in sorted(qrows, reverse=True)[:10]]
     lines += ['', '<i>Цифры: на связи сейчас / подключались. Оператор определяется по IP через RIPEstat.</i>']
     return '\n'.join(lines), [[btn('🔄 Обновить', 'wgops'), btn('⬅️ Клиенты', 'wg')]]
 
@@ -9157,6 +9494,14 @@ def scr_peer_check(uid, pub):
             lines.append(f'🕶 <b>VLESS</b>: ⚪ был активен {fmt_dur(vl["age"])} назад')
         else:
             lines.append('🕶 <b>VLESS</b>: ⚪ подключений не было')
+        if vl_rate_line(pub):
+            lines.append('      ' + vl_rate_line(pub))
+        g1, s1 = vlq_stats('peer', pub, 3600)
+        if g1 + s1:
+            lines.append(f'      соединения за час: {vlq_line(g1, s1)}')
+            if s1 and 100 * s1 / (g1 + s1) >= VLQ_ALERT_PCT:
+                advice.append('Много VLESS-соединений замирает: данные перестают доходить до клиента — обычно это '
+                              'оператор режет маскировку или подсеть сервера. Смените сайт маскировки на соседа по сети.')
         if icon != '🟢':
             lines.append(f'      вход на шлюзе: {icon} {h(st)}')
             advice.append('Вход VLESS на шлюзе не работает: 🧩 Протоколы.')
@@ -9468,7 +9813,7 @@ SCREENS = {'prt': scr_proto, 'wgops': scr_wg_ops, 'svm': scr_svcmon, 'menu': scr
            'srvthr': scr_srv_thr, 'vs': scr_vs, 'os': scr_os, 'bk': scr_bk, 'cl': scr_clean, 'wg': scr_wg, 'wgep': scr_wg_ep, 'wgstat': scr_wg_stat, 'swr': scr_sw_route, 'swl': scr_sw_list, 'diag': scr_diag, 'swe': scr_sw_exc, 'svs': scr_svc, 'sw': scr_sw, 'sws': scr_sw_srv, 'swp': scr_sw_prio,
            'swi': lambda uid: scr_sw_choice(uid, 'i'), 'swt': lambda uid: scr_sw_choice(uid, 't')}
 # клиентами WireGuard управляют все админы; общие настройки шлюза — только владелец
-OWNER_ONLY = ('prt', 'svm:t', 'svm:storm', 'zt:', 'diag:set:', 'diag:auto', 'vs', 'os', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
+OWNER_ONLY = ('prt', 'wgmm', 'svm:t', 'svm:storm', 'zt:', 'diag:set:', 'diag:auto', 'vs', 'os', 'bk', 'svc:', 'svcs:', 'admins', 'em', 'adm:', 'wgep',
               'upd:', 'subs', 'sub:', 'srvthr', 'srvt:', 'srvclean')
 
 # ---------------- живые экраны: открытый экран (кроме главного меню) обновляется раз в 3 секунды ----------------
@@ -10305,15 +10650,23 @@ def handle_wg(uid, data, chat, mid):
     if cmd == 'wgepc':
         edit(chat, mid, '🔎 Проверяю домен…')
         return scr_wg_ep(uid, check_domain(wg_eps().get('domain') or '')[1])
-    if cmd == 'wgepm':
-        n = sum(1 for p in w['peers'].values() if mass_target(p))
+    if cmd in ('wgepm', 'wgmm'):
+        back = 'wg' if cmd == 'wgmm' else 'wgep'
+        proto_rt[('mass_back', uid)] = back
+        n, letters, by = mass_count()
+        if not email_cfg()['smtp'].get('host'):
+            return scr_wg(uid, '📧 Почта для отправки не настроена (⚙️ Настройки → 📧 Почта).') if back == 'wg' \
+                else scr_wg_ep(uid, '📧 Почта для отправки не настроена (⚙️ Настройки → 📧 Почта).')
         if arg in ('d', 'i') or not both_eps():
             v = arg if arg in ('d', 'i') else ''
-            return (f'📧 <b>Разослать новые конфиги?</b>\n\n{n} клиентам с сохранённой почтой придёт письмо с '
-                    f'новым файлом и QR-кодом, адрес <code>{h(wg_endpoint(v or None))}</code>.\n'
-                    'Ключи не меняются: старые конфиги продолжат работать, пока адрес доступен.',
-                    [[btn('✅ Разослать', f'wgepmg:{v}'), btn('✖️ Отмена', 'wgep')]])
-        return via_choice('📧 <b>Разослать новые конфиги</b>', 'wgepm', 'wgep')
+            parts = ', '.join(f'{PROTO_ICON[k]} {PROTO_RU[k]} — {c}' for k, c in sorted(by.items()))
+            return (f'📧 <b>Разослать конфиги всем?</b>\n\n{n} клиентам с сохранённой почтой уйдут письма с их '
+                    f'конфигами (по письму на каждый протокол клиента: {parts}), адрес '
+                    f'<code>{h(wg_endpoint(v or None))}</code>.\n\n'
+                    'Ключи не меняются: старые конфиги продолжат работать. Удобно, если что-то сломалось или '
+                    'сменился адрес — у всех сразу будет свежий конфиг.',
+                    [[btn(f'✅ Разослать ({letters})', f'wgepmg:{v}'), btn('✖️ Отмена', back)]])
+        return via_choice('📧 <b>Разослать конфиги всем</b>', cmd, back)
     if cmd == 'wgepmg':
         return wg_mass(uid, chat, mid, arg or None)
     if cmd == 'wgadd':
@@ -10321,7 +10674,7 @@ def handle_wg(uid, data, chat, mid):
             arg = 'phone'
         awaiting[uid] = ('wg_name', arg)
         ex = {'mikrotik': 'MikroTik дача', 'phone': 'Телефон Ивана', 'pc': 'Ноутбук Маши'}.get(arg, 'Телефон')
-        return (f'➕ <b>Новый пир: {KIND_RU[arg]}</b>\n\nКак его назвать? Например: <code>{ex}</code>'
+        return (f'➕ <b>Новый клиент: {KIND_RU[arg]}</b>\n\nКак его назвать? Например: <code>{ex}</code>'
                 + '\n\nОтмена: /cancel', [[btn('✖️ Отмена', 'wg')]])
     pub = peer_by_tag(arg.split(":")[0])
     if not pub:
