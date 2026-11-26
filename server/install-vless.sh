@@ -20,6 +20,13 @@
 #  предназначены для него.
 # ============================================================================
 set -o pipefail
+# Русский текст в окнах: на свежем сервере (часто Debian) кодировка терминала бывает не UTF-8 — тогда
+# whiptail рисует «кракозябры» вида ▒<9F>. Включаем UTF-8 только для этого скрипта.
+if [ "$(locale charmap 2>/dev/null)" != "UTF-8" ]; then
+    for _l in C.UTF-8 C.utf8 en_US.UTF-8; do
+        [ "$(LC_ALL=$_l locale charmap 2>/dev/null)" = "UTF-8" ] && { export LANG=$_l LC_ALL=$_l; break; }
+    done
+fi
 CONF=/usr/local/etc/xray/config.json
 INFO=/root/vless-server.txt
 LOG=/var/log/vless-server-install.log

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.9.1'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.9.2'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -4485,9 +4485,11 @@ def net_bytes():
 
 
 def unit_info(unit):
-    r = run(['systemctl', 'show', unit, '-p', 'ActiveState', '-p', 'MainPID', '--value'], 5).stdout.split()
-    active = r[1] if len(r) > 1 else (r[0] if r else 'unknown')
-    pid = r[0] if len(r) > 1 else '0'
+    # по именам, а не по порядку строк: новый systemd (Ubuntu 26.04) выводит свойства в порядке запроса,
+    # старый — в своём, и «MainPID» принимался за состояние службы (все службы были 🔴)
+    d = svc_show(unit, ('ActiveState', 'MainPID'))
+    active = d.get('ActiveState') or 'unknown'
+    pid = d.get('MainPID') or '0'
     rss = 0
     try:
         for line in open(f'/proc/{pid}/status'):
@@ -8744,13 +8746,30 @@ def wg_port_int():
         return 51820
 
 
+def fwd_hint(proto, ext, port, name):
+    """Как клиентам из интернета достучаться до порта. Шлюз за роутером (серый адрес) — команда проброса
+    для MikroTik; у шлюза белый адрес (VPS, «в разрыв») — проброс не нужен, только открыть порт у хостера."""
+    lan = lan_ip()
+    try:
+        private = not ipaddress.ip_address(lan).is_global
+    except ValueError:
+        private = True
+    if not private:
+        return (f'<i>У шлюза свой внешний адрес {h(lan)} — проброс на роутере не нужен. Если у хостера есть '
+                f'внешний фаервол, откройте в нём {port}/{proto}.</i>')
+    return (f'<i>Шлюз за роутером: чтобы клиенты из интернета дошли до порта, на MikroTik нужен проброс '
+            f'{ext}/{proto} → {h(lan)}:{port}. Если интерфейс провайдера не в списке WAN — замените '
+            f'<code>in-interface-list=WAN</code> на <code>in-interface=имя</code>:</i>\n'
+            f'<code>/ip firewall nat add chain=dstnat in-interface-list=WAN protocol={proto} dst-port={ext} '
+            f'action=dst-nat to-addresses={h(lan)} to-ports={port} comment="vpn-gateway {name}"</code>')
+
+
 def scr_proto(uid, note=''):
     ai, ast = awg_status()
     vi, vst = vless_status()
     peers = wg_state()['peers'].values()
     n_awg = sum(1 for p in peers if p.get('awg'))
     n_vl = sum(1 for p in peers if p.get('vless'))
-    lan = lan_ip() or 'IP-шлюза'
     lines = ['🧩 <b>Протоколы</b>', '',
              'Каждому клиенту можно выдать один или несколько протоколов. Срок, лимит и выключение действуют на все сразу.',
              '', f'🔐 <b>WireGuard</b>: 🟢 как раньше (MikroTik и старые клиенты работают только на нём)', '',
@@ -8758,18 +8777,14 @@ def scr_proto(uid, note=''):
              '<i>WireGuard с маскировкой от блокировок мобильных операторов. Отдельный интерфейс awg0 — wg0 не трогается.</i>']
     a = awg_cfg()
     if a.get('on'):
-        lines.append(f'Проброс на MikroTik: <code>/ip firewall nat add chain=dstnat in-interface-list=WAN protocol=udp '
-                     f'dst-port={awg_port_ext()} action=dst-nat to-addresses={lan} to-ports={a["port"]} '
-                     'comment="vpn-gateway awg"</code>')
+        lines.append(fwd_hint('udp', awg_port_ext(), a['port'], 'awg'))
     if proto_rt.get('job'):
         lines.append(f'⏳ {h(proto_rt["job"])}')
     lines += ['', f'🕶 <b>VLESS Reality</b>: {vi} {h(vst)}' + (f' · клиентов {n_vl}' if n_vl else ''),
               '<i>Выглядит как HTTPS к обычному сайту. Вход в mihomo на шлюзе, TCP.</i>']
     v = vless_cfg()
     if v.get('on'):
-        lines.append(f'Проброс на MikroTik: <code>/ip firewall nat add chain=dstnat in-interface-list=WAN protocol=tcp '
-                     f'dst-port={vless_port_ext()} action=dst-nat to-addresses={lan} to-ports={v["port"]} '
-                     'comment="vpn-gateway vless"</code>')
+        lines.append(fwd_hint('tcp', vless_port_ext(), v['port'], 'vless'))
     if note:
         lines += ['', note]
     kb = []
