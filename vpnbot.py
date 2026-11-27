@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram-бот для VPN-шлюза: mihomo + WireGuard + MikroTik.
 # Только стандартная библиотека Python, внешних зависимостей нет.
-BOT_VERSION = '2.9.3'   # подставляется build.sh из файла VERSION
+BOT_VERSION = '2.9.33'   # подставляется build.sh из файла VERSION
 import base64
 import calendar
 import hashlib
@@ -150,7 +150,7 @@ RU_APPS_DIRECT = ['DOMAIN-SUFFIX,max.ru', 'DOMAIN-SUFFIX,oneme.ru', 'DOMAIN-SUFF
 EXIT_IP_URLS = ('https://ipv4.icanhazip.com', 'https://ipinfo.io/ip')
 WG_IOS = 'https://apps.apple.com/app/wireguard/id1441195209'
 WG_ANDROID = 'https://play.google.com/store/apps/details?id=com.wireguard.android'
-AMNEZIA_NOTE = 'Если у вас уже стоит AmneziaWG (или AmneziaVPN), можно сканировать QR-код ею — WireGuard ставить не нужно.'
+AMNEZIA_NOTE = 'Если у вас уже стоит AmneziaWG, можно сканировать QR-код ею — WireGuard ставить не нужно.'
 NOTIFY_KINDS = [
     ('switch', '🔁 Смена сервера'),
     ('dead', '🔴 Недоступность VPN'),
@@ -3073,10 +3073,18 @@ AWG_IF = 'awg0'
 AWG_DIR = '/etc/amnezia/amneziawg'
 AWG_CONF = f'{AWG_DIR}/{AWG_IF}.conf'
 AWG_UNIT = f'awg-quick@{AWG_IF}'
-AWG_APPS = 'AmneziaVPN 4.8.12.7+ или AmneziaWG 2.0+'
+AWG_APPS = 'AmneziaWG (версии 2.0 и новее)'
 AWG_ANDROID = 'https://play.google.com/store/apps/details?id=org.amnezia.awg'
-AWG_IOS = 'https://apps.apple.com/app/amneziawg/id6478942365'
-AMNEZIA_SITE = 'https://amnezia.org/downloads'
+AWG_IOS = 'https://apps.apple.com/app/amneziawg/id6478942365'          # iPhone, iPad и Mac
+AWG_WIN = 'https://github.com/amnezia-vpn/amneziawg-windows-client/releases/latest'
+# Happ — одно приложение для VLESS на всех устройствах (ссылки с официальной страницы happ.su)
+HAPP_IOS_RU = 'https://apps.apple.com/ru/app/happ-lite/id6799917773'
+HAPP_IOS = 'https://apps.apple.com/app/happ-proxy-utility/id6504287215'
+HAPP_ANDROID = 'https://play.google.com/store/apps/details?id=com.happproxy'
+HAPP_APK = 'https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk'
+HAPP_WIN = 'https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe'
+HAPP_MAC_RU = 'https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643'
+HAPP_DMG = 'https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg'
 VLESS_NAME = 'vpngw-vless'
 # запасной список маскировки (TLS 1.3 + HTTP/2, Reality с ними работает; www.microsoft.com — нет). Лучше всего —
 # сайт-сосед по сети шлюза (🔎 поиск): тогда имя сайта и адрес сервера правдоподобно совпадают
@@ -3102,8 +3110,7 @@ export -f probe_ip
 export NET="${IP%.*}"
 seq 1 254 | grep -vx "${IP##*.}" | sed "s/^/$NET./" | xargs -P 48 -I{} bash -c 'probe_ip {}' 2>/dev/null
 '''
-VLESS_APPS = ('iPhone: Happ, v2RayTun или Streisand · Android: v2rayNG, Happ или v2RayTun · '
-              'Windows/macOS: Hiddify или Happ')
+VLESS_APPS = 'Happ (iPhone, Android, Windows, Mac); подойдут и v2RayTun, v2rayNG, Hiddify, Streisand'
 PROTO_ICON = {'wg': '🔐', 'awg': '🛡', 'vless': '🕶'}
 PROTO_RU = {'wg': 'WireGuard', 'awg': 'AmneziaWG', 'vless': 'VLESS'}
 proto_rt = {'vl_conns': {}, 'vl_seen': {}, 'vl_active': {}, 'awg_err': '', 'job': None}
@@ -8742,68 +8749,138 @@ def proto_send(chat, pub, proto, only=None, via=None):
             if png:
                 tg_file('sendPhoto', chat, 'photo', 'qr.png', png,
                         f'🛡 <b>{h(p["name"])}</b>: QR-код AmneziaWG\n\n'
-                        f'1. Установите {AWG_APPS}: <a href="{AWG_IOS}">App Store</a> · '
-                        f'<a href="{AWG_ANDROID}">Google Play</a> · <a href="{AMNEZIA_SITE}">компьютер</a>\n'
-                        '2. «+» → «Сканировать QR-код» (в AmneziaVPN: «Вставить ключ / QR»)\n3. Подключитесь\n\n'
-                        '⚠️ Старые версии приложений (AmneziaWG 1.x) этот конфиг не поймут.\n'
+                        f'1. Установите AmneziaWG: <a href="{AWG_IOS}">iPhone/Mac</a> · '
+                        f'<a href="{AWG_ANDROID}">Android</a> · <a href="{AWG_WIN}">Windows</a>\n'
+                        '2. «+» → «Сканировать QR-код»\n3. Включите подключение\n\n'
+                        'Обычный WireGuard и старые версии AmneziaWG (1.x) этот конфиг не поймут.\n'
                         '⚠️ QR — это ключ доступа, не показывайте его посторонним.')
             elif only == 'qr':
                 raw_send(chat, 'ℹ️ QR-код не создан: на сервере нет программы qrencode.', ttl_kind='files')
         if only in (None, 'file'):
             tg_file('sendDocument', chat, 'document', f'{safe}-awg.conf', conf.encode(),
-                    f'🛡 AmneziaWG «{h(p["name"])}»\n\nИмпорт: {AWG_APPS} → «+» → «Импорт из файла».\n'
-                    'Приложение WireGuard этот файл не откроет.\n\n⚠️ Внутри приватный ключ, не пересылайте посторонним.')
+                    f'🛡 AmneziaWG «{h(p["name"])}»\n\nУстановите AmneziaWG: <a href="{AWG_IOS}">iPhone/Mac</a> · '
+                    f'<a href="{AWG_ANDROID}">Android</a> · <a href="{AWG_WIN}">Windows</a>\n'
+                    'Телефон: «+» → «Импорт из файла». Компьютер: «Импорт туннелей из файла» → «Подключить».\n'
+                    'Обычный WireGuard этот файл не откроет.\n\n⚠️ Внутри приватный ключ, не пересылайте посторонним.')
         return
     link = vless_link(pub, via)
     if only in (None, 'file'):
-        raw_send(chat, f'🕶 <b>VLESS «{h(p["name"])}»</b>\n\nСкопируйте ссылку целиком и добавьте её в приложение '
-                       f'(«+» → «Импорт из буфера обмена»):\n\n<code>{h(link)}</code>\n\n'
-                       f'Приложения: {h(VLESS_APPS)}.\n\n⚠️ Ссылка — это ключ доступа, не пересылайте посторонним.',
+        raw_send(chat, f'🕶 <b>VLESS «{h(p["name"])}»</b>\n\n1. Установите Happ: <a href="{HAPP_IOS_RU}">iPhone</a> · '
+                       f'<a href="{HAPP_ANDROID}">Android</a> · <a href="{HAPP_WIN}">Windows</a> · '
+                       f'<a href="{HAPP_MAC_RU}">Mac</a>\n2. Скопируйте ссылку целиком (нажмите на неё):\n\n'
+                       f'<code>{h(link)}</code>\n\n3. В Happ: «+» → «Вставить из буфера» → подключиться.\n\n'
+                       '⚠️ Ссылка — это ключ доступа, не пересылайте посторонним.',
                  ttl_kind='files')
     if only in (None, 'qr'):
         png = wg_qr(link)
         if png:
             tg_file('sendPhoto', chat, 'photo', 'qr.png', png,
-                    f'🕶 <b>{h(p["name"])}</b>: QR-код VLESS\n\nВ приложении: «+» → «Сканировать QR».\n'
-                    f'{h(VLESS_APPS)}\n\n⚠️ QR — это ключ доступа.')
+                    f'🕶 <b>{h(p["name"])}</b>: QR-код VLESS\n\n1. Установите Happ: <a href="{HAPP_IOS_RU}">iPhone</a> · '
+                    f'<a href="{HAPP_ANDROID}">Android</a>\n2. «+» → «Сканировать QR-код» → подключиться.\n\n'
+                    '⚠️ QR — это ключ доступа.')
+
+
+def proto_guide(proto, safe):
+    """Инструкция для пользователя по платформам: [(платформа, приложение, [(подпись, ссылка)], [шаги])]."""
+    if proto == 'awg':
+        phone = ['Откройте AmneziaWG → «+» → «Сканировать QR-код» и наведите камеру на QR-код из этого письма '
+                 '(откройте письмо на компьютере). Или «+» → «Импорт из файла» и выберите вложенный файл '
+                 f'{safe}-awg.conf.',
+                 'Разрешите приложению добавить конфигурацию VPN.',
+                 'Включите переключатель у подключения.']
+        desk = [f'Сохраните вложенный файл {safe}-awg.conf.',
+                'В AmneziaWG нажмите «Импорт туннелей из файла» (Import tunnel(s) from file) и выберите этот файл.',
+                'Нажмите «Подключить» (Activate).']
+        return [('📱 iPhone и iPad', 'AmneziaWG', [('App Store', AWG_IOS)], phone),
+                ('🤖 Android', 'AmneziaWG', [('Google Play', AWG_ANDROID)], phone),
+                ('💻 Windows', 'AmneziaWG', [('скачать с GitHub', AWG_WIN)],
+                 ['На странице загрузки в разделе Assets скачайте файл amneziawg-amd64-….msi и запустите его.'] + desk),
+                ('🍏 Mac', 'AmneziaWG', [('Mac App Store', AWG_IOS)], desk)]
+    phone = ['Скопируйте ссылку из письма целиком (она начинается с vless://). Или отсканируйте QR-код из письма.',
+             'Откройте Happ → «+» вверху → «Вставить из буфера» (или «Сканировать QR-код»).',
+             'Нажмите большую кнопку подключения и разрешите приложению добавить VPN.']
+    desk = ['Скопируйте ссылку из письма целиком (она начинается с vless://).',
+            'Откройте Happ → «+» → «Вставить из буфера обмена».',
+            'Нажмите кнопку подключения.']
+    return [('📱 iPhone и iPad', 'Happ', [('App Store (Россия)', HAPP_IOS_RU), ('App Store (другие страны)', HAPP_IOS)],
+             phone),
+            ('🤖 Android', 'Happ', [('Google Play', HAPP_ANDROID), ('файл APK', HAPP_APK)], phone),
+            ('💻 Windows', 'Happ', [('скачать установщик', HAPP_WIN)], desk),
+            ('🍏 Mac', 'Happ', [('App Store (Россия)', HAPP_MAC_RU), ('файл DMG', HAPP_DMG)], desk)]
 
 
 def proto_mail(pub, to, proto, via=None):
+    """Письмо пользователю: по шагам для каждого устройства, со ссылками на приложения."""
     p = wg_state()['peers'][pub]
     safe = peer_file_name(p)
     name = p['name']
-    warn = 'Это личный ключ доступа. Не пересылайте письмо другим людям.'
-    att, inline = [], []
+    title = PROTO_RU[proto]
+    warn = 'В письме — личный ключ доступа. Не пересылайте его другим людям.'
+    att, inline, link = [], [], ''
     if proto == 'awg':
         conf = awg_client_conf(pub, via)
         att.append((f'{safe}-awg.conf', conf.encode(), 'application', 'octet-stream'))
-        body = [f'1. Установите {AWG_APPS}:', f'   iPhone/iPad: {AWG_IOS}', f'   Android: {AWG_ANDROID}',
-                f'   Компьютер: {AMNEZIA_SITE}',
-                f'2. Импортируйте вложенный файл {safe}-awg.conf или отсканируйте QR-код из письма.', '3. Подключитесь.',
-                '', 'Приложение WireGuard и старые версии AmneziaWG (1.x) этот файл не откроют.']
         png = wg_qr(conf)
-        title = 'AmneziaWG'
+        what = (f'Подключение через приложение AmneziaWG — это WireGuard с защитой от блокировок, оно работает и '
+                f'через мобильный интернет. В письме — файл {safe}-awg.conf и QR-код.')
+        note = ('Обычное приложение WireGuard этот файл не откроет — нужно именно AmneziaWG. Если AmneziaWG уже '
+                'стоит, обновите его до последней версии.')
     else:
         link = vless_link(pub, via)
-        body = ['1. Установите приложение: ' + VLESS_APPS + '.',
-                '2. Скопируйте ссылку ниже целиком и добавьте в приложение («+» → «Импорт из буфера»),',
-                '   или отсканируйте QR-код из письма.', '3. Подключитесь.', '', link]
         png = wg_qr(link)
-        title = 'VLESS'
+        what = ('Подключение через приложение Happ (протокол VLESS) — работает там, где другие VPN блокируют, в том '
+                'числе через мобильный интернет. Ниже — ваша ссылка и QR-код.')
+        note = 'Подойдёт и другое приложение для VLESS (v2RayTun, v2rayNG, Hiddify, Streisand) — ссылка та же.'
     if png:
         att.append((f'{safe}-qr.png', png, 'image', 'png'))
         inline.append(('qr', png, 'image', 'png'))
-    text = '\n'.join(['Здравствуйте!', '', f'Это доступ к VPN «{GW_NAME}» для «{name}» ({title}).', '', *body, '', warn])
+    extra = []
+    if p.get('expires'):
+        extra.append(f'Доступ действует до {fmt_date(p["expires"])}.')
+    if p.get('limit'):
+        extra.append(f'Лимит трафика: {fmt_bytes(p["limit"])} в месяц.')
+    trouble = ['Проверьте, что интернет работает без VPN.',
+               'Выключите другие VPN и прокси на устройстве — одновременно может работать только один.',
+               'Обновите приложение до последней версии.',
+               'Не помогло — напишите администратору, который прислал это письмо.']
+    guide = proto_guide(proto, safe)
+    # текст
+    t = ['Здравствуйте!', '', f'Это доступ к VPN «{GW_NAME}» для «{name}».', what, '']
+    if link:
+        t += ['Ваша ссылка (копируйте целиком):', link, '']
+    for plat, app, links, steps in guide:
+        t.append(f'{plat}:')
+        t.append(f'  1. Установите {app}: ' + ' · '.join(f'{lbl} {url}' for lbl, url in links))
+        t += [f'  {i}. {s}' for i, s in enumerate(steps, 2)]
+        t.append('')
+    t += [note, '', 'Если не подключается:'] + [f'  • {x}' for x in trouble] + ['']
+    t += extra + ([''] if extra else []) + [warn]
+    # HTML
     e = html.escape
-    html_body = ('<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#222">'
-                 + ''.join(f'<p>{e(x)}</p>' if x else '' for x in text.split('\n')[:4])
-                 + '<ol>' + ''.join(f'<li>{e(x.split(". ", 1)[1])}</li>' for x in body if re.match(r'^\d\. ', x)) + '</ol>'
-                 + (f'<p><code style="word-break:break-all">{e(link)}</code></p>' if proto == 'vless' else '')
-                 + ('<p><img src="cid:qr" alt="QR-код" width="300" height="300"></p>' if png else '')
-                 + f'<p style="color:#a33">⚠️ {e(warn)}</p></div>')
-    send_mail(f'{GW_NAME}: доступ к VPN ({title}) для «{name}»', text, to=[to], html_body=html_body,
+    hb = ['<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#222;max-width:640px">',
+          f'<p>Здравствуйте!</p><p>Это доступ к VPN <b>{e(GW_NAME)}</b> для <b>«{e(name)}»</b>.<br>{e(what)}</p>']
+    if link:
+        hb.append('<p style="margin-bottom:4px"><b>Ваша ссылка</b> (копируйте целиком):</p>'
+                  f'<p style="margin-top:0;padding:10px;background:#f3f4f6;border-radius:8px;font-family:monospace;'
+                  f'font-size:13px;word-break:break-all">{e(link)}</p>')
+    if png:
+        hb.append(f'<p><img src="cid:qr" alt="QR-код {e(title)}" width="260" height="260" '
+                  'style="border:1px solid #ddd;border-radius:8px"><br><span style="color:#666;font-size:13px">'
+                  'QR-код удобно сканировать телефоном, открыв письмо на компьютере.</span></p>')
+    for plat, app, links, steps in guide:
+        btns = ' '.join(f'<a href="{e(url)}" style="display:inline-block;margin:2px 6px 2px 0;padding:6px 12px;'
+                        f'background:#2563eb;color:#fff;border-radius:6px;text-decoration:none">{e(lbl)}</a>'
+                        for lbl, url in links)
+        hb.append(f'<h3 style="margin:22px 0 6px">{e(plat)}</h3><ol style="margin-top:0;padding-left:22px">'
+                  f'<li>Установите <b>{e(app)}</b>:<br>{btns}</li>'
+                  + ''.join(f'<li>{e(s)}</li>' for s in steps) + '</ol>')
+    hb.append(f'<p style="color:#555">{e(note)}</p>')
+    hb.append('<h3 style="margin:22px 0 6px">Если не подключается</h3><ul style="margin-top:0">'
+              + ''.join(f'<li>{e(x)}</li>' for x in trouble) + '</ul>')
+    hb += [f'<p>{e(x)}</p>' for x in extra]
+    hb.append(f'<p style="color:#a33">⚠️ {e(warn)}</p></div>')
+    send_mail(f'{GW_NAME}: доступ к VPN ({title}) для «{name}»', '\n'.join(t), to=[to], html_body=''.join(hb),
               attachments=att, inline=inline)
-
 
 def scr_peer_proto(uid, pub, proto, note=''):
     p = wg_state()['peers'][pub]
@@ -8888,7 +8965,7 @@ def scr_new_proto(uid, pub, note=''):
                      f'Нужно приложение {AWG_APPS}.')
         row.append(btn('🛡 AmneziaWG', f'wgo:{t}:awg:new'))
     if vless_on():
-        lines.append('🕶 <b>VLESS</b> — похож на обычный HTTPS, проходит почти везде. Приложения Happ, v2RayTun, v2rayNG.')
+        lines.append('🕶 <b>VLESS</b> — похож на обычный HTTPS, проходит почти везде. Приложение Happ.')
         row.append(btn('🕶 VLESS', f'wgo:{t}:vless:new'))
     lines += ['', 'Остальные протоколы можно добавить позже на экране клиента.']
     if note:

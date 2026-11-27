@@ -295,7 +295,7 @@ MikroTik добавляется в боте (👥 Клиенты → ➕ 📡 Mi
 |---|---|---|---|
 | Где на шлюзе | `wg0`, `10.10.10.0/24` | `awg0`, `10.10.11.0/24` | вход в mihomo |
 | Порт по умолчанию | 51820/udp | 51821/udp | 443/tcp (или свободный) |
-| Приложение | WireGuard | AmneziaVPN 4.8.12.7+, AmneziaWG 2.0+ | Happ, v2RayTun, v2rayNG, Hiddify |
+| Приложение | WireGuard | AmneziaWG 2.0+ | Happ (подойдут v2RayTun, v2rayNG, Hiddify) |
 | Выдача | `.conf`, QR, письмо | `.conf`, QR, письмо | ссылка `vless://`, QR, письмо |
 
 - AmneziaWG бот ставит сам из PPA amnezia (Ubuntu, модуль ядра собирается 3–10 минут). После обновления
